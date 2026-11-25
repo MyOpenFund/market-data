@@ -19,9 +19,16 @@ Format (a directory)
 Strict input (``validate()`` lists every problem; each table method raises ``HistoryFileError``
 while there is one): a tab-separated file or an unnamed row-number column is refused (re-export as
 comma CSV or Parquet without the row number); ``-``, ``N/A``, ``NA``, ``#N/A`` in any cell and
-NaN or infinite numbers are refused with the file, column and first row; unknown files or
-columns, missing required columns or values, duplicate keys and member ids absent from
-``securities`` are refused. Problems never quote a member id or a name.
+NaN or infinite numbers are refused with the file, column and first row; missing required files,
+keys, columns or values, CSV and Parquet parts mixed for one table, duplicate keys, member ids
+absent from ``securities``, a fractional volume, a timezone-aware or non-midnight timestamp as a
+date, and an ``action_type`` column outside ``ACTION_TYPES`` or disagreeing with the mapped
+``source_action_type`` are refused. Problems never quote a member id or a name.
+Tolerated and listed in ``report.ignored`` (they cannot change the meaning of known columns):
+files that are not part of the format, columns of a known file outside ``FILE_COLUMNS`` (not
+read), unknown manifest keys.
+
+Token salt: ``MOF_MARKET_TOKEN_SALT`` (or ``salt=``), at least ``MIN_SALT_BYTES`` (16) bytes.
 
 Look-ahead guard (spec §9.3)
     Every dated row (prices, actions, vendor total return, snapshots, fetch log) is keyed on
@@ -32,7 +39,8 @@ Look-ahead guard (spec §9.3)
     Prices and vendor total return: the session close in UTC of the row's date on the member's
     exchange calendar (``published`` / ``session_close``). A date that is not a session is
     dropped (``non_session``); a session closing after ``export_time`` is dropped
-    (``after_export``: a partial bar). Snapshots: snapshot date 23:59:59.999999 UTC
+    (``after_export``: a partial bar, as the builder's intraday drop). Snapshots (no calendar
+    needed): snapshot date 23:59:59.999999 UTC
     (``published`` / ``snapshot_date``), capped at ``export_time`` (then ``collected`` /
     ``fetch_time``). Actions: the provider builder's rule (``market_data._calendars``), capped at
     ``export_time``. Observations and fetch log: ``load_time`` (``collected``).
@@ -40,10 +48,17 @@ Look-ahead guard (spec §9.3)
 Exchange calendars
     A member's exchange code is ``securities.exchange_code``, else the second word of its
     ``member_id`` (``AAA UW Equity`` -> ``UW``); ``exchange_mics`` maps codes to calendar MICs
-    (default ``DEFAULT_EXCHANGE_MICS``: US codes -> XNYS). Rows of a member whose code is not
-    mapped are kept out of every dated table (``unmapped_exchange``) and counted per code.
-    Snapshots keep ``snapshot_size`` = every filed member of the (index, date), so a member kept
-    out shows as a gap.
+    (default ``DEFAULT_EXCHANGE_MICS``: US codes -> XNYS). Prices, vendor total return and
+    actions of a member whose code is not mapped are kept out (``unmapped_exchange``) and
+    counted per code. Snapshots, observations and the fetch log keep every member (a European
+    composition loads before its prices; its fetch-log rows are ``empty``).
+
+Corporate actions: an explicit ``action_type`` wins, else ``source_action_type`` through
+``action_types`` (case-insensitive); unknown labels are kept out and counted, never guessed.
+
+Restatement (``snapshots(previous_snapshots, load_time=)``): for an (index, date) filed again,
+published members now absent get ``is_member=false``, and new or changed members are re-emitted,
+all at ``load_time`` (``collected`` / ``load_time``); unchanged rows are not re-emitted.
 
 Load report: ``FileHistory.report`` (counts only, no label) is filled as tables are built.
 """
@@ -97,6 +112,7 @@ __all__ = [
     "SENTINELS",
     "FileHistory",
     "HistoryFileError",
+    "Ignored",
     "LoadReport",
     "Manifest",
     "default_action_types",
@@ -266,13 +282,25 @@ class Manifest:
 
 
 @dataclass
+class Ignored:
+    """What the loader read past: files in the directory that are not part of the format,
+    columns of a known file outside its spec (file name -> columns), unknown manifest keys."""
+
+    files: list[str] = field(default_factory=list)
+    columns: dict[str, list[str]] = field(default_factory=dict)
+    manifest_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LoadReport:
-    """Counts only (never a label): rows kept out per table and reason, per unmapped exchange
-    code, and per unknown ``source_action_type``."""
+    """Never a label: rows kept out per table and reason, per unmapped exchange code and per
+    unknown ``source_action_type``; what was ignored (``validate``); the fetch-log summary."""
 
     dropped: dict[str, dict[str, int]] = field(default_factory=dict)
     unmapped_exchanges: dict[str, dict[str, int]] = field(default_factory=dict)
     unknown_action_types: dict[str, int] = field(default_factory=dict)
+    ignored: Ignored = field(default_factory=Ignored)
+    fetch_log: dict[str, int] = field(default_factory=dict)
 
 
 def _norm_type(label: str) -> str:
@@ -329,9 +357,6 @@ def _header_problems(fname: str, names: list[str], spec: _Spec) -> list[str]:
     dup = sorted({n for n in names if names.count(n) > 1})
     if dup:
         out.append(f"{fname}: duplicated columns {dup}")
-    unknown = [n for n in names if n not in spec.columns and n not in numbered]
-    if unknown:
-        out.append(f"{fname}: unknown columns {unknown}; expected some of {list(spec.columns)}")
     missing = [c for c in spec.required if c not in names]
     if missing:
         out.append(f"{fname}: missing required columns {missing}")
@@ -357,13 +382,23 @@ def _csv_header(path: Path) -> tuple[list[str], list[str]]:
     return names, []
 
 
-def _read_csv(path: Path, spec: _Spec) -> tuple[pa.Table | None, list[str]]:
+def _known_columns(fname: str, names: list[str], spec: _Spec, ignored: Ignored) -> list[str]:
+    """The spec columns among ``names``; the others are listed in ``ignored`` and not read."""
+    unknown = [n for n in names if n not in spec.columns]
+    if unknown:
+        ignored.columns[fname] = unknown
+    return [n for n in names if n in spec.columns]
+
+
+def _read_csv(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | None, list[str]]:
     names, problems = _csv_header(path)
     if problems:
         return None, problems
+    known = _known_columns(path.name, names, spec, ignored)
     problems = _header_problems(path.name, names, spec)
     if problems:
         return None, problems
+    names = known
 
     def options(types: Mapping[str, pa.DataType]) -> pv.ConvertOptions:
         return pv.ConvertOptions(
@@ -441,18 +476,19 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
     return pa.table(cols), []
 
 
-def _read_parquet(path: Path, spec: _Spec) -> tuple[pa.Table | None, list[str]]:
+def _read_parquet(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | None, list[str]]:
     try:
         names = pq.read_schema(path).names
     except (pa.ArrowInvalid, OSError) as exc:
         return None, [f"{path.name}: cannot be read as Parquet: {exc}"]
+    known = _known_columns(path.name, names, spec, ignored)
     problems = _header_problems(path.name, names, spec)
     if problems:
         return None, problems
-    return pq.read_table(path, columns=names), []
+    return pq.read_table(path, columns=known), []
 
 
-def _read_manifest(directory: Path) -> tuple[Manifest | None, list[str]]:
+def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, list[str]]:
     found = [directory / n for n in ("manifest.json", "manifest.csv") if (directory / n).exists()]
     if not found:
         return None, ["manifest: manifest.json or manifest.csv is missing"]
@@ -480,9 +516,7 @@ def _read_manifest(directory: Path) -> tuple[Manifest | None, list[str]]:
     except (ValueError, UnicodeDecodeError) as exc:
         return None, [f"{path.name}: cannot be read: {exc}"]
     problems = []
-    unknown = sorted(set(raw) - {*_MANIFEST_REQUIRED, *_MANIFEST_OPTIONAL})
-    if unknown:
-        problems.append(f"{path.name}: unknown manifest key(s) {unknown}")
+    ignored.manifest_keys = sorted(set(raw) - {*_MANIFEST_REQUIRED, *_MANIFEST_OPTIONAL})
     values: dict[str, str] = {}
     for key in (*_MANIFEST_REQUIRED, *_MANIFEST_OPTIONAL):
         v = raw.get(key)
@@ -524,7 +558,7 @@ def _read_manifest(directory: Path) -> tuple[Manifest | None, list[str]]:
     )
 
 
-def _discover(directory: Path) -> tuple[dict[str, list[Path]], list[str]]:
+def _discover(directory: Path, ignored: Ignored) -> tuple[dict[str, list[Path]], list[str]]:
     files: dict[str, list[Path]] = {}
     problems = []
     data = sorted(p for p in directory.iterdir() if p.suffix in (".csv", ".parquet"))
@@ -536,9 +570,10 @@ def _discover(directory: Path) -> tuple[dict[str, list[Path]], list[str]]:
             problems.append(f"{name}: both CSV and Parquet files; keep one format per table")
         if parts:
             files[name] = parts
-    stray = [p.name for p in data if p not in claimed and p.stem != "manifest"]
-    if stray:
-        problems.append(f"unknown files {stray}; expected {list(_SPECS)} (and manifest)")
+    manifests = {"manifest.json", "manifest.csv"}
+    ignored.files = sorted(
+        p.name for p in directory.iterdir() if p not in claimed and p.name not in manifests
+    )
     for name in _REQUIRED_FILES:
         if name not in files:
             problems.append(f"{name}: required file is missing")
@@ -547,12 +582,14 @@ def _discover(directory: Path) -> tuple[dict[str, list[Path]], list[str]]:
     return files, problems
 
 
-def _read_table(name: str, parts: list[Path]) -> tuple[pa.Table | None, list[str]]:
+def _read_table(
+    name: str, parts: list[Path], ignored: Ignored
+) -> tuple[pa.Table | None, list[str]]:
     spec = _SPECS[name]
     tables, problems = [], []
     for path in parts:
         reader = _read_parquet if path.suffix == ".parquet" else _read_csv
-        table, found = reader(path, spec)
+        table, found = reader(path, spec, ignored)
         if table is not None:
             table, found = _normalise(path.name, table, spec)
         problems.extend(found)
@@ -669,12 +706,13 @@ class FileHistory:
     def _validate(self) -> list[str]:
         if not self.directory.is_dir():
             return [f"{self.directory.name}: not a directory"]
-        manifest, problems = _read_manifest(self.directory)
-        files, found = _discover(self.directory)
+        ignored = self.report.ignored
+        manifest, problems = _read_manifest(self.directory, ignored)
+        files, found = _discover(self.directory, ignored)
         problems += found
         raw: dict[str, pa.Table] = {}
         for name, parts in files.items():
-            table, found = _read_table(name, parts)
+            table, found = _read_table(name, parts, ignored)
             problems += found
             if table is not None:
                 raw[name] = table
@@ -900,19 +938,17 @@ class FileHistory:
         sizes = (
             raw.select(["index", "date"]).group_by(["index", "date"]).aggregate([([], "count_all")])
         )
+        # no calendar needed: every filed row is kept, whatever the member's exchange code
         idx, members = self._members_of(raw["member_id"])
-        mapped, n_unmapped = self._unmapped("index_snapshots", idx, members)
-        self.report.dropped["index_snapshots"] = {DROP_UNMAPPED_EXCHANGE: n_unmapped}
+        self.report.dropped["index_snapshots"] = {}
         kept = pa.table(
             {
-                "index_code": pc.filter(raw["index"], mapped),
-                "source_symbol": pc.take(
-                    pa.array([m.token for m in members], _S), pc.filter(idx, mapped)
-                ),
-                "valid_date": pc.filter(raw["date"], mapped),
-                "weight": pc.filter(raw["weight"], mapped)
+                "index_code": raw["index"],
+                "source_symbol": pc.take(pa.array([m.token for m in members], _S), idx),
+                "valid_date": raw["date"],
+                "weight": raw["weight"]
                 if "weight" in raw.column_names
-                else pa.nulls(_count(mapped), _F),
+                else pa.nulls(raw.num_rows, _F),
             }
         )
         sizes = sizes.rename_columns(["index_code", "valid_date", "snapshot_size"])
@@ -1145,32 +1181,55 @@ class FileHistory:
         return pa.Table.from_pylist(out, schema=OBSERVATION_SCHEMA)
 
     def fetch_log(self, load_time: datetime) -> pa.Table:
-        """``fetch_log`` rows: one per member with loaded prices or snapshots, so the coverage
-        ledger can corroborate a delisting (status ``ok`` with prices, ``empty`` without)."""
+        """``fetch_log`` rows: one per member with filed prices or snapshots (unmapped exchange
+        codes included), so the coverage ledger can corroborate a delisting. ``requested_from``
+        = the member's earliest filed price or snapshot date; ``status`` ``ok`` with loaded
+        prices (``row_count`` and ``returned_from``/``to`` over the loaded rows), ``empty``
+        without. ``report.fetch_log`` counts the members, the ``empty`` ones whose filed prices
+        were not loaded and those unloaded price rows."""
         self._load()
         load = self._check_load_time(load_time)
         manifest = self.manifest
         spans: dict[str, dict[str, Any]] = {}
+
+        def span(tok: str, first: date) -> dict[str, Any]:
+            s = spans.setdefault(
+                tok, {"first": first, "returned": (None, None), "count": 0, "filed": 0}
+            )
+            s["first"] = min(s["first"], first)
+            return s
+
+        for name in ("prices_daily", "index_snapshots"):
+            if name not in self._raw:
+                continue
+            raw = self._raw[name]
+            idx, members = self._members_of(raw["member_id"])
+            agg = (
+                pa.table({"i": idx, "d": raw["date"]})
+                .group_by("i")
+                .aggregate([("d", "min"), ("d", "count")])
+            )
+            for r in agg.to_pylist():
+                s = span(members[r["i"]].token, r["d_min"])
+                if name == "prices_daily":
+                    s["filed"] = r["d_count"]
         prices = self.prices()
         if prices.num_rows:
             agg = prices.group_by("source_symbol").aggregate(
                 [("valid_date", "min"), ("valid_date", "max"), ("valid_date", "count")]
             )
             for r in agg.to_pylist():
-                spans[r["source_symbol"]] = {
-                    "first": r["valid_date_min"],
-                    "returned": (r["valid_date_min"], r["valid_date_max"]),
-                    "count": r["valid_date_count"],
-                }
-        snaps = self.snapshots()
-        if snaps.num_rows:
-            agg = snaps.group_by("source_symbol").aggregate([("valid_date", "min")])
-            for r in agg.to_pylist():
-                s = spans.setdefault(
-                    r["source_symbol"],
-                    {"first": r["valid_date_min"], "returned": (None, None), "count": 0},
-                )
-                s["first"] = min(s["first"], r["valid_date_min"])
+                s = spans[r["source_symbol"]]
+                s["returned"] = (r["valid_date_min"], r["valid_date_max"])
+                s["count"] = r["valid_date_count"]
+        empty = [s for s in spans.values() if not s["count"]]
+        self.report.fetch_log = {
+            "members": len(spans),
+            "ok": len(spans) - len(empty),
+            "empty": len(empty),
+            "empty_with_unloaded_prices": sum(1 for s in empty if s["filed"]),
+            "unloaded_price_rows": sum(s["filed"] for s in empty),
+        }
         stamp = manifest.export_time.isoformat()
         out = [
             {

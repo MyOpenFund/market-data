@@ -161,7 +161,6 @@ def test_manifest_csv_accepted(tmp_path):
         ("dividends", "after tax", "dividends"),
         ("source_description", None, "source_description"),
         ("dates_timezone", None, "dates_timezone"),
-        ("adjustments", "none", "unknown manifest key"),
     ],
 )
 def test_manifest_keys_checked(tmp_path, key, value, message):
@@ -173,6 +172,36 @@ def test_manifest_keys_checked(tmp_path, key, value, message):
         manifest[key] = value
     rewrite(path, "manifest.json", json.dumps(manifest))
     assert message in problems_of(history(path))
+
+
+def test_extra_files_columns_and_keys_ignored_and_listed(tmp_path):
+    baseline = history(csv_export(tmp_path / "base"))
+    path = csv_export(tmp_path)
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["exporter_version"] = "3.1"
+    rewrite(path, "manifest.json", json.dumps(manifest))
+    lines = (path / "prices_daily.csv").read_text().splitlines()
+    lines = [lines[0] + ",adjusted_close"] + [ln + ",-" for ln in lines[1:]]
+    rewrite(path, "prices_daily.csv", "\n".join(lines) + "\n")
+    rewrite(path, "README.txt", "synthetic\n")
+    rewrite(path, "holdings.csv", "a,b\n1,2\n")
+    fh = history(path)
+    assert fh.validate() == []  # the ignored column is not read: its '-' does not matter
+    assert fh.report.ignored.files == ["README.txt", "holdings.csv"]
+    assert fh.report.ignored.columns == {"prices_daily.csv": ["adjusted_close"]}
+    assert fh.report.ignored.manifest_keys == ["exporter_version"]
+    assert fh.prices().equals(baseline.prices())
+
+
+def test_extra_parquet_column_ignored(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pq.read_table(path / "securities.parquet")
+    pq.write_table(
+        table.append_column("sector", pa.array(["x"] * table.num_rows)), path / "securities.parquet"
+    )
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.report.ignored.columns == {"securities.parquet": ["sector"]}
 
 
 def test_missing_manifest_refused(tmp_path):
@@ -274,8 +303,10 @@ def test_required_columns_and_values(tmp_path):
         "member_id,date,close,volume,ccy",
     )
     edit_csv(path, "securities.csv", "Beta Fake Inc", "")
-    problems = problems_of(history(path))
-    assert "prices_daily.csv" in problems and "'currency'" in problems and "'ccy'" in problems
+    fh = history(path)
+    problems = problems_of(fh)
+    assert "prices_daily.csv" in problems and "'currency'" in problems and "'ccy'" not in problems
+    assert fh.report.ignored.columns == {"prices_daily.csv": ["ccy"]}
     assert "securities.csv" in problems and "'name'" in problems and "row 2" in problems
 
 
@@ -435,8 +466,11 @@ def test_unmapped_exchange_counted(fh):
     assert tok("EEE ZZ Equity") not in symbols and tok("CCC LN Equity") not in symbols
     assert fh.report.unmapped_exchanges["prices"] == {"LN": 3, "ZZ": 2}
     assert fh.report.dropped["prices"][DROP_UNMAPPED_EXCHANGE] == 5
-    fh.snapshots()
-    assert fh.report.unmapped_exchanges["index_snapshots"] == {"LN": 3, "ZZ": 3}
+    # compositions need no calendar: unmapped members stay in the snapshots
+    snapped = set(fh.snapshots()["source_symbol"].to_pylist())
+    assert {tok("EEE ZZ Equity"), tok("CCC LN Equity")} <= snapped
+    assert "index_snapshots" not in fh.report.unmapped_exchanges
+    assert fh.report.dropped["index_snapshots"] == {}
     fh.actions()
     assert fh.report.unmapped_exchanges["corporate_actions"] == {"LN": 1, "ZZ": 1}
 
@@ -479,14 +513,16 @@ def test_snapshots_as_filed(fh):
     }
     assert all(r["is_member"] for r in rows)
     idx1 = [r for r in rows if r["index_code"] == "IDX1" and r["valid_date"] == date(2020, 1, 31)]
-    # EEE (unmapped exchange) is kept out, the size still counts every filed member
-    assert {r["snapshot_size"] for r in idx1} == {4} and len(idx1) == 3
+    # EEE (unmapped exchange) is kept: a composition needs no calendar
+    assert {r["snapshot_size"] for r in idx1} == {4} and len(idx1) == 4
+    assert tok("EEE ZZ Equity") in {r["source_symbol"] for r in idx1}
     idx2 = [r for r in rows if r["index_code"] == "IDX2" and r["valid_date"] == date(2020, 3, 31)]
     assert {r["source_symbol"]: r["weight"] for r in idx2} == {
         tok("AAA UN Equity"): 0.55,
+        tok("CCC LN Equity"): 0.25,
         tok("FFF UN Equity"): 0.2,
     }
-    assert [r["weight"] for r in idx1] == [None, None, None]
+    assert [r["weight"] for r in idx1] == [None] * 4
 
 
 def test_restatement_gives_is_member_false(tmp_path):
@@ -526,7 +562,9 @@ def test_restatement_gives_is_member_false(tmp_path):
         pc.and_(pc.equal(now["index_code"], "IDX1"), pc.equal(now["valid_date"], date(2020, 3, 31)))
     )
     current = {r["source_symbol"] for r in members.to_pylist() if r["is_member"]}
-    assert current == {tok(m) for m in ("AAA UN Equity", "DDD UQ Equity", "BBB UW Equity")}
+    assert current == {
+        tok(m) for m in ("AAA UN Equity", "DDD UQ Equity", "EEE ZZ Equity", "BBB UW Equity")
+    }
     before = asof(combined, key, LOAD - timedelta(hours=1))
     old = before.filter(
         pc.and_(
@@ -535,7 +573,7 @@ def test_restatement_gives_is_member_false(tmp_path):
         )
     )
     assert {r["source_symbol"] for r in old.to_pylist() if r["is_member"]} == {
-        tok(m) for m in ("AAA UN Equity", "DDD UQ Equity", "FFF UN Equity")
+        tok(m) for m in ("AAA UN Equity", "DDD UQ Equity", "EEE ZZ Equity", "FFF UN Equity")
     }
     latest(combined, key)  # no tie on (key, known_at)
     dup = combined.group_by([*key, "known_at"]).aggregate([([], "count_all")])
@@ -625,9 +663,7 @@ def test_action_types_parameter(tmp_path):
 def test_fetch_log_rows(fh):
     log = fh.fetch_log(LOAD)
     rows = {r["source_symbol"]: r for r in log.to_pylist()}
-    assert set(rows) == {
-        tok(m) for m in ("AAA UN Equity", "BBB UW Equity", "DDD UQ Equity", "FFF UN Equity")
-    }
+    assert set(rows) == {tok(m) for m in MEMBERS}  # unmapped exchanges included
     bbb = rows[tok("BBB UW Equity")]
     assert bbb["fetch_id"] == f"2020-04-02T18:00:00+00:00:{tok('BBB UW Equity')}"
     assert (bbb["requested_from"], bbb["requested_to"]) == (date(2020, 1, 30), date(2020, 4, 2))
@@ -639,6 +675,22 @@ def test_fetch_log_rows(fh):
     assert aaa["row_count"] == 6 and aaa["returned_to"] == date(2020, 3, 31)
     fff = rows[tok("FFF UN Equity")]
     assert fff["requested_from"] == date(2020, 1, 31)  # earliest snapshot before its prices
+    # unmapped exchange: prices filed but not loaded -> empty, counted in the report
+    eee = rows[tok("EEE ZZ Equity")]
+    assert (eee["status"], eee["row_count"], eee["returned_from"], eee["returned_to"]) == (
+        "empty",
+        0,
+        None,
+        None,
+    )
+    assert eee["requested_from"] == date(2020, 1, 31)
+    assert fh.report.fetch_log == {
+        "members": 6,
+        "ok": 4,
+        "empty": 2,
+        "empty_with_unloaded_prices": 2,
+        "unloaded_price_rows": 5,
+    }
 
 
 def test_fetch_log_empty_member(tmp_path):
