@@ -58,6 +58,8 @@ jobs:
           pip install build==1.6.1 twine==7.0.0
           python -m build . --outdir dist
           twine check --strict dist/*
+      - name: Wheel guard (no direct reference in the built Requires-Dist)
+        run: bash scripts/check-no-direct-references.sh --wheel "$(ls dist/*.whl)"
       - name: Smoke install in a fresh venv
         run: |
           python -m venv "$RUNNER_TEMP/smoke"

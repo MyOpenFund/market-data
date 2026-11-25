@@ -157,33 +157,57 @@ problem (file, column, row; never a cell's content).
 ## Acceptance computations
 
 `market_data.acceptance` holds pure functions over the store recipes' outputs
-(`membership_intervals`, `total_return`, `sessions`), to check a backtest universe on your data:
+(`membership_intervals` of one index, `total_return`, `sessions`), to check a backtest universe on
+your data. None of them reports a clean result on missing evidence:
 
 - `equal_weight_index(intervals, tr, sessions, rebalance="quarterly", company_groups=...)`: an
   equal-weight index (per company when `company_groups` [instrument_id, company_id] groups share
-  lines), rebalanced monthly or quarterly on membership as known at each date, members leaving
-  between rebalances sold at their last total-return level; `annual_fee` for an ETF comparison.
-- `truncation_check(build_fn, as_of)`: rebuilds with every fact known after `as_of` removed and
-  lists the sessions up to `as_of` that moved (empty: no look-ahead).
+  lines), rebalanced monthly or quarterly (`rebalance_months`, default January, April, July,
+  October) on membership as known at each date. Members leaving between rebalances are sold at
+  their last total-return level; `exit_proceeds` keeps the proceeds in cash (default) or
+  reinvests them pro rata. A member with no usable level at a rebalance (none yet, or older than
+  `max_stale_sessions`) is skipped and counted (`on_missing="skip"`, default) or refused
+  (`"raise"`). The result holds `levels` and one `rebalances` row per date (members, bought,
+  skipped, stale, carried). `annual_fee` for an ETF comparison.
+- `truncation_check(build_fn, as_of)`: your `build_fn(as_of, truncate=...)` builds the series
+  twice, once after removing every fact known after `as_of` from its inputs (`truncate=True`) and
+  once from everything available now; the check lists the sessions up to `as_of` that differ
+  (empty: no look-ahead). It proves only what your `build_fn` does: one that ignores `truncate`
+  always passes. Take `as_of` at or after a session close; comparing no session raises.
 - `compare_series(a, b, tolerance=...)`: our series vs a vendor's (maximum difference, sessions
-  over tolerance, annualised tracking difference).
+  over tolerance, annualised tracking difference); it does not pass on fewer than `min_sessions`
+  (default 2) common sessions, and says why in `reason`.
 - `survivors_only_delta(...)`: the same index on today's members only, and the annualised return
-  that bias would add.
+  that bias would add. The point-in-time index raises on a member without total return
+  (`full_on_missing="raise"`, default: skipping a dead name would hide the bias measured); the
+  survivors index skips (`survivors_on_missing="skip"`); both skipped counts are returned.
 
 Their docstrings state every rule and parameter.
 
 ## Adapters
 
-| Source code | What | Access |
+What `--source` and `load-history` read:
+
+| Adapter | What | Command |
 |---|---|---|
-| `massive` | Massive (formerly Polygon.io) daily US prices, dividends, splits, tickers; free Stocks Basic plan, 5 requests a minute, 2 years of history | restricted |
-| `tiingo` | Tiingo end-of-day prices with dividends and splits; free plan (50 requests an hour, 1,000 a day, 500 symbols a month) | restricted |
-| `private_history` | a history file (above) | restricted |
-| `openfigi` | OpenFIGI identifier mapping (a resolver, not a price source) | open |
-| `manual` | your reviewed manual mapping | restricted |
+| `massive` | Massive (formerly Polygon.io) daily US prices, dividends, splits, tickers; free Stocks Basic plan, 5 requests a minute, 2 years of history | `fetch` / `build --source massive` |
+| `tiingo` | Tiingo end-of-day prices with dividends and splits, per symbol; free plan (50 requests an hour, 1,000 a day, 500 symbols a month) | `fetch` / `build --source tiingo` |
+| history file | the format above (source code `private_history`) | `load-history` |
 
 Quotas are respected, never worked around: requests are spaced, retries are bounded, and a limit
 may be set lower, never higher.
+
+Sources this package registers (licence, terms, access class) under the `open_data_store.sources`
+entry point:
+
+| Source code | What | Access |
+|---|---|---|
+| `massive` | the Massive adapter's rows | restricted |
+| `tiingo` | the Tiingo adapter's rows | restricted |
+| `private_history` | rows loaded from a history file | restricted |
+| `openfigi` | identifiers from OpenFIGI (a resolver, not a price source; `map --openfigi`) | open |
+| `sec` | issuer links (CIK) from the SEC ticker map | open |
+| `manual` | your reviewed manual mapping (`MOF_MARKET_MANUAL_MAPPING`) | restricted |
 
 ### Writing an adapter in your own package
 
@@ -218,8 +242,8 @@ The provider sources (`massive`, `tiingo`) and a private export are for personal
 own key or rights: registered `restricted`, with **no public display** and **no ML training**
 (`no_public_display`, `no_ml_training` in the registry). Never share their data with another
 person, never publish it, never train a model on it. Check each provider's current terms
-yourself before your first fetch. OpenFIGI identifiers are open (attribution: OpenFIGI). The code
-in this repository is MIT licensed; the data you fetch is not.
+yourself before your first fetch. OpenFIGI identifiers and SEC EDGAR data are open (attribution:
+OpenFIGI, SEC EDGAR). The code in this repository is MIT licensed; the data you fetch is not.
 
 ## What never goes in this repository
 
@@ -242,6 +266,7 @@ pytest -q -W error
 Releases: the `release` workflow publishes to PyPI by trusted publishing (tag `vX.Y.Z`, or Run
 workflow with target `pypi` or `testpypi`) once the `pypi` environment's reviewer approves. Its
 guard (`scripts/check-no-direct-references.sh`) fails the build while `pyproject.toml` pins a
-dependency by git URL: the first release waits for open-data-store 0.2.0 on PyPI.
+dependency by git URL, and checks the built wheel's `Requires-Dist` again: the first release
+waits for open-data-store 0.2.0 on PyPI.
 
 MIT licensed.

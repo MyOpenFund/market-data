@@ -10,7 +10,9 @@ from open_data_store.market.asof import sessions as calendar_sessions
 
 from market_data.acceptance import (
     INDEX_SCHEMA,
+    REBALANCES_SCHEMA,
     ComparisonResult,
+    IndexResult,
     SurvivorsResult,
     compare_series,
     equal_weight_index,
@@ -50,7 +52,9 @@ def _tr(series: dict[str, dict[str, float]]) -> pa.Table:
     )
 
 
-def _levels(index: pa.Table) -> dict[date, float]:
+def _levels(index: IndexResult | pa.Table) -> dict[date, float]:
+    if isinstance(index, IndexResult):
+        index = index.levels
     return dict(
         zip(
             index.column("session_date").to_pylist(), index.column("level").to_pylist(), strict=True
@@ -111,8 +115,15 @@ BOTH = _intervals([("mof:a", "2024-01-01", None), ("mof:b", "2024-01-01", None)]
 
 def test_quarterly_rebalance_lets_weights_drift_until_the_quarter():
     index = equal_weight_index(BOTH, DRIFT_TR, DRIFT_SESSIONS, rebalance="quarterly")
-    assert index.schema == INDEX_SCHEMA
+    assert index.levels.schema == INDEX_SCHEMA
     assert list(_levels(index).values()) == pytest.approx([1.0, 1.0, 1.5, 1.25, 1.25, 1.875])
+    assert index.rebalances.schema == REBALANCES_SCHEMA
+    assert index.rebalances.column("rebalance_date").to_pylist() == [
+        D("2024-01-30"),
+        D("2024-04-01"),
+    ]
+    assert index.rebalances.column("bought").to_pylist() == [2, 2]
+    assert index.skipped == 0
 
 
 def test_monthly_rebalance_resets_weights_each_month():
@@ -124,7 +135,8 @@ def test_equal_weight_index_is_deterministic_whatever_the_row_order():
     shuffled = DRIFT_TR.take(list(reversed(range(DRIFT_TR.num_rows))))
     a = equal_weight_index(BOTH, DRIFT_TR, DRIFT_SESSIONS, rebalance="quarterly")
     b = equal_weight_index(BOTH, shuffled, DRIFT_SESSIONS, rebalance="quarterly")
-    assert a.equals(b)
+    assert a.levels.equals(b.levels)
+    assert a.rebalances.equals(b.rebalances)
 
 
 def test_company_grouping_merges_share_lines():
@@ -255,6 +267,10 @@ def test_member_without_any_level_is_skipped_or_refused():
     members = _intervals([("mof:a", "2024-01-01", None), ("mof:z", "2024-01-01", None)])
     index = equal_weight_index(members, tr, sessions, rebalance="quarterly")
     assert list(_levels(index).values()) == pytest.approx([1.0, 2.0])
+    # Skipped, never silently: the count is in the result.
+    assert index.skipped == 1
+    row = index.rebalances.to_pylist()[0]
+    assert (row["members"], row["bought"], row["skipped"], row["stale"]) == (2, 1, 1, 0)
     with pytest.raises(ValueError, match="1 member"):
         equal_weight_index(members, tr, sessions, rebalance="quarterly", on_missing="raise")
 
@@ -307,8 +323,10 @@ def test_no_member_keeps_the_index_flat():
 
 def test_no_session_gives_an_empty_index():
     index = equal_weight_index(BOTH, DRIFT_TR, _sessions(), rebalance="monthly")
-    assert index.num_rows == 0
-    assert index.schema == INDEX_SCHEMA
+    assert index.levels.num_rows == 0
+    assert index.levels.schema == INDEX_SCHEMA
+    assert index.rebalances.num_rows == 0
+    assert index.skipped == 0
 
 
 # --- truncation ---------------------------------------------------------------------------------
@@ -516,3 +534,161 @@ def test_survivors_are_the_members_at_as_of_and_sessions_stop_there():
         survivors_only_delta(
             members, tr, _sessions(*days), as_of=datetime(2024, 1, 3), rebalance="monthly"
         )
+
+
+# --- review fixes: never clean on missing evidence ----------------------------------------------
+
+
+def test_survivors_full_index_raises_on_a_dead_member_without_total_return():
+    days = ["2023-01-03", "2023-03-01", "2023-06-01", "2024-01-03"]
+    tr = _tr(
+        {
+            "mof:s1": dict.fromkeys(days, 1.0),
+            "mof:late": {"2023-06-01": 1.0, "2024-01-03": 1.0},  # a survivor listed later
+        }
+    )
+    members = _intervals(
+        [
+            ("mof:dead", "2023-01-01", "2023-06-01"),  # no total return at all
+            ("mof:s1", "2023-01-01", None),
+            ("mof:late", "2023-06-01", None),
+        ]
+    )
+    with pytest.raises(ValueError, match="1 member"):
+        survivors_only_delta(
+            members, tr, _sessions(*days), as_of=D("2024-01-03"), rebalance="monthly"
+        )
+    result = survivors_only_delta(
+        members,
+        tr,
+        _sessions(*days),
+        as_of=D("2024-01-03"),
+        rebalance="monthly",
+        full_on_missing="skip",
+    )
+    # The dead name was skipped twice in the full index (two rebalances while a member), and the
+    # late survivor twice in the back-filled one (no price before 2023-06-01): both visible.
+    assert result.full_skipped == 2
+    assert result.survivors_skipped == 2
+    assert result.full.rebalances.column("skipped").to_pylist() == [1, 1, 0, 0]
+    with pytest.raises(ValueError, match="1 member"):
+        survivors_only_delta(
+            members,
+            tr,
+            _sessions(*days),
+            as_of=D("2024-01-03"),
+            rebalance="monthly",
+            full_on_missing="skip",
+            survivors_on_missing="raise",
+        )
+
+
+def test_max_stale_sessions_refuses_a_level_too_old_and_counts_carries():
+    sessions = _sessions("2024-01-02", "2024-01-03", "2024-01-04", "2024-02-01", "2024-02-02")
+    tr = _tr(
+        {
+            "mof:a": {"2024-01-02": 1.0},  # stops trading, still listed by a stale snapshot
+            "mof:b": {d: 1.0 for d in ("2024-01-02", "2024-01-03", "2024-01-04", "2024-02-01")}
+            | {"2024-02-02": 2.0},
+        }
+    )
+    members = _intervals([("mof:a", "2024-01-01", None), ("mof:b", "2024-01-01", None)])
+    unlimited = equal_weight_index(members, tr, sessions, rebalance="monthly")
+    feb = unlimited.rebalances.to_pylist()[1]
+    assert (feb["bought"], feb["carried"], feb["max_carry_sessions"], feb["stale"]) == (2, 1, 3, 0)
+    assert _levels(unlimited)[D("2024-02-02")] == pytest.approx(1.5)
+    capped = equal_weight_index(members, tr, sessions, rebalance="monthly", max_stale_sessions=2)
+    feb = capped.rebalances.to_pylist()[1]
+    assert (feb["bought"], feb["skipped"], feb["stale"]) == (1, 1, 1)
+    assert capped.stale == 1
+    assert _levels(capped)[D("2024-02-02")] == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="stale"):
+        equal_weight_index(
+            members, tr, sessions, rebalance="monthly", max_stale_sessions=2, on_missing="raise"
+        )
+    with pytest.raises(ValueError, match="max_stale_sessions"):
+        equal_weight_index(members, tr, sessions, rebalance="monthly", max_stale_sessions=-1)
+
+
+def test_rebalance_months_choose_the_quarter_anchors():
+    year = calendar_sessions("XNYS", D("2024-01-01"), D("2024-12-31"))
+    assert rebalance_dates(year, "quarterly", rebalance_months=(3, 6, 9, 12)) == [
+        D("2024-01-02"),
+        D("2024-03-01"),
+        D("2024-06-03"),
+        D("2024-09-03"),
+        D("2024-12-02"),
+    ]
+    with pytest.raises(ValueError, match="quarterly"):
+        rebalance_dates(year, "monthly", rebalance_months=(1,))
+    with pytest.raises(ValueError, match="rebalance_months"):
+        rebalance_dates(year, "quarterly", rebalance_months=(0, 13))
+
+
+def test_timestamp_dates_null_valid_from_and_several_indices_are_refused():
+    ts = pa.table({"session_date": pa.array([datetime(2024, 1, 2, tzinfo=UTC)])})
+    with pytest.raises(ValueError, match="date column"):
+        equal_weight_index(BOTH, DRIFT_TR, ts, rebalance="monthly")
+    tr_ts = DRIFT_TR.set_column(
+        1, "session_date", DRIFT_TR.column("session_date").cast(pa.timestamp("us"))
+    )
+    with pytest.raises(ValueError, match="date column"):
+        equal_weight_index(BOTH, tr_ts, DRIFT_SESSIONS, rebalance="monthly")
+    null_from = BOTH.set_column(2, "valid_from", pa.array([None, D("2024-01-01")], pa.date32()))
+    with pytest.raises(ValueError, match="null valid_from"):
+        equal_weight_index(null_from, DRIFT_TR, DRIFT_SESSIONS, rebalance="monthly")
+    with pytest.raises(ValueError, match="null valid_from"):
+        survivors_only_delta(
+            null_from, DRIFT_TR, DRIFT_SESSIONS, as_of=D("2024-04-02"), rebalance="monthly"
+        )
+    two = BOTH.set_column(1, "index_code", pa.array(["one", "two"]))
+    with pytest.raises(ValueError, match="one index per call"):
+        equal_weight_index(two, DRIFT_TR, DRIFT_SESSIONS, rebalance="monthly")
+    with pytest.raises(ValueError, match="date column"):
+        compare_series(ts.append_column("level", pa.array([1.0])), _series({}), tolerance=0.0)
+
+
+def test_truncation_comparing_nothing_raises():
+    with pytest.raises(ValueError, match="nothing was compared"):
+        truncation_check(_asof_build, datetime(2023, 12, 1, tzinfo=UTC))
+
+    def empty(as_of: datetime, *, truncate: bool) -> pa.Table:
+        return pa.table(
+            {"session_date": pa.array([], pa.date32()), "level": pa.array([], pa.float64())}
+        )
+
+    with pytest.raises(ValueError, match="nothing was compared"):
+        truncation_check(empty, AS_OF)
+
+
+def test_truncation_compares_ints_and_floats_with_the_tolerance():
+    def build(as_of: datetime, *, truncate: bool) -> pa.Table:
+        values = pa.array([1, 2], pa.int64()) if truncate else pa.array([1.0, 2.0005])
+        return pa.table({"session_date": pa.array(TRUNC_DAYS[:2], pa.date32()), "level": values})
+
+    assert truncation_check(build, AS_OF, tolerance=1e-3) == []
+    assert truncation_check(build, AS_OF) == ["2024-01-03"]
+
+
+def test_truncation_refuses_a_timestamp_key():
+    def build(as_of: datetime, *, truncate: bool) -> pa.Table:
+        return pa.table({"session_date": pa.array([AS_OF]), "level": [1.0]})
+
+    with pytest.raises(ValueError, match="date column"):
+        truncation_check(build, AS_OF)
+
+
+def test_compare_series_needs_min_sessions_to_pass():
+    a = _series({"2024-01-02": 1.0, "2024-01-03": 1.0})
+    b = _series({"2024-01-03": 7.0, "2024-01-04": 1.0})
+    result = compare_series(a, b, tolerance=0.0)
+    assert result.sessions_compared == 1
+    assert result.sessions_over == 0
+    assert not result.passed
+    assert "min_sessions" in result.reason
+    assert compare_series(a, b, tolerance=0.0, min_sessions=1).passed
+    over = compare_series(a, _series({"2024-01-02": 1.0, "2024-01-03": 2.0}), tolerance=0.1)
+    assert not over.passed and "over tolerance" in over.reason
+    assert compare_series(a, a, tolerance=0.0).reason is None
+    with pytest.raises(ValueError, match="min_sessions"):
+        compare_series(a, a, tolerance=0.0, min_sessions=0)
