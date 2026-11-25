@@ -45,4 +45,20 @@ def sources() -> list[SourceInfo]:
             attribution="OpenFIGI",
             access="open",
         ),
+        SourceInfo(
+            code="manual",
+            licence="operator's reviewed mapping; never redistributed",
+            terms_url="",
+            attribution="",
+            access="restricted",
+            no_public_display=True,
+            no_ml_training=True,
+        ),
+        SourceInfo(
+            code="sec",
+            licence="SEC EDGAR public data",
+            terms_url="https://www.sec.gov/privacy",
+            attribution="SEC EDGAR",
+            access="open",
+        ),
     ]

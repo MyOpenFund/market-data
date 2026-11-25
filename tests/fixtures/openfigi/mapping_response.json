@@ -1,0 +1,77 @@
+[
+  {
+    "data": [
+      {
+        "figi": "BBG000SYNC10",
+        "name": "SYNTHETIC ONE CORP",
+        "ticker": "SYNA",
+        "exchCode": "US",
+        "compositeFIGI": "BBG000SYNC10",
+        "securityType": "Common Stock",
+        "marketSector": "Equity",
+        "shareClassFIGI": "BBG001SYNS10",
+        "securityType2": "Common Stock",
+        "securityDescription": "SYNA"
+      }
+    ]
+  },
+  {
+    "warning": "No identifier found."
+  },
+  {
+    "data": [
+      {
+        "figi": "BBG000SYNC20",
+        "name": "SYNTHETIC TWO INC",
+        "ticker": "SYNB",
+        "exchCode": "US",
+        "compositeFIGI": "BBG000SYNC20",
+        "securityType": "Common Stock",
+        "marketSector": "Equity",
+        "shareClassFIGI": "BBG001SYNS20",
+        "securityType2": "Common Stock",
+        "securityDescription": "SYNB"
+      },
+      {
+        "figi": "BBG000SYNC21",
+        "name": "SYNTHETIC TWO OLD INC",
+        "ticker": "SYNB",
+        "exchCode": "US",
+        "compositeFIGI": "BBG000SYNC21",
+        "securityType": "Common Stock",
+        "marketSector": "Equity",
+        "shareClassFIGI": null,
+        "securityType2": "Common Stock",
+        "securityDescription": "SYNB"
+      }
+    ]
+  },
+  {
+    "data": [
+      {
+        "figi": "BBG000SYNC30",
+        "name": "SYNTHETIC THREE CO",
+        "ticker": "SYNC",
+        "exchCode": "US",
+        "compositeFIGI": "BBG000SYNC30",
+        "securityType": "Common Stock",
+        "marketSector": "Equity",
+        "shareClassFIGI": "BBG001SYNS30",
+        "securityType2": "Common Stock",
+        "securityDescription": "SYNC"
+      },
+      {
+        "figi": "BBG000SYNX31",
+        "name": "SYNTHETIC THREE CO",
+        "ticker": "SYNC",
+        "exchCode": "UN",
+        "compositeFIGI": "BBG000SYNC30",
+        "securityType": "Common Stock",
+        "marketSector": "Equity",
+        "shareClassFIGI": "BBG001SYNS30",
+        "securityType2": "Common Stock",
+        "securityDescription": "SYNC"
+      }
+    ]
+  }
+]

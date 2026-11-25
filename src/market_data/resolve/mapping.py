@@ -1,0 +1,862 @@
+"""Instrument mapping: which source symbol is which instrument, over time (spec §7.1).
+
+``build_mapping`` turns identifier observations (any adapter's ``symbols`` rows, the history-file
+adapter's ``observations``) and parsed OpenFIGI results into ``INSTRUMENT_IDENTIFIERS`` rows:
+the identifier observations of each instrument and the dated ``source_symbol`` mapping rows
+the store resolves provider series through (``open_data_store.market._mapping``).
+
+Rules
+    - One instrument per composite FIGI. Its ``instrument_id`` is opaque, ``"mof:" +
+      uuid4().hex`` (random); ids already published (``existing``, found through their
+      ``composite_figi`` rows) are reused, never re-minted: determinism across runs comes from
+      passing ``existing``. New ids are listed in ``MappingResult.minted``.
+    - A series' candidate composite FIGIs come from its ``composite_figi`` observations, else
+      from its OpenFIGI results (observations win: OpenFIGI results of a series that has a
+      composite observation are ignored).
+    - One candidate: the mapping row covers the series' span, ``valid_date`` = span start,
+      ``valid_to`` = span end + 1 day (half-open). The observation's own dates are ignored
+      there (a history-file label is dated at the export, its span comes from the fetch log).
+      Without a span, the observation's window is used; with no start at all the series is
+      unresolved (``no_span``).
+    - Several candidates (a recycled ticker): each gets its observation window, a missing
+      start or end taken from the span, clipped to the span. Disjoint windows give one mapping
+      row per instrument; overlapping windows (or an undated candidate, e.g. OpenFIGI results
+      only) make the series ``ambiguous``: not mapped. Candidates entirely outside the span are
+      dropped; none left: unresolved (``outside_span``). No candidate: unresolved
+      (``no_composite_figi``). Both reports carry [source_code, source_symbol, reason,
+      candidates] and never a label; write them to private reports only.
+    - Mapping rows carry the series' ``source_code`` (``id_value`` =
+      ``"<source_code>:<symbol>"``). ``link_reason`` is null, except ``venue_change`` on the
+      rows of two or more symbols of one source mapped to one instrument (that covers a renamed
+      symbol too). Their windows may overlap (a venue change with duplicated history): the
+      store's ``resolve_prices`` keeps identical rows once and raises on different values, so
+      such overlaps must carry identical rows or be made disjoint with a manual row.
+    - Identifier observations (``OBSERVED_SCHEMES``) become rows of the instrument their
+      series maps to: all of them when it maps to one instrument (whatever their dates); on a
+      recycled symbol, the instrument whose window the observation overlaps (a
+      ``composite_figi`` row goes to its own instrument). They keep the observation's
+      ``source_code``: a label from the private export stays under the restricted
+      ``private_history`` source. An observation without a date takes its instrument's window
+      start. Observations of an unmapped series, or of a recycled symbol overlapping several
+      (or none) of its instruments' windows, are not emitted. OpenFIGI-derived rows
+      (``composite_figi``, ``figi``, ``share_class_figi`` open-ended; ``ticker`` over the
+      mapping window) carry source ``openfigi``.
+    - Manual mapping (``load_manual_mapping``; a reviewed private CSV at
+      ``MOF_MARKET_MANUAL_MAPPING``) wins for every series it names: that series gets only the
+      manual rows (source ``manual``, ``link_reason`` as filed, default ``manual``), whatever
+      the observations and OpenFIGI say. A row names an ``instrument_id`` already known
+      (published or minted in this run) or a ``composite_figi`` (its instrument, minted when
+      new, with a ``manual`` ``composite_figi`` row so the id is found next run). With
+      ``manual=None`` the published manual rows (from ``existing``) keep winning, so a run
+      without the file never flips a reviewed mapping; with a manual table it is the full truth
+      and published manual rows it no longer holds are closed.
+    - Closing: a published mapping row (in ``existing``, read latest) of a series this run
+      covers that the run does not emit again is re-emitted with ``valid_to = valid_date``, an
+      empty window the store never applies, so an outdated mapping (a series now manual,
+      ambiguous or re-dated) cannot clash with the new one.
+    - ``known_at`` = ``load_time`` (``collected`` / ``load_time``) for every row (spec §7.3).
+
+Spans: ``spans_from_fetch_log`` (per series, earliest ``requested_from`` (else
+``returned_from``) to the latest ``returned_to`` (else ``requested_to``)) and
+``spans_from_dates`` (first/last ``valid_date`` of any dated rows, e.g. index snapshots, so a
+member whose prices stop before its last snapshot stays mapped on that snapshot), merged by
+``combine_spans``.
+
+Issuer link (spec §7.1, V0 call): ``link_issuers`` adds ``cik`` rows (source ``sec``) for
+instruments whose current ticker is in the SEC ``company_tickers.json`` map. Current: the
+instrument's latest mapping window ends within ``max_staleness_days`` of ``as_of`` (default
+the latest mapping end of the table), and its ticker is the latest ticker row still open at
+``as_of``. Dead names get none. A ticker claimed by two current instruments, or mapped to two
+CIKs, links nothing (never a guess).
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import re
+import uuid
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pyarrow as pa
+from open_data_store.contracts.rules import conform
+from open_data_store.contracts.standard.market import INSTRUMENT_IDENTIFIERS, LINK_REASONS
+from open_data_store.market.asof import latest
+from open_data_store.sources import SOURCE_CODE_PATTERN
+
+from market_data.adapters.base import RAW_SYMBOL_SCHEMA
+
+__all__ = [
+    "AMBIGUOUS_SEVERAL_COMPOSITES",
+    "CURRENT_MAX_STALENESS_DAYS",
+    "MANUAL_MAPPING_ENV",
+    "MANUAL_SCHEMA",
+    "MANUAL_SOURCE",
+    "OBSERVATION_INPUT_SCHEMA",
+    "OBSERVED_SCHEMES",
+    "OPENFIGI_SOURCE",
+    "REPORT_SCHEMA",
+    "SEC_SOURCE",
+    "SPAN_SCHEMA",
+    "SYMBOL_SCHEME",
+    "UNRESOLVED_NO_COMPOSITE",
+    "UNRESOLVED_NO_SPAN",
+    "UNRESOLVED_OUTSIDE_SPAN",
+    "MappingResult",
+    "build_mapping",
+    "combine_spans",
+    "link_issuers",
+    "load_manual_mapping",
+    "spans_from_dates",
+    "spans_from_fetch_log",
+]
+
+MANUAL_MAPPING_ENV = "MOF_MARKET_MANUAL_MAPPING"
+MANUAL_SOURCE = "manual"
+OPENFIGI_SOURCE = "openfigi"
+SEC_SOURCE = "sec"
+SYMBOL_SCHEME = "source_symbol"
+OBSERVED_SCHEMES = (
+    "figi",
+    "composite_figi",
+    "share_class_figi",
+    "isin",
+    "ticker",
+    "cik",
+    "export_member_id",
+    "export_name",
+)
+UNRESOLVED_NO_COMPOSITE = "no_composite_figi"
+UNRESOLVED_NO_SPAN = "no_span"
+UNRESOLVED_OUTSIDE_SPAN = "outside_span"
+AMBIGUOUS_SEVERAL_COMPOSITES = "several_composite_figis"
+# An instrument whose last mapped date is this many days before ``as_of`` still counts as
+# current for the issuer link (a weekend, a holiday week, a late fetch).
+CURRENT_MAX_STALENESS_DAYS = 7
+
+# Identifier observations as adapters produce them, with their source.
+OBSERVATION_INPUT_SCHEMA = pa.schema(
+    [*RAW_SYMBOL_SCHEMA, pa.field("source_code", pa.string(), nullable=False)]
+)
+# Per provider series, the first and last date it has data for (or was requested).
+SPAN_SCHEMA = pa.schema(
+    [
+        pa.field("source_code", pa.string(), nullable=False),
+        pa.field("source_symbol", pa.string(), nullable=False),
+        pa.field("first_date", pa.date32()),
+        pa.field("last_date", pa.date32()),
+    ]
+)
+REPORT_SCHEMA = pa.schema(
+    [
+        pa.field("source_code", pa.string(), nullable=False),
+        pa.field("source_symbol", pa.string(), nullable=False),
+        pa.field("reason", pa.string(), nullable=False),
+        pa.field("candidates", pa.int32(), nullable=False),
+    ]
+)
+# The reviewed manual mapping: exactly one of instrument_id / composite_figi per row.
+MANUAL_SCHEMA = pa.schema(
+    [
+        pa.field("source_code", pa.string(), nullable=False),
+        pa.field("source_symbol", pa.string(), nullable=False),
+        pa.field("instrument_id", pa.string()),
+        pa.field("composite_figi", pa.string()),
+        pa.field("valid_date", pa.date32(), nullable=False),
+        pa.field("valid_to", pa.date32()),
+        pa.field("link_reason", pa.string()),
+    ]
+)
+
+_FIGI = re.compile(r"BBG[0-9A-Z]{9}")  # always fullmatch
+_MOF_ID = re.compile(r"mof:[0-9a-f]{32}")  # always fullmatch
+_DAY = timedelta(days=1)
+_KEY = INSTRUMENT_IDENTIFIERS.natural_key
+_SCHEMA = INSTRUMENT_IDENTIFIERS.schema
+
+Series = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class MappingResult:
+    identifiers: pa.Table  # INSTRUMENT_IDENTIFIERS, conformed (empty schema'd table when none)
+    unresolved: pa.Table  # REPORT_SCHEMA
+    ambiguous: pa.Table  # REPORT_SCHEMA
+    minted: tuple[str, ...] = ()  # instrument ids created by this run
+
+
+@dataclass(frozen=True)
+class _Window:
+    instrument_id: str
+    start: date
+    end: date | None  # exclusive; None = open
+    composite: str | None  # the candidate that made it (None for a manual instrument_id row)
+
+
+# -- small helpers -----------------------------------------------------------------------------
+
+
+def _check_load_time(load_time: datetime) -> datetime:
+    if load_time.tzinfo is None or load_time.utcoffset() is None:
+        raise ValueError("load_time must be timezone-aware")
+    return load_time
+
+
+def _require(table: pa.Table, columns: Iterable[str], what: str) -> None:
+    missing = [c for c in columns if c not in table.column_names]
+    if missing:
+        raise ValueError(f"{what} lacks column(s) {missing}")
+
+
+def _overlaps(a: tuple[date | None, date | None], b: tuple[date | None, date | None]) -> bool:
+    lo = max(a[0] or date.min, b[0] or date.min)
+    hi = min(a[1] or date.max, b[1] or date.max)
+    return lo < hi
+
+
+def _row(
+    instrument_id: str,
+    scheme: str,
+    value: str,
+    start: date,
+    end: date | None,
+    source_code: str,
+    load: datetime,
+    link_reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "instrument_id": instrument_id,
+        "id_scheme": scheme,
+        "id_value": value,
+        "valid_to": end,
+        "link_reason": link_reason,
+        "known_at_basis": "load_time",
+        "valid_date": start,
+        "known_at": load,
+        "known_at_kind": "collected",
+        "source_code": source_code,
+        "source_doc_id": None,
+    }
+
+
+def _natural_key(row: Mapping[str, Any]) -> tuple:
+    return tuple(row[k] for k in _KEY)
+
+
+def _later_end(a: date | None, b: date | None) -> date | None:
+    return None if a is None or b is None else max(a, b)
+
+
+def _dedupe(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per natural key; identical keys keep the widest ``valid_to``."""
+    out: dict[tuple, dict[str, Any]] = {}
+    for r in rows:
+        key = _natural_key(r)
+        if key in out:
+            out[key]["valid_to"] = _later_end(out[key]["valid_to"], r["valid_to"])
+        else:
+            out[key] = dict(r)
+    return list(out.values())
+
+
+def _identifiers_table(rows: list[dict[str, Any]]) -> pa.Table:
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            r["instrument_id"],
+            r["id_scheme"],
+            r["id_value"],
+            r["source_code"],
+            r["valid_date"],
+        ),
+    )
+    table = pa.Table.from_pylist(rows, schema=_SCHEMA)
+    return conform(INSTRUMENT_IDENTIFIERS, table) if rows else table
+
+
+def _report(rows: list[tuple[Series, str, int]]) -> pa.Table:
+    return pa.Table.from_pylist(
+        [
+            {"source_code": s[0], "source_symbol": s[1], "reason": reason, "candidates": n}
+            for s, reason, n in sorted(rows)
+        ],
+        schema=REPORT_SCHEMA,
+    )
+
+
+# -- spans -------------------------------------------------------------------------------------
+
+
+def _spans_table(spans: Mapping[Series, tuple[date | None, date | None]]) -> pa.Table:
+    return pa.Table.from_pylist(
+        [
+            {"source_code": s[0], "source_symbol": s[1], "first_date": f, "last_date": la}
+            for s, (f, la) in sorted(spans.items())
+        ],
+        schema=SPAN_SCHEMA,
+    )
+
+
+def _min(a: date | None, b: date | None) -> date | None:
+    return b if a is None else a if b is None else min(a, b)
+
+
+def _max(a: date | None, b: date | None) -> date | None:
+    return b if a is None else a if b is None else max(a, b)
+
+
+def spans_from_fetch_log(fetch_log: pa.Table) -> pa.Table:
+    """``SPAN_SCHEMA`` rows from ``fetch_log`` rows: per series, the earliest ``requested_from``
+    (else ``returned_from``) and the latest ``returned_to`` (else ``requested_to``: a fetch
+    that returned nothing still covers its requested range)."""
+    cols = ("source_code", "source_symbol", "requested_from", "requested_to")
+    _require(fetch_log, (*cols, "returned_from", "returned_to"), "fetch_log")
+    out: dict[Series, tuple[date | None, date | None]] = {}
+    for r in fetch_log.to_pylist():
+        first = r["requested_from"] or r["returned_from"]
+        last = r["returned_to"] or r["requested_to"]
+        if first is None and last is None:
+            continue
+        s = (r["source_code"], r["source_symbol"])
+        f0, l0 = out.get(s, (None, None))
+        out[s] = (_min(f0, first), _max(l0, last))
+    return _spans_table(out)
+
+
+def spans_from_dates(table: pa.Table) -> pa.Table:
+    """``SPAN_SCHEMA`` rows: first and last ``valid_date`` per (source_code, source_symbol)."""
+    _require(table, ("source_code", "source_symbol", "valid_date"), "dated table")
+    if not table.num_rows:
+        return _spans_table({})
+    agg = table.group_by(["source_code", "source_symbol"]).aggregate(
+        [("valid_date", "min"), ("valid_date", "max")]
+    )
+    return combine_spans(
+        pa.table(
+            {
+                "source_code": agg["source_code"],
+                "source_symbol": agg["source_symbol"],
+                "first_date": agg["valid_date_min"].cast(pa.date32()),
+                "last_date": agg["valid_date_max"].cast(pa.date32()),
+            }
+        )
+    )
+
+
+def combine_spans(*spans: pa.Table) -> pa.Table:
+    """One ``SPAN_SCHEMA`` row per series: the widest span of every input."""
+    out: dict[Series, tuple[date | None, date | None]] = {}
+    for table in spans:
+        for s, (first, last) in _span_map(table).items():
+            f0, l0 = out.get(s, (None, None))
+            out[s] = (_min(f0, first), _max(l0, last))
+    return _spans_table(out)
+
+
+def _span_map(spans: pa.Table | None) -> dict[Series, tuple[date | None, date | None]]:
+    if spans is None:
+        return {}
+    _require(spans, SPAN_SCHEMA.names, "spans")
+    out: dict[Series, tuple[date | None, date | None]] = {}
+    for r in spans.select(SPAN_SCHEMA.names).to_pylist():
+        s = (r["source_code"], r["source_symbol"])
+        first, last = r["first_date"], r["last_date"]
+        if first is not None and last is not None and last < first:
+            raise ValueError(f"span of a {s[0]!r} series ends before it starts")
+        f0, l0 = out.get(s, (None, None))
+        out[s] = (_min(f0, first), _max(l0, last))
+    return out
+
+
+# -- manual mapping ----------------------------------------------------------------------------
+
+
+def _manual_problems(row: Mapping[str, Any]) -> list[str]:
+    """What is wrong with one typed manual row (never quoting a value: the file is private)."""
+    out = []
+    code = row.get("source_code")
+    if not isinstance(code, str) or not SOURCE_CODE_PATTERN.fullmatch(code):
+        out.append("source_code is not a source code")
+    if not row.get("source_symbol"):
+        out.append("source_symbol is empty")
+    inst, comp = row.get("instrument_id"), row.get("composite_figi")
+    if (inst is None) == (comp is None):
+        out.append("exactly one of instrument_id and composite_figi must be filled")
+    elif inst is not None and not _MOF_ID.fullmatch(inst):
+        out.append("instrument_id is not 'mof:' + 32 hex digits")
+    elif comp is not None and not _FIGI.fullmatch(comp):
+        out.append("composite_figi is not a FIGI (BBG + 9 characters)")
+    start, end = row.get("valid_date"), row.get("valid_to")
+    if start is None:
+        out.append("valid_date is missing")
+    elif end is not None and end <= start:
+        out.append("valid_to is not after valid_date")
+    reason = row.get("link_reason")
+    if reason is not None and reason not in LINK_REASONS:
+        out.append(f"link_reason must be one of {LINK_REASONS}")
+    return out
+
+
+def _parse_date(value: str | None, column: str, problems: list[str]) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        problems.append(f"{column} is not a date (YYYY-MM-DD)")
+        return None
+
+
+def load_manual_mapping(
+    path: str | Path | None = None, *, env: Mapping[str, str] | None = None
+) -> pa.Table | None:
+    """The reviewed manual mapping (``MANUAL_SCHEMA``) from ``path``, else from the private path
+    in ``MOF_MARKET_MANUAL_MAPPING``; None when neither is set.
+
+    CSV (UTF-8, comma, header): ``source_code``, ``source_symbol``, ``instrument_id`` and/or
+    ``composite_figi`` (exactly one filled per row), ``valid_date`` (YYYY-MM-DD), optional
+    ``valid_to`` (exclusive, empty = open) and ``link_reason`` (one of ``LINK_REASONS``, empty =
+    ``manual``). Any problem raises ``ValueError`` naming the data row, never a cell's value."""
+    if path is None:
+        raw = (os.environ if env is None else env).get(MANUAL_MAPPING_ENV, "").strip()
+        if not raw:
+            return None
+        path = raw
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        header = [h.strip() for h in next(reader, [])]
+        missing = [c for c in ("source_code", "source_symbol", "valid_date") if c not in header]
+        if not {"instrument_id", "composite_figi"} & set(header):
+            missing.append("instrument_id or composite_figi")
+        if missing:
+            raise ValueError(f"manual mapping: missing column(s) {missing}")
+        rows, problems = [], []
+        for i, cells in enumerate(reader, start=1):
+            if not any(c.strip() for c in cells):
+                continue
+            if len(cells) != len(header):
+                problems.append(f"data row {i}: {len(cells)} fields, header has {len(header)}")
+                continue
+            raw_row = {h: (c.strip() or None) for h, c in zip(header, cells, strict=True)}
+            row_problems: list[str] = []
+            row = {
+                "source_code": raw_row.get("source_code"),
+                "source_symbol": raw_row.get("source_symbol"),
+                "instrument_id": raw_row.get("instrument_id"),
+                "composite_figi": raw_row.get("composite_figi"),
+                "valid_date": _parse_date(raw_row.get("valid_date"), "valid_date", row_problems),
+                "valid_to": _parse_date(raw_row.get("valid_to"), "valid_to", row_problems),
+                "link_reason": raw_row.get("link_reason"),
+            }
+            row_problems += [p for p in _manual_problems(row) if p not in row_problems]
+            problems += [f"data row {i}: {p}" for p in row_problems]
+            rows.append(row)
+    if problems:
+        raise ValueError("manual mapping refused: " + "; ".join(problems))
+    return pa.Table.from_pylist(rows, schema=MANUAL_SCHEMA)
+
+
+def _manual_rows(manual: pa.Table) -> list[dict[str, Any]]:
+    _require(manual, MANUAL_SCHEMA.names, "manual mapping")
+    rows = manual.select(MANUAL_SCHEMA.names).to_pylist()
+    problems = [f"row {i}: {p}" for i, r in enumerate(rows, 1) for p in _manual_problems(r)]
+    # two rows of one series naming different targets on overlapping dates: the store would
+    # raise on every covered date, so refuse it here
+    by_series: dict[Series, list[tuple[int, Any, date, date | None]]] = defaultdict(list)
+    for i, r in enumerate(rows, 1):
+        target = r["instrument_id"] or r["composite_figi"]
+        by_series[(r["source_code"], r["source_symbol"])].append(
+            (i, target, r["valid_date"], r["valid_to"])
+        )
+    for entries in by_series.values():
+        for k, (i, t1, s1, e1) in enumerate(entries):
+            for j, t2, s2, e2 in entries[k + 1 :]:
+                if t1 != t2 and _overlaps((s1, e1), (s2, e2)):
+                    problems.append(f"rows {i} and {j}: overlapping windows, different targets")
+    if problems:
+        raise ValueError("manual mapping refused: " + "; ".join(problems))
+    return rows
+
+
+def _manual_from(prior: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The published manual mapping rows still in force, as manual rows."""
+    out = []
+    for r in prior:
+        if r["source_code"] != MANUAL_SOURCE or r["id_scheme"] != SYMBOL_SCHEME:
+            continue
+        if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
+            continue  # closed
+        source_code, _, symbol = r["id_value"].partition(":")
+        out.append(
+            {
+                "source_code": source_code,
+                "source_symbol": symbol,
+                "instrument_id": r["instrument_id"],
+                "composite_figi": None,
+                "valid_date": r["valid_date"],
+                "valid_to": r["valid_to"],
+                "link_reason": r["link_reason"],
+            }
+        )
+    return out
+
+
+# -- ids ---------------------------------------------------------------------------------------
+
+
+class _Ids:
+    """composite FIGI -> instrument_id, from the published rows, minting new ids on demand."""
+
+    def __init__(self, prior: list[dict[str, Any]]) -> None:
+        self.by_composite: dict[str, str] = {}
+        self.known: set[str] = set()
+        self.minted: list[str] = []
+        clashes = set()
+        for r in prior:
+            self.known.add(r["instrument_id"])
+            if r["id_scheme"] != "composite_figi":
+                continue
+            seen = self.by_composite.setdefault(r["id_value"], r["instrument_id"])
+            if seen != r["instrument_id"]:
+                clashes.add(r["id_value"])
+        if clashes:
+            raise ValueError(
+                f"existing identifiers put {len(clashes)} composite FIGI on several instruments; "
+                "fix them (a manual mapping) before building a new mapping"
+            )
+
+    def for_composite(self, composite: str) -> str:
+        if composite not in self.by_composite:
+            new = "mof:" + uuid.uuid4().hex
+            self.by_composite[composite] = new
+            self.known.add(new)
+            self.minted.append(new)
+        return self.by_composite[composite]
+
+
+# -- inputs ------------------------------------------------------------------------------------
+
+
+def _observation_rows(observations: pa.Table | None) -> list[dict[str, Any]]:
+    if observations is None or not observations.num_rows:
+        return []
+    cols = ["source_code", "source_symbol", "id_scheme", "id_value", "valid_date", "valid_to"]
+    _require(observations, cols, "observations")
+    rows = observations.select(cols).to_pylist()
+    bad_schemes = sorted({r["id_scheme"] for r in rows} - set(OBSERVED_SCHEMES), key=str)
+    if bad_schemes:
+        raise ValueError(
+            f"observation id_scheme(s) {bad_schemes} are not ones the mapping takes "
+            f"({OBSERVED_SCHEMES})"
+        )
+    for r in rows:
+        if not (r["source_code"] and r["source_symbol"] and r["id_value"]):
+            raise ValueError("an observation lacks its source_code, source_symbol or id_value")
+        if r["id_scheme"] == "composite_figi" and not _FIGI.fullmatch(r["id_value"]):
+            raise ValueError(f"a {r['source_code']!r} observation holds an invalid composite FIGI")
+        if r["valid_date"] and r["valid_to"] and r["valid_to"] <= r["valid_date"]:
+            raise ValueError(f"a {r['source_code']!r} observation window ends before it starts")
+    return rows
+
+
+def _figi_rows(figi_results: pa.Table | None) -> list[dict[str, Any]]:
+    if figi_results is None or not figi_results.num_rows:
+        return []
+    cols = ["source_code", "source_symbol", "figi", "composite_figi", "share_class_figi", "ticker"]
+    _require(figi_results, cols, "figi_results")
+    rows = [r for r in figi_results.select(cols).to_pylist() if r["composite_figi"]]
+    for r in rows:
+        if not _FIGI.fullmatch(r["composite_figi"]):
+            raise ValueError("an OpenFIGI result holds an invalid composite FIGI")
+    return rows
+
+
+# -- the mapping -------------------------------------------------------------------------------
+
+
+def _candidate_windows(
+    candidates: Mapping[str, tuple[date | None, date | None]],
+    span: tuple[date | None, date | None] | None,
+) -> tuple[str, dict[str, tuple[date, date | None]]]:
+    """("ok" | a report reason, {composite: [start, end)})."""
+    first, last = span if span else (None, None)
+    span_end = last + _DAY if last else None
+    if len(candidates) == 1:
+        ((composite, (start, end)),) = candidates.items()
+        if span:
+            start, end = first or start, span_end if last else end
+        if start is None:
+            return UNRESOLVED_NO_SPAN, {}
+        return "ok", {composite: (start, end)}
+    windows: dict[str, tuple[date, date | None]] = {}
+    for composite, (start, end) in candidates.items():
+        start = _max(start, first) if start else first
+        end = (min(end, span_end) if span_end else end) if end else span_end
+        if start is None:
+            return AMBIGUOUS_SEVERAL_COMPOSITES, {}
+        if end is not None and end <= start:
+            continue  # the source never served this candidate's dates
+        windows[composite] = (start, end)
+    if not windows:
+        return UNRESOLVED_OUTSIDE_SPAN, {}
+    items = list(windows.values())
+    if any(_overlaps(a, b) for i, a in enumerate(items) for b in items[i + 1 :]):
+        return AMBIGUOUS_SEVERAL_COMPOSITES, {}
+    return "ok", windows
+
+
+def _instrument_for_observation(row: Mapping[str, Any], windows: list[_Window]) -> _Window | None:
+    if row["id_scheme"] == "composite_figi":
+        own = [w for w in windows if w.composite == row["id_value"]]
+        if own:
+            return min(own, key=lambda w: w.start)
+    if len({w.instrument_id for w in windows}) == 1:
+        # a series that is one instrument: every label is its own, whatever its date (a
+        # history-file label is dated at the export, after a dead member's last price)
+        return min(windows, key=lambda w: w.start)
+    hits = [w for w in windows if _overlaps((row["valid_date"], row["valid_to"]), (w.start, w.end))]
+    if len({w.instrument_id for w in hits}) != 1:
+        return None
+    return min(hits, key=lambda w: w.start)
+
+
+def build_mapping(
+    observations: pa.Table | None,
+    figi_results: pa.Table | None = None,
+    *,
+    existing: pa.Table | None = None,
+    load_time: datetime,
+    spans: pa.Table | None = None,
+    manual: pa.Table | None = None,
+) -> MappingResult:
+    """``INSTRUMENT_IDENTIFIERS`` rows (identifier observations and ``source_symbol`` mapping
+    rows) plus the unresolved and ambiguous series. See the module docstring for the rules.
+
+    ``observations``: ``OBSERVATION_INPUT_SCHEMA`` rows (extra columns ignored);
+    ``figi_results``: ``openfigi.FIGI_RESULT_SCHEMA`` rows; ``existing``: the published
+    ``INSTRUMENT_IDENTIFIERS`` rows (read latest here); ``spans``: ``SPAN_SCHEMA``;
+    ``manual``: ``MANUAL_SCHEMA`` (``load_manual_mapping``)."""
+    load = _check_load_time(load_time)
+    obs = _observation_rows(observations)
+    figi = _figi_rows(figi_results)
+    span_of = _span_map(spans)
+    prior = latest(existing, _KEY).to_pylist() if existing is not None and existing.num_rows else []
+    ids = _Ids(prior)
+    manual_given = manual is not None
+    manual_rows = _manual_rows(manual) if manual_given else _manual_from(prior)
+    manual_series = {(r["source_code"], r["source_symbol"]) for r in manual_rows}
+
+    observed: dict[Series, dict[str, tuple[date | None, date | None]]] = defaultdict(dict)
+    for r in obs:
+        if r["id_scheme"] == "composite_figi":
+            hull = observed[(r["source_code"], r["source_symbol"])]
+            window = (r["valid_date"], r["valid_to"])
+            if r["id_value"] in hull:
+                old = hull[r["id_value"]]
+                start = None if old[0] is None or window[0] is None else min(old[0], window[0])
+                window = (start, _later_end(old[1], window[1]))
+            hull[r["id_value"]] = window
+    from_figi: dict[Series, set[str]] = defaultdict(set)
+    for r in figi:
+        from_figi[(r["source_code"], r["source_symbol"])].add(r["composite_figi"])
+
+    scope = (
+        {(r["source_code"], r["source_symbol"]) for r in obs}
+        | set(from_figi)
+        | set(span_of)
+        | manual_series
+    )
+    unresolved: list[tuple[Series, str, int]] = []
+    ambiguous: list[tuple[Series, str, int]] = []
+    windows_of: dict[Series, list[_Window]] = defaultdict(list)
+    via_openfigi: set[Series] = set()
+    mapping: list[dict[str, Any]] = []
+
+    for s in sorted(scope - manual_series):
+        if s in observed:
+            candidates = observed[s]
+        elif s in from_figi:
+            candidates = dict.fromkeys(from_figi[s], (None, None))
+            via_openfigi.add(s)
+        else:
+            unresolved.append((s, UNRESOLVED_NO_COMPOSITE, 0))
+            continue
+        status, windows = _candidate_windows(candidates, span_of.get(s))
+        if status == AMBIGUOUS_SEVERAL_COMPOSITES:
+            ambiguous.append((s, status, len(candidates)))
+            continue
+        if status != "ok":
+            unresolved.append((s, status, len(candidates)))
+            continue
+        for composite, (start, end) in sorted(windows.items(), key=lambda kv: kv[1][0]):
+            inst = ids.for_composite(composite)
+            windows_of[s].append(_Window(inst, start, end, composite))
+            mapping.append(_row(inst, SYMBOL_SCHEME, f"{s[0]}:{s[1]}", start, end, s[0], load))
+
+    # two or more symbols of one source on one instrument: a venue change (or a rename)
+    symbols_of: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for r in mapping:
+        symbols_of[(r["source_code"], r["instrument_id"])].add(r["id_value"])
+    for r in mapping:
+        if len(symbols_of[(r["source_code"], r["instrument_id"])]) > 1:
+            r["link_reason"] = "venue_change"
+
+    labels: list[dict[str, Any]] = []
+    for i, m in enumerate(manual_rows, 1):
+        if m["instrument_id"] is not None:
+            if m["instrument_id"] not in ids.known:
+                raise ValueError(
+                    f"manual mapping row {i}: unknown instrument_id (neither published nor "
+                    "minted in this run)"
+                )
+            inst = m["instrument_id"]
+        else:
+            inst = ids.for_composite(m["composite_figi"])
+            labels.append(
+                _row(inst, "composite_figi", m["composite_figi"], m["valid_date"], None,
+                     MANUAL_SOURCE, load)
+            )  # fmt: skip
+        s = (m["source_code"], m["source_symbol"])
+        windows_of[s].append(_Window(inst, m["valid_date"], m["valid_to"], m["composite_figi"]))
+        mapping.append(
+            _row(inst, SYMBOL_SCHEME, f"{s[0]}:{s[1]}", m["valid_date"], m["valid_to"],
+                 MANUAL_SOURCE, load, m["link_reason"] or "manual")
+        )  # fmt: skip
+
+    for r in obs:
+        windows = windows_of.get((r["source_code"], r["source_symbol"]))
+        if not windows:
+            continue
+        w = _instrument_for_observation(r, windows)
+        if w is None:
+            continue
+        labels.append(
+            _row(w.instrument_id, r["id_scheme"], r["id_value"], r["valid_date"] or w.start,
+                 r["valid_to"], r["source_code"], load)
+        )  # fmt: skip
+    for r in figi:
+        s = (r["source_code"], r["source_symbol"])
+        if s not in via_openfigi or s in manual_series or not windows_of.get(s):
+            continue
+        (w,) = windows_of[s]
+        if r["composite_figi"] != w.composite:
+            continue
+        for scheme, end in (
+            ("composite_figi", None),
+            ("figi", None),
+            ("share_class_figi", None),
+            ("ticker", w.end),
+        ):
+            if r[scheme]:
+                labels.append(
+                    _row(w.instrument_id, scheme, r[scheme], w.start, end, OPENFIGI_SOURCE, load)
+                )
+
+    # close published mapping rows this run supersedes
+    emitted = {_natural_key(r) for r in mapping}
+    in_scope = {f"{s[0]}:{s[1]}" for s in scope}
+    for r in prior:
+        if r["id_scheme"] != SYMBOL_SCHEME or _natural_key(r) in emitted:
+            continue
+        if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
+            continue  # already closed
+        if r["id_value"] in in_scope or (manual_given and r["source_code"] == MANUAL_SOURCE):
+            mapping.append(
+                _row(r["instrument_id"], SYMBOL_SCHEME, r["id_value"], r["valid_date"],
+                     r["valid_date"], r["source_code"], load, r["link_reason"])
+            )  # fmt: skip
+
+    return MappingResult(
+        identifiers=_identifiers_table(mapping + _dedupe(labels)),
+        unresolved=_report(unresolved),
+        ambiguous=_report(ambiguous),
+        minted=tuple(ids.minted),
+    )
+
+
+# -- issuer link -------------------------------------------------------------------------------
+
+
+def _norm_ticker(value: str) -> str:
+    return value.strip().upper().replace(".", "-").replace("/", "-")
+
+
+def link_issuers(
+    identifiers: pa.Table,
+    sec_tickers: pa.Table,
+    *,
+    load_time: datetime,
+    as_of: date | None = None,
+    max_staleness_days: int = CURRENT_MAX_STALENESS_DAYS,
+) -> pa.Table:
+    """``identifiers`` plus a ``cik`` row (source ``sec``) for each current instrument whose
+    current ticker is in ``sec_tickers`` (the SEC ``company_tickers.json`` map: columns ``cik``,
+    ``ticker``; others ignored). See the module docstring for "current". Tickers compare
+    case-insensitively with ``.`` and ``/`` read as ``-`` (``BRK.B`` = ``BRK-B``). The CIK is
+    written as 10 digits; ``valid_date`` is the load date (the map is a present-time
+    observation), open-ended; ``known_at`` = ``load_time`` (``collected`` / ``load_time``)."""
+    load = _check_load_time(load_time)
+    if max_staleness_days < 0:
+        raise ValueError("max_staleness_days must be >= 0")
+    _require(sec_tickers, ("cik", "ticker"), "sec_tickers")
+    rows = latest(identifiers, _KEY).to_pylist() if identifiers.num_rows else []
+
+    open_end = date.max
+    last: dict[str, date] = {}  # instrument -> last mapped date (date.max while open)
+    for r in rows:
+        if r["id_scheme"] != SYMBOL_SCHEME:
+            continue
+        if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
+            continue
+        end = open_end if r["valid_to"] is None else r["valid_to"] - _DAY
+        last[r["instrument_id"]] = max(last.get(r["instrument_id"], date.min), end)
+    if as_of is None:
+        finite = [d for d in last.values() if d != open_end]
+        as_of = max(finite) if finite else None
+    floor = as_of - timedelta(days=max_staleness_days) if as_of else None
+    current = {i for i, d in last.items() if floor is None or d >= floor}
+
+    latest_ticker: dict[str, tuple[date, set[str]]] = {}
+    for r in rows:
+        if r["id_scheme"] != "ticker" or r["instrument_id"] not in current:
+            continue
+        if as_of is not None and r["valid_to"] is not None and r["valid_to"] <= as_of:
+            continue  # closed before as_of
+        inst, value = r["instrument_id"], _norm_ticker(r["id_value"])
+        start, values = latest_ticker.get(inst, (date.min, set()))
+        if r["valid_date"] > start:
+            latest_ticker[inst] = (r["valid_date"], {value})
+        elif r["valid_date"] == start:
+            values.add(value)
+            latest_ticker[inst] = (start, values)
+    claims: dict[str, set[str]] = defaultdict(set)
+    for inst, (_, values) in latest_ticker.items():
+        if len(values) == 1:
+            claims[next(iter(values))].add(inst)
+
+    ciks: dict[str, set[str]] = defaultdict(set)
+    for cik, ticker in zip(
+        sec_tickers["cik"].to_pylist(), sec_tickers["ticker"].to_pylist(), strict=True
+    ):
+        if cik is None or not ticker:
+            continue
+        try:
+            number = int(str(cik).strip())
+        except ValueError:
+            raise ValueError("sec_tickers holds a CIK that is not a number") from None
+        ciks[_norm_ticker(ticker)].add(f"{number:010d}")
+
+    load_date = load.astimezone(UTC).date()
+    new = [
+        _row(next(iter(insts)), "cik", next(iter(ciks[t])), load_date, None, SEC_SOURCE, load)
+        for t, insts in sorted(claims.items())
+        if len(insts) == 1 and len(ciks.get(t, ())) == 1
+    ]
+    base = identifiers.select(_SCHEMA.names).cast(_SCHEMA)
+    table = pa.concat_tables([base, pa.Table.from_pylist(new, schema=_SCHEMA)])
+    return conform(INSTRUMENT_IDENTIFIERS, table) if table.num_rows else table

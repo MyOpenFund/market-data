@@ -72,7 +72,10 @@ def test_sources_registered_with_expected_access():
         "massive",
         "tiingo",
         "private_history",
+        "manual",
     }
+    assert by_code["manual"].no_public_display and by_code["manual"].no_ml_training
+    assert by_code["sec"].access == "open" and by_code["sec"].attribution == "SEC EDGAR"
     assert by_code["openfigi"].access == "open"
     assert by_code["openfigi"].attribution == "OpenFIGI"
     assert by_code["massive"].no_public_display and by_code["massive"].no_ml_training
@@ -80,7 +83,9 @@ def test_sources_registered_with_expected_access():
 
 
 def test_sources_discovered_through_entry_point():
-    assert {"massive", "tiingo", "private_history", "openfigi"} <= set(discover_sources())
+    assert {"massive", "tiingo", "private_history", "openfigi", "manual", "sec"} <= set(
+        discover_sources()
+    )
 
 
 def test_adapter_not_allowed_is_not_loaded(monkeypatch):
