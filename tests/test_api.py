@@ -403,11 +403,29 @@ def test_server_profile_unknown_instrument_never_names_a_restricted_label(store)
     assert set(out["instrument_id"].to_pylist()) == {I2}
 
 
-def test_server_profile_label_resolved_on_the_as_of_date(store):
-    # a ticker closed before as_of names nothing then
+def test_server_profile_label_resolved_on_the_latest_mapping(store):
+    # inputs resolve through the latest mapping (spec 9.3), whatever as_of: AAA names I1 now,
+    # even for an as_of before its ticker row starts (nothing was known then: no rows)
     kw = dict(profile="server", store=store, allowed_restricted={"tiingo"})
-    with pytest.raises(UnknownInstrumentError):
-        api.prices(["AAA"], START, END, as_of=datetime(1999, 1, 1, tzinfo=UTC), **kw)
+    out = api.prices(["AAA"], START, END, as_of=datetime(1999, 1, 1, tzinfo=UTC), **kw)
+    assert out.num_rows == 0
+
+
+def test_server_profile_closed_label_names_nothing_even_for_an_earlier_as_of(tmp_path):
+    ids = [
+        _ident(I1, "source_symbol", "tiingo:AAA", "tiingo"),
+        _ident(I1, "ticker", "OLD", "openfigi", valid_to=date(2010, 1, 1)),
+        _ident(I1, "ticker", "AAA", "openfigi", valid=date(2010, 1, 1)),
+    ]
+    prices = [_price("AAA", d, 100.0) for d in SESS["session_date"].to_pylist()]
+    with junction_store(tmp_path, prices, ids) as store:
+        kw = dict(profile="server", store=store, as_of=AS_OF, allowed_restricted={"tiingo"})
+        with pytest.raises(UnknownInstrumentError):
+            api.prices(["OLD"], START, END, **kw)
+        early = dict(kw, as_of=datetime(2005, 1, 1, tzinfo=UTC))
+        with pytest.raises(UnknownInstrumentError):
+            api.prices(["OLD"], START, END, **early)
+        assert api.prices(["AAA"], START, END, **kw).num_rows == 5
 
 
 # --- review fixes: scoped server reads, no-data errors -------------------------------------------
@@ -533,3 +551,110 @@ def test_server_profile_symbol_reused_by_another_instrument(tmp_path):
             out = api.prices(["BBB"], START, END, **kw, **extra)
             assert set(out["instrument_id"].to_pylist()) == {I2}, extra
             assert out["session_date"].to_pylist() == later, extra
+
+
+# --- final review: precedence across a junction, scoped reads -----------------------------------
+
+
+class junction_store:
+    """A store holding ``prices`` and ``ids`` (a context manager yielding the open store)."""
+
+    def __init__(self, tmp_path, prices, ids, actions=()):
+        self.cfg = StoreConfig(
+            data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake")
+        )
+        for c in MARKET_CONTRACTS:
+            approve_contract(self.cfg, c, "test")
+        for contract, rows in (
+            (PRICES, prices),
+            (INSTRUMENT_IDENTIFIERS, ids),
+            (CORPORATE_ACTIONS, list(actions)),
+        ):
+            if rows:
+                write_batch(
+                    contract,
+                    pa.Table.from_pylist(rows, schema=contract.schema),
+                    landing_root=self.cfg.landing,
+                    run_id="t",
+                    producer="test",
+                )
+        assert publish_pending(self.cfg).exit_code == 0
+
+    def __enter__(self):
+        self.store = Store.open(self.cfg)
+        return self.store
+
+    def __exit__(self, *exc):
+        self.store.close()
+
+
+def test_server_profile_precedence_spans_a_junction(tmp_path):
+    days = SESS["session_date"].to_pylist()
+    prices = [_price("t_x", d, 100.0 + i, source="private_history") for i, d in enumerate(days[:3])]
+    prices += [_price("AAA", d, 500.0 + i, source="massive") for i, d in enumerate(days[2:], 2)]
+    ids = [
+        _ident(I1, "source_symbol", "private_history:t_x", "private_history"),
+        _ident(I1, "source_symbol", "massive:AAA", "massive"),
+        _ident(I1, "ticker", "AAA", "openfigi"),
+    ]
+    allowed = {"private_history", "massive"}
+    with junction_store(tmp_path, prices, ids) as store:
+        kw = dict(profile="server", store=store, as_of=AS_OF, allowed_restricted=allowed)
+        out = api.prices(["AAA"], START, END, precedence=["private_history", "massive"], **kw)
+        assert out["close"].to_pylist() == [100.0, 101.0, 102.0, 503.0, 504.0]
+        assert out["source_code"].to_pylist() == ["private_history"] * 3 + ["massive"] * 2
+        tr = api.prices(
+            ["AAA"], START, END, adjust="total_return", precedence=["private_history", "massive"],
+            **kw,
+        )  # fmt: skip
+        assert tr.num_rows == 5
+        # without a precedence the overlapping session clashes; source= still filters
+        with pytest.raises(api.ApiError, match="pass source="):
+            api.prices(["AAA"], START, END, **kw)
+        only = api.prices(["AAA"], START, END, source="massive", **kw)
+        assert only["close"].to_pylist() == [502.0, 503.0, 504.0]
+        with pytest.raises(RestrictedSourceError):
+            api.prices(
+                ["AAA"], START, END, profile="server", store=store, as_of=AS_OF,
+                allowed_restricted={"massive"}, precedence=["private_history", "massive"],
+            )  # fmt: skip
+        with pytest.raises(TypeError):
+            api.prices(["AAA"], START, END, precedence="massive", **kw)
+
+
+class SpyStore:
+    """A store wrapper recording each read_asof (dataset, filters, rows returned)."""
+
+    def __init__(self, store):
+        self.store = store
+        self.reads: list[tuple[str, dict | None, int]] = []
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def read_asof(self, dataset, as_of=None, **kw):
+        table = self.store.read_asof(dataset, as_of, **kw)
+        self.reads.append((dataset, kw.get("filters"), table.num_rows))
+        return table
+
+
+def test_server_profile_reads_only_the_requested_series(busy_store):
+    spy = SpyStore(busy_store)
+    kw = dict(profile="server", store=spy, as_of=AS_OF, allowed_restricted={"tiingo", "massive"})
+    out = api.prices(["BBB"], START, END, adjust="total_return", **kw)
+    assert set(out["instrument_id"].to_pylist()) == {I2}
+    by_dataset = {name.rsplit("_v", 1)[0]: (f, rows) for name, f, rows in spy.reads}
+    assert by_dataset["prices"][0] == {"source_code": ["tiingo"], "source_symbol": ["BBB"]}
+    assert all(f is not None for name, f, _ in spy.reads if name.startswith("corporate"))
+    assert by_dataset["prices"][1] == 5  # BBB's rows only, never AAA's or CCC's
+    assert by_dataset["instrument_identifiers"][0] is None  # the mapping is read first, whole
+    assert spy.reads[0][0].startswith("instrument_identifiers")
+    assert "index_snapshots" not in by_dataset and "fetch_log" not in by_dataset
+
+
+def test_server_profile_reads_only_the_requested_actions(store):
+    spy = SpyStore(store)
+    kw = dict(profile="server", store=spy, as_of=AS_OF, allowed_restricted={"tiingo"})
+    api.prices(["42"], START, END, adjust="total_return", **kw)
+    (actions,) = [(f, rows) for name, f, rows in spy.reads if name.startswith("corporate")]
+    assert actions == ({"source_code": ["tiingo"], "source_symbol": ["BBB"]}, 0)  # not AAA's

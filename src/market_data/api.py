@@ -22,15 +22,21 @@ Profile ``none`` (default: the README "Try it")
     what the source knows today (actions and corrections included).
 
 Profile ``server``
-    Reads a store (``store``, else ``Store.open()`` from the environment) with
-    ``load_market_inputs`` in strict mode as known at ``as_of``: restricted sources are dropped
-    unless listed in ``allowed_restricted``, unregistered ones always. Inputs are tickers, CIKs
-    (digits, zero-padded to 10), FIGIs (``figi``, ``composite_figi``, ``share_class_figi``) or
-    instrument ids (``mof:...``), resolved through the latest identifiers that the gate lets
-    through, on ``as_of``'s UTC date (a label closed before then names nothing). ``source``
-    selects one source (precedence) and must be allowed when restricted; without it, two
-    sources for one (instrument, session) raise (the recipe's rule). Output is keyed by
-    ``instrument_id`` only: an as-of answer carries no label.
+    Reads a store (``store``, else ``Store.open()`` from the environment) through the store
+    binding's strict licence gate (``load_market_inputs``' rule): restricted sources are
+    dropped unless listed in ``allowed_restricted``, unregistered ones always. The identifiers
+    are read first (latest); then only the requested instruments' series are read from
+    ``prices`` (and ``corporate_actions`` for a total return), as known at ``as_of``, through
+    natural-key filters: a call never reads the whole store. Inputs are tickers, CIKs (digits,
+    zero-padded to 10), FIGIs (``figi``, ``composite_figi``, ``share_class_figi``) or
+    instrument ids (``mof:...``), resolved through the latest mapping (spec §9.3: the
+    identifier rows the gate lets through, open today; a label closed since names nothing,
+    whatever ``as_of``). ``source`` filters to one source and must be allowed when
+    restricted; ``precedence`` orders several (the first with a row wins per instrument and
+    session, so a series spans the private history then a daily provider; each restricted one
+    must be allowed); with neither, two sources for one (instrument, session) raise (the
+    recipe's rule). Output is keyed by ``instrument_id`` only: an as-of answer carries no
+    label.
 
 Output (sorted by instrument_id, session_date; ``start``..``end`` inclusive)
     ``adjust="raw"``: ``RAW_LIVE_SCHEMA`` / ``RAW_SERVER_SCHEMA`` (raw close, volume, currency,
@@ -55,17 +61,21 @@ one, and the message still names the caller's inputs only.
 from __future__ import annotations
 
 import os
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 
 import pyarrow as pa
 import pyarrow.compute as pc
 from open_data_store import sources as registry
-from open_data_store.contracts.standard.market import INSTRUMENT_IDENTIFIERS
+from open_data_store.contracts.base import Contract
+from open_data_store.contracts.standard.market import (
+    CORPORATE_ACTIONS,
+    INSTRUMENT_IDENTIFIERS,
+    PRICES,
+)
 from open_data_store.market.asof import latest, sessions
 from open_data_store.market.returns import resolve_actions, resolve_prices, total_return
-from open_data_store.market.store import load_market_inputs
 
 from market_data.adapters.base import Adapter, Secret
 from market_data.archive import MemoryArchive
@@ -224,6 +234,7 @@ def prices(
     allowed_restricted: Collection[str] = frozenset(),
     mic: str = DEFAULT_MIC,
     adapter: Adapter | None = None,
+    precedence: Sequence[str] | None = None,
 ) -> pa.Table:
     """Daily prices of ``instruments`` from ``start`` to ``end`` (inclusive); see the module
     docstring for the profiles, the output and the errors.
@@ -234,7 +245,10 @@ def prices(
     (only a store keeps earlier vintages). ``allowed_restricted``: restricted source codes the
     server profile may read. ``mic``: the session calendar. ``adapter``: an adapter to use
     instead of building the live one from ``source`` and the key (tests, a custom adapter);
-    the caller closes it."""
+    the caller closes it. ``precedence`` (server): source codes in order, the first with a row
+    wins per (instrument, session), so one series spans a junction (the private history,
+    then a daily provider); sources it leaves out are ignored, each restricted one must be
+    allowed; ``source=`` still filters to one source."""
     if adjust not in _ADJUST:
         raise ValueError(f"adjust must be one of {_ADJUST}, got {adjust!r}")
     if profile not in _PROFILES:
@@ -243,9 +257,23 @@ def prices(
         raise ValueError(f"start {start.isoformat()} is after end {end.isoformat()}")
     labels = _inputs(instruments)
     at = _aware(as_of)
+    order = _precedence(precedence)
     if profile == "none":
+        if order:
+            raise ValueError("precedence applies to the server profile only (one live source)")
         return _live(labels, start, end, source, adjust, at, mic, api_key, adapter)
-    return _server(labels, start, end, source, adjust, at, mic, store, allowed_restricted)
+    return _server(labels, start, end, source, adjust, at, mic, store, allowed_restricted, order)
+
+
+def _precedence(precedence: Sequence[str] | None) -> tuple[str, ...]:
+    if precedence is None:
+        return ()
+    if isinstance(precedence, str):
+        raise TypeError("precedence must be a sequence of source codes, not a string")
+    order = tuple(dict.fromkeys(precedence))
+    if not all(isinstance(c, str) and c for c in order):
+        raise ValueError("precedence must hold source codes (non-empty strings)")
+    return order
 
 
 # --- profile none ------------------------------------------------------------------------------
@@ -415,6 +443,37 @@ def _resolve_inputs(labels: list[str], identifiers: pa.Table, on: date) -> dict[
     return out
 
 
+def _read_gated(
+    store: Any,
+    contract: Contract,
+    at: datetime,
+    allowed: frozenset[str],
+    known: Mapping[str, Any],
+    filters: dict[str, list[str]] | None = None,
+) -> pa.Table:
+    """``contract``'s rows as known at ``at`` (only those ``filters`` select), through the
+    store binding's strict licence gate (``load_market_inputs``' rule): restricted sources
+    dropped unless allowed, unregistered ones always."""
+    from open_data_store.reader.api import UnknownDataset
+
+    name = contract.table_name
+    try:
+        published = store.is_published(name)
+    except UnknownDataset:
+        published = False
+    if not published:
+        return contract.schema.empty_table()
+    table = store.read_asof(name, at, filters=filters)
+    table = registry.filter_sources(
+        table,
+        allowed_restricted=allowed,
+        restricted=registry.restricted_codes(known),
+        strict=True,
+        registered=frozenset(known),
+    )
+    return table.select(contract.schema.names).cast(contract.schema)
+
+
 def _server(
     labels: list[str],
     start: date,
@@ -425,24 +484,44 @@ def _server(
     mic: str,
     store: Any,
     allowed_restricted: Collection[str],
+    order: tuple[str, ...] = (),
 ) -> pa.Table:
     allowed = frozenset(allowed_restricted)
     _check_source(source, allowed)
+    for code in order:
+        _check_source(code, allowed)
+    known = registry.discover_sources()
     own = store is None
     if own:
         from open_data_store.reader import Store
 
         store = Store.open()
     try:
-        inputs = load_market_inputs(store, as_of=as_of, allowed_restricted=allowed)
+        # the mapping first (read latest, spec 9.3), then only the requested series' facts
+        now = datetime.now(UTC)
+        identifiers = _read_gated(store, INSTRUMENT_IDENTIFIERS, now, allowed, known)
+        named = _resolve_inputs(labels, identifiers, now.date())
+        series = _series_of(identifiers, set(named.values()))
+        tokens = set().union(*series.values())
+        if source is not None:
+            tokens = {t for t in tokens if t.partition(":")[0] == source}
+        elif order:
+            tokens = {t for t in tokens if t.partition(":")[0] in order}
+        filters = None
+        if tokens:
+            parts = [t.partition(":") for t in tokens]
+            filters = {
+                "source_code": sorted({p[0] for p in parts}),
+                "source_symbol": sorted({p[2] for p in parts}),
+            }
+        prices_in = _facts(store, PRICES, as_of, allowed, known, filters, tokens)
+        actions_in = None
+        if adjust != "raw":
+            actions_in = _facts(store, CORPORATE_ACTIONS, as_of, allowed, known, filters, tokens)
     finally:
         if own:
             store.close()
-    named = _resolve_inputs(labels, inputs.identifiers, as_of.astimezone(UTC).date())
-    series = _series_of(inputs.identifiers, set(named.values()))
-    prices_in = _of_series(inputs.prices, set().union(*series.values()))
-    actions_in = _of_series(inputs.actions, set().union(*series.values()))
-    precedence = (source,) if source else ()
+    precedence = (source,) if source else order
     wanted = pa.array(sorted(set(named.values())), pa.string())
 
     def requested(table: pa.Table) -> pa.Table:
@@ -452,12 +531,12 @@ def _server(
 
     def resolved_for(tokens: set[str]) -> tuple[pa.Table, pa.Table | None]:
         rp = resolve_prices(
-            _of_series(prices_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
+            _of_series(prices_in, tokens), identifiers, as_of=as_of, precedence=precedence
         )
-        if adjust == "raw":
+        if actions_in is None:
             return requested(rp), None
         ra = resolve_actions(
-            _of_series(actions_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
+            _of_series(actions_in, tokens), identifiers, as_of=as_of, precedence=precedence
         )
         return requested(rp), requested(ra)
 
@@ -473,7 +552,7 @@ def _server(
                 clashing.append(label)
         raise ApiError(
             f"several sources (or conflicting series) for {clashing[:_MAX_LISTED]} on one "
-            "session; pass source= to choose one"
+            "session; pass source= to choose one, or precedence= to order them"
         ) from None
     if source is not None:
         window = _in_range(resolved, "session_date", start, end)
@@ -489,6 +568,22 @@ def _server(
         return _raw(resolved, start, end).cast(RAW_SERVER_SCHEMA)
     assert actions is not None
     return _total_return(resolved, actions, start, end, mic).cast(TOTAL_RETURN_SERVER_SCHEMA)
+
+
+def _facts(
+    store: Any,
+    contract: Contract,
+    as_of: datetime,
+    allowed: frozenset[str],
+    known: Mapping[str, Any],
+    filters: dict[str, list[str]] | None,
+    tokens: set[str],
+) -> pa.Table:
+    """The rows of ``tokens``' series as known at ``as_of`` (none read without a series)."""
+    if not tokens:
+        return contract.schema.empty_table()
+    table = _read_gated(store, contract, as_of, allowed, known, filters)
+    return _of_series(table, tokens)
 
 
 def _series_of(identifiers: pa.Table, instruments: set[str]) -> dict[str, set[str]]:
