@@ -24,6 +24,32 @@ one instrument per composite FIGI. Two optional settings, both environment varia
   the automatic mapping for the series it names. Keep it on a private path: it is never
   published.
 
+## Try it: prices in a notebook (`none` profile)
+
+With your own free [Tiingo](https://www.tiingo.com) key in `TIINGO_API_KEY`:
+
+```python
+from datetime import date
+from market_data.api import prices
+
+prices(["AAPL", "MSFT"], date(2024, 1, 2), date(2024, 3, 28))  # raw daily closes
+prices(["AAPL"], date(2024, 1, 2), date(2024, 3, 28), adjust="total_return")
+```
+
+Nothing is stored: the data is fetched with your key, built in memory and returned to you.
+Rows are keyed by an in-memory id (`live:tiingo:AAPL`, not a store instrument id) and your
+input. On a store (`profile="server"`), inputs may be tickers, CIKs, FIGIs or instrument ids,
+and restricted sources are read only when you allow them (`allowed_restricted`).
+
+## Operator commands (`server` profile)
+
+`market-data load-history | fetch | map | build | report`: every command is a dry run unless
+`--write`, prints one summary line and exits 0 (ok), 1 (degraded; 0 with `--allow-degraded`) or
+2 (error). Paths come from flags or `MOF_MARKET_ARCHIVE`, `MOF_MARKET_REPORTS` (private, outside
+any git checkout), `OPEN_DATA_STORE_DATA_ROOT` (landing) and `OPEN_DATA_STORE_CATALOG` (published
+identifiers). See `market-data <command> --help` and the docstrings of `market_data.cli` and
+`market_data.pipeline`.
+
 ## Writing an adapter in your own package
 
 Implement the `market_data.adapters.Adapter` protocol (`source_code`, `info`, `fetch`, `parse`),

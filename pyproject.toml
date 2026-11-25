@@ -35,6 +35,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff==0.17.3", "build", "twine"]
 
+[project.scripts]
+market-data = "market_data.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/MyOpenFund/market-data"
 Source = "https://github.com/MyOpenFund/market-data"

@@ -198,3 +198,45 @@ class RawArchive:
 
 def _parse_date(value: str | None) -> date | None:
     return None if value is None else date.fromisoformat(value)
+
+
+class MemoryArchive:
+    """The ``RawArchive`` reading interface over fetches held in memory: nothing is persisted.
+
+    For the in-memory paths (the API's ``none`` profile, a fetch run's own summary): the builder
+    reads it exactly as it reads the on-disk archive, so the same rows come out. References are
+    ``memory:<n>`` (n zero-padded) in put order; ``history_with_refs`` and ``symbols`` follow
+    ``RawArchive``'s ordering."""
+
+    def __init__(self) -> None:
+        self._entries: list[ArchivedFetch] = []
+
+    def put(self, result: FetchResult) -> str:
+        ref = f"memory:{len(self._entries):08d}"
+        self._entries.append(ArchivedFetch(ref, result))
+        return ref
+
+    def history(self, source_code: str, source_symbol: str, kind: str) -> Iterator[FetchResult]:
+        for entry in self.history_with_refs(source_code, source_symbol, kind):
+            yield entry.result
+
+    def history_with_refs(
+        self, source_code: str, source_symbol: str, kind: str
+    ) -> Iterator[ArchivedFetch]:
+        entries = [
+            e
+            for e in self._entries
+            if (e.result.source_code, e.result.source_symbol, e.result.kind)
+            == (source_code, source_symbol, kind)
+        ]
+        entries.sort(key=lambda e: (e.result.fetched_at.astimezone(UTC), e.archive_ref))
+        yield from entries
+
+    def symbols(self, source_code: str, kind: str) -> list[str]:
+        return sorted(
+            {
+                e.result.source_symbol
+                for e in self._entries
+                if e.result.source_code == source_code and e.result.kind == kind
+            }
+        )
