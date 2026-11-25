@@ -1152,8 +1152,7 @@ def _holds_key(value, key: str, depth: int = 0) -> bool:
         return any(_holds_key(v, key, depth + 1) for _, v in value.raw)
     if isinstance(value, dict):
         return any(
-            _holds_key(k, key, depth + 1) or _holds_key(v, key, depth + 1)
-            for k, v in value.items()
+            _holds_key(k, key, depth + 1) or _holds_key(v, key, depth + 1) for k, v in value.items()
         )
     if isinstance(value, list | tuple | set | frozenset):
         return any(_holds_key(v, key, depth + 1) for v in value)

@@ -872,3 +872,12 @@ def test_report_precedence_error_never_quotes_a_series(env, run, monkeypatch, ca
     assert run("report", "--index", "IDX1") == EXIT_ERROR
     err = capsys.readouterr().err
     assert "pass --precedence" in err and "t_secret" not in err
+
+
+def test_map_openfigi_without_a_key_says_how_to_get_one(env, run, monkeypatch, capsys):
+    from market_data.resolve import openfigi
+
+    monkeypatch.delenv("OPENFIGI_API_KEY", raising=False)
+    monkeypatch.setattr(openfigi.OpenFigiClient, "map", lambda self, jobs: [])
+    assert run("map", "--no-existing", "--openfigi") in (EXIT_OK, EXIT_DEGRADED)
+    assert openfigi.KEY_HELP in capsys.readouterr().err

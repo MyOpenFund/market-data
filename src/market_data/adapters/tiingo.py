@@ -162,6 +162,7 @@ __all__ = [
     "FREE_PLAN_PER_HOUR",
     "FREE_PLAN_UNIQUE_SYMBOLS_PER_MONTH",
     "KEPT_OUT_REASONS",
+    "KEY_HELP",
     "MAX_VOLUME",
     "MISSING_FIELD",
     "NON_FINITE",
@@ -239,7 +240,7 @@ VENDOR_ADJUSTED_SCHEMA = pa.schema(
     ]
 )
 
-_GET_A_KEY = (
+KEY_HELP = (
     f"set {API_KEY_ENV} to your own Tiingo API token: create a free account at "
     "https://www.tiingo.com and copy the token from your account's API page"
 )
@@ -492,7 +493,7 @@ class TiingoAdapter:
 
     def _check_key(self) -> None:
         if not self._key:
-            raise TiingoKeyError(f"no Tiingo API key: {_GET_A_KEY}")
+            raise TiingoKeyError(f"no Tiingo API key: {KEY_HELP}")
         if not _KEY_CHARS.fullmatch(self._key.reveal()):
             raise TiingoKeyError(
                 f"the Tiingo API key in {API_KEY_ENV} has characters an HTTP header cannot "

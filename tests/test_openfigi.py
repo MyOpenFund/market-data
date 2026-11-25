@@ -276,3 +276,10 @@ def test_key_not_a_local_of_the_request_frames():
     out = client(Inspect(echo=True), FakeClock(), FAKE_KEY).map([us_ticker_job("ABC")])
     assert len(out) == 1
     assert leaks == []
+
+
+def test_key_help_says_the_key_is_optional_and_free():
+    from market_data.resolve.openfigi import KEY_HELP
+
+    assert "optional" in KEY_HELP and "OPENFIGI_API_KEY" in KEY_HELP
+    assert "https://www.openfigi.com" in KEY_HELP

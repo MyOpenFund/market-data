@@ -171,6 +171,7 @@ __all__ = [
     "ERROR_PAYLOAD",
     "FREE_PLAN_RPM",
     "KEPT_OUT_REASONS",
+    "KEY_HELP",
     "LIST_LIMIT",
     "MAX_VOLUME",
     "MINOR_UNIT_CURRENCIES",
@@ -279,7 +280,7 @@ KEPT_OUT_REASONS = (
 )
 _SYMBOL_SCHEMES = ("ticker", "composite_figi", "share_class_figi", "cik")
 
-_GET_A_KEY = (
+KEY_HELP = (
     f"set {API_KEY_ENV} to your own Massive API key: create a free account at "
     "https://massive.com (Stocks Basic plan) and copy the key from the dashboard"
 )
@@ -481,7 +482,7 @@ class MassiveAdapter:
     def _check_key(self) -> None:
         """A key an HTTP header can carry (the auth hook sets it on each request)."""
         if not self._key:
-            raise MassiveKeyError(f"no Massive API key: {_GET_A_KEY}")
+            raise MassiveKeyError(f"no Massive API key: {KEY_HELP}")
         if not _KEY_CHARS.fullmatch(self._key.reveal()):
             raise MassiveKeyError(
                 f"the Massive API key in {API_KEY_ENV} has characters an HTTP header cannot "

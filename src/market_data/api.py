@@ -174,6 +174,13 @@ def _key_envs() -> dict[str, str]:
     return {tiingo.SOURCE_CODE: tiingo.API_KEY_ENV, massive.SOURCE_CODE: massive.API_KEY_ENV}
 
 
+def _key_help(source: str) -> str:
+    """How to get the free key of ``source`` (the adapter's own words)."""
+    from market_data.adapters import massive, tiingo
+
+    return {tiingo.SOURCE_CODE: tiingo.KEY_HELP, massive.SOURCE_CODE: massive.KEY_HELP}[source]
+
+
 LIVE_SOURCES = ("tiingo", "massive")
 
 
@@ -185,8 +192,8 @@ def _live_adapter(source: str, api_key: str | Secret | None) -> Adapter:
         raw = os.environ.get(env, "")
     if not raw.strip():
         raise MissingKeyError(
-            f"no {source} API key: pass api_key= or set {env} (your own free key; the 'none' "
-            "profile never uses a shared one)"
+            f"no {source} API key: pass api_key= or {_key_help(source)} (the 'none' profile "
+            "never uses a shared key)"
         )
     key = Secret(raw.strip())
     if source == "tiingo":

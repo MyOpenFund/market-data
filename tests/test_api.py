@@ -98,10 +98,12 @@ def _isolated(tmp_path, monkeypatch):
 
 
 def test_none_profile_needs_key():
-    with pytest.raises(MissingKeyError, match="TIINGO_API_KEY"):
+    with pytest.raises(MissingKeyError, match="TIINGO_API_KEY") as info:
         api.prices(["AAA"], START, END)
-    with pytest.raises(MissingKeyError, match="MASSIVE_API_KEY"):
+    assert "free account at https://www.tiingo.com" in str(info.value)
+    with pytest.raises(MissingKeyError, match="MASSIVE_API_KEY") as info:
         api.prices(["AAA"], START, END, source="massive")
+    assert "free account at https://massive.com" in str(info.value)
 
 
 def test_none_profile_key_never_in_errors(monkeypatch):

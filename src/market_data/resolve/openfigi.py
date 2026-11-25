@@ -34,6 +34,7 @@ from market_data.adapters.base import Secret
 
 __all__ = [
     "API_KEY_ENV",
+    "KEY_HELP",
     "API_KEY_HEADER",
     "DEFAULT_BACKOFF_S",
     "DEFAULT_MAX_RETRIES",
@@ -53,6 +54,11 @@ __all__ = [
 
 OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 API_KEY_ENV = "OPENFIGI_API_KEY"
+# Said when the client runs without a key (the keyless quota works, only slower).
+KEY_HELP = (
+    f"OpenFIGI runs without a key at its keyless quota; a key is optional and free: create an "
+    f"account at https://www.openfigi.com/api and set {API_KEY_ENV} for a higher quota"
+)
 API_KEY_HEADER = "X-OPENFIGI-APIKEY"
 NO_KEY_RPM = 25
 NO_KEY_MAX_JOBS = 10
@@ -163,6 +169,11 @@ class OpenFigiClient:
         """A client keyed from ``OPENFIGI_API_KEY`` when set (else the keyless quota)."""
         raw = (os.environ if env is None else env).get(API_KEY_ENV, "")
         return cls(Secret(raw.strip()) if raw.strip() else None, **kw)
+
+    @property
+    def keyed(self) -> bool:
+        """True when the client sends a key (else the keyless quota)."""
+        return self._key is not None
 
     def __repr__(self) -> str:
         key = "Secret(***)" if self._key else "None"

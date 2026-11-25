@@ -259,6 +259,10 @@ def _map(args: argparse.Namespace, run_id: str, started: datetime) -> pipeline.S
         from market_data.resolve.openfigi import OpenFigiClient
 
         client = OpenFigiClient.from_env()
+        if not client.keyed:
+            from market_data.resolve.openfigi import KEY_HELP
+
+            print(f"map: {KEY_HELP}", file=sys.stderr)
     try:
         return pipeline.map_identifiers(
             observations=observations,
