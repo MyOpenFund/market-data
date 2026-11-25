@@ -19,6 +19,9 @@ from market_data.adapters.base import RAW_SYMBOL_SCHEMA
 from market_data.adapters.file import FileHistory
 from market_data.resolve.mapping import (
     AMBIGUOUS_SEVERAL_COMPOSITES,
+    AMBIGUOUS_WINDOW_CLOSED,
+    CHANGED_COMPOSITE,
+    CHANGED_EXPORT_COMPOSITE,
     MANUAL_MAPPING_ENV,
     MANUAL_SCHEMA,
     MANUAL_SOURCE,
@@ -1210,3 +1213,315 @@ def test_export_composite_change_moves_the_span_and_is_reported():
         load_time=LATER + timedelta(days=1),
     )
     assert third.changed.num_rows == 0
+
+
+# --- round 5: published windows survive ambiguous answers; every move reported -----------------
+
+
+def two_composites(series: tuple[str, str], first: str, second: str) -> pa.Table:
+    entries = [{"figi": c, "compositeFIGI": c, "ticker": "ZZZ", "exchCode": "US"}
+               for c in (first, second)]  # fmt: skip
+    return figi_results([series], [{"data": entries}])
+
+
+def open_mapping_rows(tables: list[pa.Table], value: str) -> list[tuple]:
+    now = latest(pa.concat_tables(tables), INSTRUMENT_IDENTIFIERS.natural_key)
+    return sorted(
+        (r["valid_date"], r["valid_to"])
+        for r in rows_of(now, id_scheme="source_symbol", id_value=value)
+        if r["valid_to"] is None or r["valid_to"] > r["valid_date"]
+    )
+
+
+@pytest.mark.parametrize("answer", [(CX, CY), (CY, CV)])
+def test_several_openfigi_composites_keep_the_published_mapping(answer):
+    sp = spans(("tiingo", "LIVE", date(2005, 1, 3), END))
+    first = build(None, openfigi_one([("tiingo", "LIVE")]), spans=sp)
+    second = build(
+        None, two_composites(("tiingo", "LIVE"), *answer), spans=sp,
+        existing=first.identifiers, load_time=LATER,
+    )  # fmt: skip
+    got = report(second.ambiguous)[("tiingo", "LIVE")]
+    assert (got["reason"], got["candidates"]) == (AMBIGUOUS_SEVERAL_COMPOSITES, 2)
+    assert second.identifiers.num_rows == 0 and second.minted == ()  # nothing closed or minted
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "tiingo:LIVE", date(2010, 1, 4)) == instrument_of(first.identifiers, CX)
+
+
+def test_two_undated_composites_keep_the_published_dated_mapping():
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    first = build(
+        observations(ob("massive", "ABC", "composite_figi", CX, date(2005, 1, 3))), spans=sp
+    )
+    both = observations(
+        ob("massive", "ABC", "composite_figi", CX), ob("massive", "ABC", "composite_figi", CY)
+    )
+    second = build(both, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert report(second.ambiguous)[("massive", "ABC")]["reason"] == AMBIGUOUS_SEVERAL_COMPOSITES
+    assert not mapping_rows(second, "massive:ABC") and second.minted == ()
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "massive:ABC", date(2010, 1, 4)) == instrument_of(first.identifiers, CX)
+
+
+def test_export_token_keeps_its_mapping_when_openfigi_gives_two_composites():
+    sp = spans(("private_history", "t1", date(2005, 1, 3), END))
+    first = build(observations(ob("private_history", "t1", "composite_figi", CX, END)), spans=sp)
+    second = build(
+        None, two_composites(("private_history", "t1"), CX, CY), spans=sp,
+        existing=first.identifiers, load_time=LATER,
+    )  # fmt: skip
+    key = ("private_history", "t1")
+    assert report(second.ambiguous)[key]["reason"] == AMBIGUOUS_SEVERAL_COMPOSITES
+    assert second.identifiers.num_rows == 0
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "private_history:t1", date(2010, 1, 4)) == instrument_of(
+        first.identifiers, CX
+    )
+
+
+def test_unresolved_answer_keeps_the_published_mapping():
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    first = build(
+        observations(ob("massive", "ABC", "composite_figi", CX, date(2005, 1, 3))), spans=sp
+    )
+    x = instrument_of(first.identifiers, CX)
+    # outside_span: the only candidate starts after the span ends
+    after = observations(ob("massive", "ABC", "composite_figi", CY, END + timedelta(days=30)))
+    second = build(after, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert report(second.unresolved)[("massive", "ABC")]["reason"] == "outside_span"
+    assert not mapping_rows(second, "massive:ABC") and second.minted == ()
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "massive:ABC", date(2010, 1, 4)) == x
+    # no_span: a span row without a first date and an observation with only an end
+    ended = observations(ob("massive", "ABC", "composite_figi", CY, None, date(2020, 1, 2)))
+    second = build(
+        ended, spans=spans(("massive", "ABC", None, END)), existing=first.identifiers,
+        load_time=LATER,
+    )  # fmt: skip
+    assert report(second.unresolved)[("massive", "ABC")]["reason"] == UNRESOLVED_NO_SPAN
+    assert not mapping_rows(second, "massive:ABC")
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "massive:ABC", date(2010, 1, 4)) == x
+
+
+def test_dated_move_of_any_source_is_reported():
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    first = build(
+        observations(ob("massive", "ABC", "composite_figi", CX, date(2005, 1, 3))), spans=sp
+    )
+    assert first.changed.num_rows == 0
+    moved = observations(ob("massive", "ABC", "composite_figi", CY, date(2005, 1, 3)))
+    second = build(moved, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert second.changed.to_pylist() == [
+        {"source_code": "massive", "source_symbol": "ABC", "reason": CHANGED_COMPOSITE,
+         "candidates": 1}
+    ]  # fmt: skip
+    assert CHANGED_COMPOSITE == "composite_changed"
+    published = pa.concat_tables([first.identifiers, second.identifiers])
+    m = symbol_mappings(published)
+    assert resolve(m, "massive:ABC", date(2010, 1, 4)) == instrument_of(second.identifiers, CY)
+    third = build(moved, spans=sp, existing=published, load_time=LATER + timedelta(days=1))
+    assert third.changed.num_rows == 0  # unchanged: nothing to report
+
+
+def test_swapped_windows_are_reported_as_moves():
+    first, sp = recycled_published()  # CX 2005-2010, CY 2012-
+    swapped = observations(
+        ob("massive", "ABC", "composite_figi", CY, date(2005, 1, 3), date(2010, 1, 4)),
+        ob("massive", "ABC", "composite_figi", CX, date(2012, 1, 3)),
+    )
+    second = build(swapped, spans=sp, existing=first.identifiers, load_time=LATER)
+    got = report(second.changed)[("massive", "ABC")]
+    assert (got["reason"], got["candidates"]) == (CHANGED_COMPOSITE, 2)
+
+
+def test_window_closed_by_a_dated_end_is_not_stretched():
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    dated = observations(
+        ob("massive", "ABC", "composite_figi", CY, date(2012, 1, 3), date(2015, 1, 2))
+    )
+    first = build(dated, spans=sp)
+    y = instrument_of(first.identifiers, CY)
+    second = build(
+        None, openfigi_one([("massive", "ABC")], composite=CY), spans=sp,
+        existing=first.identifiers, load_time=LATER,
+    )  # fmt: skip
+    assert report(second.ambiguous)[("massive", "ABC")]["reason"] == AMBIGUOUS_WINDOW_CLOSED
+    assert AMBIGUOUS_WINDOW_CLOSED == "window_closed"
+    assert second.identifiers.num_rows == 0  # no mapping row, no present-time label
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "massive:ABC", date(2014, 1, 3)) == y
+    assert resolve(m, "massive:ABC", date(2020, 1, 3)) is None
+    # a dated end later than the previous span end caps the extension
+    capped = observations(
+        ob("massive", "CAP", "composite_figi", CX, date(2012, 1, 3), date(2024, 6, 10))
+    )
+    first = build(capped, spans=spans(("massive", "CAP", date(2012, 1, 3), END)))
+    assert open_mapping_rows([first.identifiers], "massive:CAP") == [
+        (date(2012, 1, 3), END + timedelta(days=1))
+    ]
+    second = build(
+        None, openfigi_one([("massive", "CAP")]),
+        spans=spans(("massive", "CAP", date(2012, 1, 3), date(2024, 6, 28))),
+        existing=first.identifiers, load_time=datetime(2024, 7, 1, 8, 0, tzinfo=UTC),
+    )  # fmt: skip
+    assert open_mapping_rows([first.identifiers, second.identifiers], "massive:CAP") == [
+        (date(2012, 1, 3), date(2024, 6, 10))
+    ]
+    assert report(second.ambiguous)[("massive", "CAP")]["reason"] == AMBIGUOUS_WINDOW_CLOSED
+
+
+def test_span_without_dates_never_opens_or_hides_a_kept_window():
+    sp = spans(("tiingo", "LIVE", date(2005, 1, 3), END))
+    figi = openfigi_one([("tiingo", "LIVE")])
+    first = build(None, figi, spans=sp)
+    window = [(date(2005, 1, 3), END + timedelta(days=1))]
+    # no last_date: the window is never extended (nor rewritten open-ended)
+    no_last = spans(("tiingo", "LIVE", date(2005, 1, 3), None))
+    second = build(None, figi, spans=no_last, existing=first.identifiers, load_time=LATER)
+    assert not mapping_rows(second, "tiingo:LIVE")
+    assert open_mapping_rows([first.identifiers, second.identifiers], "tiingo:LIVE") == window
+    # no first_date on a kept series: reported no_span
+    no_first = spans(("tiingo", "LIVE", None, END))
+    second = build(None, figi, spans=no_first, existing=first.identifiers, load_time=LATER)
+    assert report(second.unresolved)[("tiingo", "LIVE")]["reason"] == UNRESOLVED_NO_SPAN
+    assert open_mapping_rows([first.identifiers, second.identifiers], "tiingo:LIVE") == window
+
+
+def test_extended_row_keeps_its_link_reason_next_to_a_sibling():
+    sp = spans(("tiingo", "LIVE", date(2005, 1, 3), END))
+    first = build(None, openfigi_one([("tiingo", "LIVE")]), spans=sp)
+    x = instrument_of(first.identifiers, CX)
+    # the published instrument also carries a second composite (a reviewed merge)
+    label = rows_of(first.identifiers, id_scheme="composite_figi")[0]
+    extra = pa.Table.from_pylist([{**label, "id_value": CY}], schema=first.identifiers.schema)
+    existing = pa.concat_tables([first.identifiers, extra])
+    longer = spans(
+        ("tiingo", "LIVE", date(2005, 1, 3), END + timedelta(days=3)),
+        ("tiingo", "LIV2", date(2020, 1, 3), END + timedelta(days=3)),
+    )
+    second = build(
+        observations(ob("tiingo", "LIV2", "composite_figi", CY, date(2020, 1, 3))),
+        openfigi_one([("tiingo", "LIVE")]), spans=longer, existing=existing, load_time=LATER,
+    )  # fmt: skip
+    (live,) = mapping_rows(second, "tiingo:LIVE")
+    (liv2,) = mapping_rows(second, "tiingo:LIV2")
+    assert live["instrument_id"] == liv2["instrument_id"] == x
+    assert live["valid_to"] == END + timedelta(days=4) and live["link_reason"] is None
+    assert liv2["link_reason"] == "venue_change"
+
+
+def open_labels(tables: list[pa.Table], instrument: str) -> set[tuple]:
+    now = latest(pa.concat_tables(tables), INSTRUMENT_IDENTIFIERS.natural_key)
+    return {
+        (r["id_scheme"], r["id_value"])
+        for r in rows_of(now, instrument_id=instrument)
+        if r["id_scheme"] != "source_symbol"
+        and (r["valid_to"] is None or r["valid_to"] > r["valid_date"])
+    }
+
+
+def test_move_closes_the_labels_the_series_left_on_the_old_instrument():
+    sp = spans(("private_history", "t1", date(2005, 1, 3), END))
+
+    def export(composite):
+        return observations(
+            ob("private_history", "t1", "composite_figi", composite, END),
+            ob("private_history", "t1", "export_member_id", "SYN UN Equity", END),
+            ob("private_history", "t1", "ticker", "SYN", END),
+        )
+
+    first = build(export(CX), spans=sp)
+    x = instrument_of(first.identifiers, CX)
+    second = build(export(CY), spans=sp, existing=first.identifiers, load_time=LATER)
+    y = instrument_of(second.identifiers, CY)
+    tables = [first.identifiers, second.identifiers]
+    assert open_labels(tables, x) == set()  # nothing left open on the instrument it left
+    assert open_labels(tables, y) == {
+        ("composite_figi", CY), ("export_member_id", "SYN UN Equity"), ("ticker", "SYN")
+    }  # fmt: skip
+    conform(INSTRUMENT_IDENTIFIERS, pa.concat_tables(tables))
+    # the old instrument keeps its id: a later export naming CX again finds it
+    third = build(
+        export(CX), spans=sp, existing=pa.concat_tables(tables),
+        load_time=LATER + timedelta(days=1),
+    )  # fmt: skip
+    assert third.minted == () and instrument_of(third.identifiers, CX) == x
+    # the current ticker follows: only the new instrument can be linked to an issuer
+    linked = link_issuers(
+        pa.concat_tables(tables), pa.table({"cik": [5], "ticker": ["SYN"]}),
+        load_time=LATER + timedelta(days=1), as_of=END,
+    )  # fmt: skip
+    assert {r["instrument_id"] for r in rows_of(linked, id_scheme="cik")} == {y}
+
+
+def test_move_leaves_the_labels_of_a_sibling_series():
+    sp = spans(
+        ("private_history", "t1", date(2005, 1, 3), END),
+        ("private_history", "t2", date(2005, 1, 3), END),
+    )
+
+    def export(composite):
+        return observations(
+            ob("private_history", "t1", "composite_figi", composite, END),
+            ob("private_history", "t1", "export_member_id", "SYN UN Equity", END),
+            ob("private_history", "t1", "ticker", "SYN", END),
+            ob("private_history", "t2", "composite_figi", CX, END),
+            ob("private_history", "t2", "export_member_id", "SYN UW Equity", END),
+            ob("private_history", "t2", "ticker", "SYN", END),
+        )
+
+    first = build(export(CX), spans=sp)
+    x = instrument_of(first.identifiers, CX)
+    second = build(export(CY), spans=sp, existing=first.identifiers, load_time=LATER)
+    assert report(second.changed)[("private_history", "t1")]["reason"] == CHANGED_EXPORT_COMPOSITE
+    tables = [first.identifiers, second.identifiers]
+    conform(INSTRUMENT_IDENTIFIERS, pa.concat_tables(tables))
+    # t2 still names the old instrument: its labels stay, t1's member id is closed
+    assert open_labels(tables, x) == {
+        ("composite_figi", CX), ("export_member_id", "SYN UW Equity"), ("ticker", "SYN")
+    }  # fmt: skip
+    # a sibling absent from this run's observations keeps everything that may be its own
+    only_t1 = observations(
+        ob("private_history", "t1", "composite_figi", CY, END),
+        ob("private_history", "t1", "export_member_id", "SYN UN Equity", END),
+    )
+    second = build(only_t1, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert open_labels([first.identifiers, second.identifiers], x) == {
+        ("composite_figi", CX), ("export_member_id", "SYN UW Equity"), ("ticker", "SYN")
+    }  # fmt: skip
+
+
+def test_changed_cik_closes_the_row_of_a_source_the_instrument_lost():
+    sp = spans(("private_history", "t1", date(2005, 1, 3), END))
+    private = build(
+        observations(ob("private_history", "t1", "composite_figi", CX, END),
+                     ob("private_history", "t1", "ticker", "LIV", END)),
+        spans=sp,
+    )  # fmt: skip
+    x = instrument_of(private.identifiers, CX)
+    linked = link_issuers(
+        private.identifiers, pa.table({"cik": [1], "ticker": ["LIV"]}), load_time=LATER, as_of=END
+    )
+    assert [r["source_code"] for r in rows_of(linked, id_scheme="cik")] == ["private_history"]
+    # the token moves away (corrected export); a massive series now carries the instrument
+    later = LATER + timedelta(days=1)
+    moved = build(
+        observations(ob("private_history", "t1", "composite_figi", CY, END),
+                     ob("massive", "LIV", "composite_figi", CX, date(2005, 1, 3)),
+                     ob("massive", "LIV", "ticker", "LIV", date(2005, 1, 3))),
+        spans=combine_spans(sp, spans(("massive", "LIV", date(2005, 1, 3), END))),
+        existing=linked, load_time=later,
+    )  # fmt: skip
+    both = pa.concat_tables([linked, moved.identifiers])
+    relinked = link_issuers(
+        both, pa.table({"cik": [7], "ticker": ["LIV"]}),
+        load_time=later + timedelta(days=1), as_of=END,
+    )  # fmt: skip
+    now = latest(relinked, INSTRUMENT_IDENTIFIERS.natural_key)
+    open_ciks = [
+        (r["id_value"], r["source_code"])
+        for r in rows_of(now, id_scheme="cik", instrument_id=x)
+        if r["valid_to"] is None or r["valid_to"] > r["valid_date"]
+    ]
+    assert open_ciks == [("0000000007", "massive")]
