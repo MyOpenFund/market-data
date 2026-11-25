@@ -99,7 +99,8 @@ between the steps that read the store:
 1. `load-history --write` (once per export), `map --write --no-existing` (the first mapping),
    publish;
 2. `fetch --write` (symbols, prices, actions: as many as the plan allows), `map --write` (reads
-   the published identifiers), `build --source ... --write`, publish;
+   the published identifiers), publish, `build --source ... --write` (restricted to the
+   published mapping), publish;
 3. `report --index CODE --write` (with `--precedence private_history massive` once a provider
    overlaps the history: two sources for one instrument and session refuse a coverage without
    it).
