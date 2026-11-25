@@ -56,8 +56,11 @@ first session of the range with a price) from raw closes and corporate actions, 
 `flags`. Vendor-adjusted prices are never used.
 
 On a store (`profile="server"`), inputs may be tickers, CIKs, FIGIs or instrument ids
-(`mof:...`); the answer is keyed by `instrument_id` only and read as known at `as_of`. Restricted
-sources are read only when listed in `allowed_restricted`. Errors are `ApiError` subclasses
+(`mof:...`), resolved through the latest mapping; the answer is keyed by `instrument_id` only and
+read as known at `as_of` (only the requested instruments' series are read). Restricted sources
+are read only when listed in `allowed_restricted`. Where two sources hold one instrument (the
+history file, then a daily provider), pass `precedence=["private_history", "massive"]` (the first
+source with a row wins per session); `source=` keeps one source only. Errors are `ApiError` subclasses
 (`MissingKeyError`, `UnknownInstrumentError`, `AmbiguousInstrumentError`,
 `RestrictedSourceError`, `NoDataError`). See the docstring of `market_data.api`.
 
@@ -86,7 +89,28 @@ it computes what it can and writes nothing (`fetch` lists the requests it would 
 they would spend). Each prints one summary line (counts, never a label) and exits 0 (`ok`), 1
 (`degraded`; 0 with `--allow-degraded`) or 2 (`error`, or a usage error refused before any
 work). Common flags: `--write`, `--allow-degraded`, `--archive`, `--reports`, and `--landing` for
-the commands that land batches.
+the commands that land batches. `--source` takes the adapters shipped here (`massive`,
+`tiingo`); an adapter from your own package is driven through the Python API
+(`market_data.pipeline`).
+
+The order of a run, the publisher (open-data-store's `publish_pending`) landing the batches
+between the steps that read the store:
+
+1. `load-history --write` (once per export), `map --write --no-existing` (the first mapping),
+   publish;
+2. `fetch --write` (symbols, prices, actions: as many as the plan allows), `map --write` (reads
+   the published identifiers), `build --source ... --write`, publish;
+3. `report --index CODE --write` (with `--precedence private_history massive` once a provider
+   overlaps the history: two sources for one instrument and session refuse a coverage without
+   it).
+
+The raw archive (`MOF_MARKET_ARCHIVE`) must sit on a local filesystem that supports hard links
+(each answer is written to a temp file, then linked into place, never overwritten): not a share
+mounted without hard-link support. Fetch a session once the provider has published it: a
+session fetched right after its close may come back empty and is logged as fetched; while no
+member has a price that day the store's coverage counts the session `session_not_published`,
+never a delisting; fetch it again later (`report --index` without `--as-of` leaves out a
+session not closed yet).
 
 Load a history file (format below); `--previous-snapshots` restates snapshots already published,
 `--max-non-session-share` sets the tripwire for dates that are not exchange-local:
