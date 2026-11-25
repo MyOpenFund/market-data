@@ -273,15 +273,13 @@ def test_ids_stable_across_runs():
     )
     sp2 = pa.concat_tables([sp, spans(("tiingo", "NEW", date(2020, 1, 2), END))])
     second = build(more, spans=sp2, existing=first.identifiers, load_time=LATER)
-    assert instrument_of(second.identifiers, CX) == x
-    assert instrument_of(second.identifiers, CY) == instrument_of(first.identifiers, CY)
-    assert second.minted == (instrument_of(second.identifiers, CL),)
-    key = ["instrument_id", "id_scheme", "id_value", "valid_date", "valid_to", "source_code"]
-    assert sorted(first.identifiers.select(key).to_pylist(), key=str) == sorted(
-        rows_of(second.identifiers.select(key), source_code="massive"), key=str
-    )
-    # a third run with the published history (both runs) still re-mints nothing
     published = pa.concat_tables([first.identifiers, second.identifiers])
+    assert instrument_of(published, CX) == x
+    assert instrument_of(published, CY) == instrument_of(first.identifiers, CY)
+    assert second.minted == (instrument_of(second.identifiers, CL),)
+    # the massive series is unchanged: none of its published rows is written again
+    assert rows_of(second.identifiers, source_code="massive") == []
+    # a third run with the published history (both runs) still re-mints nothing
     third = build(more, spans=sp2, existing=published, load_time=LATER + timedelta(days=1))
     assert third.minted == ()
 
@@ -351,8 +349,7 @@ def test_manual_mapping_wins(tmp_path):
     assert resolve(m, "massive:HWX", date(2020, 1, 2)) == a
     # a run without the manual file keeps the published manual rows winning
     third = build(obs, spans=sp, existing=published, load_time=LATER + timedelta(days=1))
-    live = [r for r in mapping_rows(third, "massive:HWX") if r["valid_to"] != r["valid_date"]]
-    assert {r["source_code"] for r in live} == {MANUAL_SOURCE}
+    assert mapping_rows(third, "massive:HWX") == []  # the published manual rows stand as is
     m = symbol_mappings(pa.concat_tables([published, third.identifiers]))
     assert resolve(m, "massive:HWX", date(2010, 1, 4)) == b
     assert third.minted == ()
@@ -718,8 +715,8 @@ def test_composite_observation_never_lands_on_another_instrument():
         nxt = build(obs, spans=sp, existing=published, manual=again,
                     load_time=LOAD + timedelta(days=k))  # fmt: skip
         assert nxt.minted == ()
-        assert instrument_of(nxt.identifiers, CX) == x
         published = pa.concat_tables([published, nxt.identifiers])
+        assert instrument_of(published, CX) == x
         m = symbol_mappings(published)
         expected = x if again is not None and again.num_rows == 0 else y
         assert resolve(m, "massive:HWX", date(2020, 1, 2)) == expected
@@ -743,7 +740,8 @@ def test_composite_outside_the_span_is_left_out_and_never_minted():
         existing=first.identifiers,
         load_time=LATER,
     )
-    assert instrument_of(second.identifiers, CX) != instrument_of(second.identifiers, CY)
+    published = pa.concat_tables([first.identifiers, second.identifiers])
+    assert instrument_of(published, CX) != instrument_of(published, CY)
 
 
 def test_recycled_symbol_with_a_composite_on_one_side_only():
@@ -852,8 +850,10 @@ def test_run_without_spans_keeps_the_published_window():
     m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
     assert resolve(m, "massive:Q", date(2016, 1, 4)) is None
     assert resolve(m, "massive:Q", date(2012, 1, 3)) == instrument_of(first.identifiers, CX)
-    # its labels still land on the published instrument
-    assert instrument_of(second.identifiers, CX) == instrument_of(first.identifiers, CX)
+    # its labels still sit on the published instrument (unchanged: not written again)
+    both = pa.concat_tables([first.identifiers, second.identifiers])
+    assert instrument_of(both, CX) == instrument_of(first.identifiers, CX)
+    assert second.identifiers.num_rows == 0
 
 
 def test_link_issuers_needs_as_of_and_is_idempotent():
@@ -1664,3 +1664,29 @@ def test_listed_symbols_never_priced_are_not_series():
     assert not result.minted or len(result.minted) == 1  # only AAA's instrument
     # without any span table the observation windows still map (unchanged)
     assert mapping_rows(build(obs), "massive:OLD2")
+
+
+def test_identical_rerun_emits_no_row():
+    obs = observations(
+        ob("private_history", "t_a", "composite_figi", CX, END),
+        ob("private_history", "t_a", "export_member_id", "SYN UN Equity", END),
+        ob("massive", "AAA", "composite_figi", CX),
+        ob("massive", "AAA", "ticker", "AAA"),
+        ob("massive", "AAA", "cik", "0000000111"),
+    )
+    sp = spans(
+        ("private_history", "t_a", date(2000, 1, 3), date(2020, 3, 31)),
+        ("massive", "AAA", date(2024, 1, 2), END),
+    )
+    results, tables = runs(*((obs, sp, LOAD + timedelta(days=d)) for d in range(3)))
+    assert results[0].identifiers.num_rows > 0
+    assert results[1].identifiers.num_rows == 0 and results[2].identifiers.num_rows == 0
+    # a change is still written: the span grows, the massive window is extended
+    longer = spans(
+        ("private_history", "t_a", date(2000, 1, 3), date(2020, 3, 31)),
+        ("massive", "AAA", date(2024, 1, 2), END + timedelta(days=3)),
+    )
+    grown = build(
+        obs, spans=longer, existing=pa.concat_tables(tables), load_time=LOAD + timedelta(days=5)
+    )
+    assert [r["valid_to"] for r in mapping_rows(grown, "massive:AAA")] == [END + timedelta(days=4)]

@@ -122,6 +122,8 @@ Rules
       only those the moved series states this run (the rest may be the other series'). The
       closed ``composite_figi`` row still names the instrument: its id is reused.
     - ``known_at`` = ``load_time`` (``collected`` / ``load_time``) for every row (spec §7.3).
+      A row identical to the latest published version of its natural key (every column but
+      ``known_at``) is not emitted: an identical re-run writes nothing.
 
 Spans: ``spans_from_fetch_log`` (per series, earliest ``requested_from`` (else
 ``returned_from``) to the later of the last ``returned_to`` and the last snapshot date when
@@ -302,6 +304,7 @@ _MOF_ID = re.compile(r"mof:[0-9a-f]{32}")  # always fullmatch
 _DAY = timedelta(days=1)
 _KEY = INSTRUMENT_IDENTIFIERS.natural_key
 _SCHEMA = INSTRUMENT_IDENTIFIERS.schema
+_COMPARED = tuple(n for n in _SCHEMA.names if n != "known_at")  # what a re-emission may change
 
 Series = tuple[str, str]
 Window = tuple[date | None, date | None]  # [start, end); None = unbounded
@@ -1272,8 +1275,17 @@ def build_mapping(
                      r["valid_date"], r["source_code"], load, r["link_reason"])
             )  # fmt: skip
 
+    # a row identical to its published latest version (all but known_at) says nothing new:
+    # not written again, so an identical re-run writes no row
+    published_rows = {_natural_key(r): r for r in prior}
+
+    def news(row: Mapping[str, Any]) -> bool:
+        old = published_rows.get(_natural_key(row))
+        return old is None or any(old[c] != row[c] for c in _COMPARED)
+
+    out = [r for r in mapping + _dedupe(labels) + closing if news(r)]
     return MappingResult(
-        identifiers=_identifiers_table(mapping + _dedupe(labels) + closing),
+        identifiers=_identifiers_table(out),
         unresolved=_report(unresolved),
         ambiguous=_report(ambiguous),
         minted=tuple(ids.minted),
