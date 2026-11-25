@@ -73,12 +73,19 @@ Rules
       composite names), never on another company's window; when that instrument has no window
       in the series (a manual override, a candidate outside the span) it is left out. Other
       labels: on an export-dated series that is one instrument, all of them whatever their
-      dates; otherwise on the one instrument whose window the label overlaps. Labels left out
-      (``composite_not_mapped``, ``outside_windows``, ``several_windows``) are counted in
-      ``MappingResult.labels_left_out``; labels of an unmapped series are not (the series is
-      reported). A manually mapped series gets none of its observed labels
-      (``manual_override``): the review overrides what the source says. An observation
-      without a date takes its instrument's window start.
+      dates; otherwise on the one instrument whose window the label overlaps. A series that
+      keeps its published windows without this run's answer applied (a present-time answer
+      naming another instrument, shared, stale or capped by a dated end; several composites;
+      no composite; no span, unless every composite it observes names a kept instrument) gets
+      none of this run's labels (``answer_not_applied``): they may describe whoever trades
+      the symbol now. An undated composite observation of a non-export source never rewrites
+      a published label of the same instrument, source and value (re-emitted open-ended it
+      would erase the dated end a later run's cap reads). Labels left out
+      (``composite_not_mapped``, ``outside_windows``, ``several_windows``,
+      ``answer_not_applied``) are counted in ``MappingResult.labels_left_out``; labels of an
+      unmapped series are not (the series is reported). A manually mapped series gets none
+      of its observed labels (``manual_override``): the review overrides what the source
+      says. An observation without a date takes its instrument's window start.
     - OpenFIGI-derived rows (``composite_figi``, ``figi``, ``share_class_figi``, ``ticker``)
       are dated at the load date and open-ended (present-time answers: never a span start or
       an exit date), under the series' own source when it is restricted or unregistered (fail
@@ -164,6 +171,7 @@ __all__ = [
     "CURRENT_MAX_STALENESS_DAYS",
     "EXPORT_DATED_SOURCES",
     "LABELS_LEFT_OUT_SCHEMA",
+    "LABEL_ANSWER_NOT_APPLIED",
     "LABEL_COMPOSITE_NOT_MAPPED",
     "LABEL_MANUAL_OVERRIDE",
     "LABEL_OUTSIDE_WINDOWS",
@@ -224,6 +232,7 @@ LABEL_MANUAL_OVERRIDE = "manual_override"
 LABEL_COMPOSITE_NOT_MAPPED = "composite_not_mapped"
 LABEL_OUTSIDE_WINDOWS = "outside_windows"
 LABEL_SEVERAL_WINDOWS = "several_windows"
+LABEL_ANSWER_NOT_APPLIED = "answer_not_applied"
 # Sources whose identifier observations are dated at an export, not at the dates they describe
 # (the history-file adapter's default source code): their spans, not their dates, bound them.
 EXPORT_DATED_SOURCES = ("private_history",)
@@ -958,12 +967,29 @@ def build_mapping(
     applied: dict[Series, _Window] = {}  # present-time answers applied this run, per series
     extended: set[tuple] = set()  # natural keys of published rows whose end this run extends
     left: dict[Series, set[str]] = {}  # instruments a moved series no longer maps to
+    unapplied: set[Series] = set()  # series kept without this run's answer applied
 
-    def keep(s: Series, value: str, published: list[_Window], candidates: int = 0) -> None:
+    def names_kept(s: Series, published: list[_Window]) -> bool:
+        """True when the series observes a composite this run and each one names an
+        instrument of its published windows (the observations describe the kept instrument)."""
+        kept_ids = {w.instrument_id for w in published}
+        return s in observed and all(ids.by_composite.get(c) in kept_ids for c in observed[s])
+
+    def keep(
+        s: Series,
+        value: str,
+        published: list[_Window],
+        candidates: int = 0,
+        *,
+        answer_applied: bool = False,
+    ) -> None:
         """Keep the published windows as they are; report the part of this run's span they
-        leave uncovered."""
+        leave uncovered. Unless ``answer_applied``, this run's observations of the series say
+        nothing about the kept instrument: none of its labels is attached."""
         windows_of[s] = published
         kept.add(value)
+        if not answer_applied:
+            unapplied.add(s)
         first, last = span_of.get(s, (None, None))
         if s in span_of and first is None:
             unresolved.append((s, UNRESOLVED_NO_SPAN, candidates))  # coverage unknown
@@ -993,7 +1019,7 @@ def build_mapping(
         published = _published_windows(prior, value, s[0])
         if s not in span_of and published:
             # no span this run: never rewrite a published (bounded) window open-ended
-            keep(s, value, published)
+            keep(s, value, published, answer_applied=names_kept(s, published))
             continue
         if s in observed:
             candidates = observed[s]
@@ -1059,7 +1085,13 @@ def build_mapping(
                     newest = _Window(newest.instrument_id, newest.start, end, c)
                 else:
                     newest = _Window(newest.instrument_id, newest.start, newest.end, c)
-                keep(s, value, [w for w in published if w.start != newest.start] + [newest], 1)
+                keep(
+                    s,
+                    value,
+                    [w for w in published if w.start != newest.start] + [newest],
+                    1,
+                    answer_applied=True,
+                )
                 applied[s] = newest
                 continue
             if doubt:
@@ -1137,11 +1169,21 @@ def build_mapping(
         return code if code in restricted or code not in registered else OPENFIGI_SOURCE
 
     left_out: dict[tuple[Series, str], int] = defaultdict(int)
+    published_labels = {
+        (r["instrument_id"], r["source_code"], r["id_value"])
+        for r in prior
+        if r["id_scheme"] == "composite_figi" and _is_open(r)
+    }
     for r in obs:
         s = (r["source_code"], r["source_symbol"])
         windows = windows_of.get(s)
         if not windows:
             continue  # the series itself is reported unresolved or ambiguous
+        if s in unapplied:
+            # kept as published, this run's answer not applied: its labels may describe
+            # someone else (a recycled symbol), so none is attached
+            left_out[(s, LABEL_ANSWER_NOT_APPLIED)] += 1
+            continue
         if s in manual_series:
             # the reviewed mapping overrides what the source says: its labels may describe
             # another instrument, so none is attached
@@ -1151,6 +1193,16 @@ def build_mapping(
         w, why = _place_label(r, windows, ids, span_rule)
         if w is None:
             left_out[(s, why)] += 1
+            continue
+        if (
+            r["id_scheme"] == "composite_figi"
+            and not span_rule
+            and r["valid_date"] is None
+            and r["valid_to"] is None
+            and (w.instrument_id, r["source_code"], r["id_value"]) in published_labels
+        ):
+            # an undated (present-time) composite never rewrites a published label: re-emitted
+            # open-ended it would erase the dated end the next run's window cap reads
             continue
         labels.append(
             _row(w.instrument_id, r["id_scheme"], r["id_value"], r["valid_date"] or w.start,

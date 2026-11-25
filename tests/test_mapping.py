@@ -22,6 +22,7 @@ from market_data.resolve.mapping import (
     AMBIGUOUS_WINDOW_CLOSED,
     CHANGED_COMPOSITE,
     CHANGED_EXPORT_COMPOSITE,
+    LABEL_ANSWER_NOT_APPLIED,
     MANUAL_MAPPING_ENV,
     MANUAL_SCHEMA,
     MANUAL_SOURCE,
@@ -1525,3 +1526,96 @@ def test_changed_cik_closes_the_row_of_a_source_the_instrument_lost():
         if r["valid_to"] is None or r["valid_to"] > r["valid_date"]
     ]
     assert open_ciks == [("0000000007", "massive")]
+
+
+# --- final review: the label loop over several runs (B5 must-fix) ------------------------------
+
+
+def runs(*steps):
+    """Run build_mapping once per (observations, spans, load_time), each over the identifiers
+    published so far; returns (results, every published table)."""
+    tables: list[pa.Table] = []
+    results = []
+    for obs, sp, when in steps:
+        existing = pa.concat_tables(tables) if tables else None
+        results.append(build(obs, spans=sp, existing=existing, load_time=when))
+        tables.append(results[-1].identifiers)
+    return results, tables
+
+
+def left_out(result) -> dict:
+    return {
+        (r["source_symbol"], r["reason"]): r["rows"] for r in result.labels_left_out.to_pylist()
+    }
+
+
+def test_identical_third_run_never_stretches_a_window_closed_at_a_date():
+    dated = observations(
+        ob("massive", "ABC", "composite_figi", CX, date(2010, 1, 4), date(2015, 6, 1))
+    )
+    undated = observations(ob("massive", "ABC", "composite_figi", CX))
+    longer = spans(("massive", "ABC", date(2010, 1, 4), date(2024, 6, 28)))
+    when = [datetime(2024, 7, d, tzinfo=UTC) for d in (1, 2, 3)]
+    results, tables = runs(
+        (dated, spans(("massive", "ABC", date(2010, 1, 4), date(2015, 5, 29))), when[0]),
+        (undated, longer, when[1]),
+        (undated, longer, when[2]),
+    )
+    x = instrument_of(results[0].identifiers, CX)
+    m = symbol_mappings(pa.concat_tables(tables))
+    assert resolve(m, "massive:ABC", date(2012, 1, 3)) == x
+    assert resolve(m, "massive:ABC", date(2020, 1, 3)) is None  # still closed after run 3
+    for result in results[1:]:
+        assert report(result.ambiguous)[("massive", "ABC")]["reason"] == AMBIGUOUS_WINDOW_CLOSED
+    # the dated composite label keeps its end
+    now = latest(pa.concat_tables(tables), INSTRUMENT_IDENTIFIERS.natural_key)
+    (label,) = rows_of(now, id_scheme="composite_figi", instrument_id=x)
+    assert label["valid_to"] == date(2015, 6, 1)
+
+
+FOREIGN = (("cik", "0000000999"), ("share_class_figi", "BBG001SYNS20"))
+
+
+def foreign_labels(symbol: str = "ABC", *, composite: str | None = CY) -> list[dict]:
+    """Undated labels of another company now trading under ``symbol``."""
+    rows = [ob("massive", symbol, s, v) for s, v in FOREIGN]
+    if composite is not None:
+        rows.append(ob("massive", symbol, "composite_figi", composite))
+    return rows
+
+
+@pytest.mark.parametrize("case", ["openfigi_changed", "several", "no_composite", "no_span"])
+def test_labels_of_an_answer_not_applied_never_land_on_the_kept_instrument(case):
+    first = build(
+        observations(
+            ob("massive", "ABC", "composite_figi", CX, date(2010, 1, 4), date(2015, 6, 1)),
+            ob("massive", "ABC", "cik", "0000000111", date(2010, 1, 4), date(2015, 6, 1)),
+        ),
+        spans=spans(("massive", "ABC", date(2010, 1, 4), date(2015, 5, 29))),
+    )
+    x = instrument_of(first.identifiers, CX)
+    later = spans(("massive", "ABC", date(2010, 1, 4), date(2024, 5, 31)))
+    obs = {
+        # another composite, undated: the present-time answer names someone else
+        "openfigi_changed": observations(*foreign_labels()),
+        # the old (dated) composite and the new undated one: several candidates
+        "several": observations(
+            ob("massive", "ABC", "composite_figi", CX, None, date(2015, 6, 1)),
+            *foreign_labels(),
+        ),
+        # no composite this run, only the new listing's labels
+        "no_composite": observations(*foreign_labels(composite=None)),
+        # no span this run, the observation names another composite
+        "no_span": observations(*foreign_labels()),
+    }[case]
+    second = build(
+        obs, spans=None if case == "no_span" else later,
+        existing=first.identifiers, load_time=LATER,
+    )  # fmt: skip
+    labels = open_labels([first.identifiers, second.identifiers], x)
+    assert not labels & set(FOREIGN)
+    assert ("cik", "0000000111") in labels
+    assert left_out(second)[("ABC", LABEL_ANSWER_NOT_APPLIED)] == obs.num_rows
+    assert LABEL_ANSWER_NOT_APPLIED == "answer_not_applied"
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "massive:ABC", date(2012, 1, 3)) == x  # the published window kept
