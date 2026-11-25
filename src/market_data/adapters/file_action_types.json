@@ -1,0 +1,9 @@
+{
+  "regular cash": "cash_dividend_regular",
+  "special cash": "cash_dividend_special",
+  "stock split": "split",
+  "spinoff": "spin_off",
+  "return of capital": "return_of_capital",
+  "rights issue": "rights",
+  "stock dividend": "stock_dividend"
+}

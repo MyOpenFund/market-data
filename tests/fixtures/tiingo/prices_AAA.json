@@ -1,0 +1,10 @@
+[
+  {"date": "2026-11-19T00:00:00.000Z", "open": 99.0, "high": 101.0, "low": 98.0, "close": 100.0, "volume": 1000,
+   "adjOpen": 48.5, "adjHigh": 49.5, "adjLow": 48.0, "adjClose": 49.0, "adjVolume": 2000, "divCash": 0.0, "splitFactor": 1.0},
+  {"date": "2026-11-20T00:00:00.000Z", "open": 100.5, "high": 103.0, "low": 100.0, "close": 102.0, "volume": 1200,
+   "adjOpen": 49.25, "adjHigh": 50.5, "adjLow": 49.0, "adjClose": 50.0, "adjVolume": 2400, "divCash": 0.5, "splitFactor": 1.0},
+  {"date": "2026-11-23T00:00:00.000Z", "open": 51.0, "high": 52.0, "low": 50.5, "close": 51.5, "volume": 2600,
+   "adjOpen": 51.0, "adjHigh": 52.0, "adjLow": 50.5, "adjClose": 51.5, "adjVolume": 2600, "divCash": 0.0, "splitFactor": 2.0},
+  {"date": "2026-11-24T00:00:00.000Z", "open": 51.5, "high": 52.5, "low": 51.0, "close": 52.0, "volume": 2400,
+   "adjOpen": 51.5, "adjHigh": 52.5, "adjLow": 51.0, "adjClose": 52.0, "adjVolume": 2400, "divCash": 0.0, "splitFactor": 1.0}
+]

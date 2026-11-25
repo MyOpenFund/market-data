@@ -1,0 +1,9 @@
+{
+  "status": "OK",
+  "request_id": "synthetic-request-5",
+  "results": [
+    {"id": "d5", "ticker": "AAA", "cash_amount": 0.05, "currency": "USD",
+     "ex_dividend_date": "2026-11-23", "distribution_type": "irregular"},
+    {"id": "d6", "ticker": "DDD", "cash_amount": 0.3, "currency": "USD", "ex_dividend_date": "2026-11-23"}
+  ]
+}

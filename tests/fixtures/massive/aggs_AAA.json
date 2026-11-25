@@ -1,0 +1,12 @@
+{
+  "ticker": "AAA",
+  "adjusted": false,
+  "queryCount": 2,
+  "resultsCount": 2,
+  "status": "OK",
+  "request_id": "synthetic-request-3",
+  "results": [
+    {"v": 1000, "vw": 9.95, "o": 9.9, "c": 10.0, "h": 10.1, "l": 9.8, "t": 1795064400000, "n": 12},
+    {"v": 1500.0, "vw": 10.4, "o": 10.0, "c": 10.5, "h": 10.8, "l": 9.9, "t": 1795150800000, "n": 20}
+  ]
+}

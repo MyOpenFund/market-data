@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "myopenfund-market-data"
+dynamic = ["version"]
+description = "Market-data producer for MyOpenFund: pluggable source adapters writing into open-data-store."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Marc Jeulin" }]
+maintainers = [{ name = "Marc Jeulin" }]
+keywords = ["myopenfund", "market-data", "open-data", "finance", "adapters"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    # Pinned to the commit of open-data-store 0.2.0 candidate until 0.2.0 is on PyPI
+    # (PyPI refuses git URL dependencies): switch to
+    # "myopenfund-open-data-store[writer,recipes]>=0.2.0" once it is published.
+    "myopenfund-open-data-store[writer,recipes] @ git+https://github.com/MyOpenFund/open-data-store@6b5d399fccd7f13e668fc77bb77c1869a7812141",
+    "exchange_calendars>=4.13",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "pandas>=2",
+    "pyarrow>=17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff==0.17.3", "build", "twine"]
+
+[project.scripts]
+market-data = "market_data.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/MyOpenFund/market-data"
+Source = "https://github.com/MyOpenFund/market-data"
+Issues = "https://github.com/MyOpenFund/market-data/issues"
+Organization = "https://github.com/MyOpenFund"
+
+# Sources this package ships (licence terms, access class), read by open-data-store.
+[project.entry-points."open_data_store.sources"]
+market_data = "market_data.sources:sources"
+
+# Adapters shipped here are declared in the group "market_data.adapters", one entry per source
+# code, each a zero-argument callable returning an Adapter. Every one needs its source registered
+# in market_data.sources (tests/test_adapters_base.py enforces it).
+[project.entry-points."market_data.adapters"]
+massive = "market_data.adapters.massive:adapter"
+tiingo = "market_data.adapters.tiingo:adapter"
+
+[tool.hatch.metadata]
+# Needed for the git URL dependency above; remove with it.
+allow-direct-references = true
+
+[tool.hatch.version]
+path = "src/market_data/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "BLE"]

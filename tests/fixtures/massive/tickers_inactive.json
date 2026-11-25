@@ -1,0 +1,10 @@
+{
+  "status": "OK",
+  "request_id": "synthetic-request-8",
+  "count": 1,
+  "results": [
+    {"ticker": "CCC", "name": "Synthetic Gamma Ltd", "market": "stocks", "locale": "us", "active": false,
+     "composite_figi": "BBG000000CC1", "share_class_figi": "BBG000000CC2",
+     "delisted_utc": "2025-06-30T00:00:00Z"}
+  ]
+}

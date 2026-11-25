@@ -1,0 +1,14 @@
+{
+  "status": "OK",
+  "request_id": "synthetic-request-6",
+  "results": [
+    {"id": "s1", "ticker": "AAA", "execution_date": "2026-11-23", "split_from": 1, "split_to": 2,
+     "adjustment_type": "forward_split", "historical_adjustment_factor": 0.5},
+    {"id": "s2", "ticker": "BBB", "execution_date": "2026-11-20", "split_from": 10, "split_to": 1,
+     "adjustment_type": "reverse_split"},
+    {"id": "s3", "ticker": "CCC", "execution_date": "2026-11-23", "split_from": 100, "split_to": 105,
+     "adjustment_type": "stock_dividend"},
+    {"id": "s4", "ticker": "DDD", "execution_date": "2026-11-23", "split_from": 1, "split_to": 1,
+     "adjustment_type": "synthetic_other"}
+  ]
+}
