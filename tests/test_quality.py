@@ -693,3 +693,21 @@ def test_symbol_failure_not_cleared_by_a_later_whole_market_ok():
         ]
     )
     assert unsuperseded_failures(log)["source_symbol"].to_pylist() == ["BBB"]
+
+
+def test_null_range_failure_superseded_by_a_later_null_range_success():
+    # a failed whole-list (symbols) fetch, then a successful one of the same source
+    log = fetch_log(
+        [
+            ("*", None, None, "error", utc(2024, 1, 6)),
+            ("*", None, None, "ok", utc(2024, 1, 7)),
+        ]
+    )
+    assert unsuperseded_failures(log).num_rows == 0
+    # an earlier success, another symbol or a dated success supersedes nothing
+    for rows in (
+        [("*", None, None, "ok", utc(2024, 1, 5)), ("*", None, None, "error", utc(2024, 1, 6))],
+        [("*", None, None, "error", utc(2024, 1, 6)), ("BBB", None, None, "ok", utc(2024, 1, 7))],
+        [("*", None, None, "error", utc(2024, 1, 6)), ("*", D, D, "ok", utc(2024, 1, 7))],
+    ):
+        assert unsuperseded_failures(fetch_log(rows)).num_rows == 1

@@ -109,14 +109,14 @@ _MAPPING_REASONS = tuple(
         {
             getattr(_mapping, name)
             for name in dir(_mapping)
-            if name.startswith(("UNRESOLVED_", "AMBIGUOUS_", "CHANGED_", "LABEL_"))
+            if name.startswith(("UNRESOLVED_", "AMBIGUOUS_", "CHANGED_", "LABEL_", "LISTED_"))
             and isinstance(getattr(_mapping, name), str)
         }
         | set(LINK_REASONS)
         | {OTHER}
     )
 )
-_MAPPING_TABLES = ("unresolved", "ambiguous", "changed", "labels_left_out")
+_MAPPING_TABLES = ("unresolved", "ambiguous", "changed", "labels_left_out", "listed_not_priced")
 _QUALITY = (*CHECKS, OTHER)
 _BUILD_DROPS = (*DROP_REASONS, OTHER)
 
@@ -263,7 +263,9 @@ class RunSummary:
       ``unknown_action_types`` (distinct and rows), ``ignored`` (files, files with ignored
       columns, columns, manifest keys), ``fetch_log`` summary, ``unlisted_spinoff_targets``.
     - ``mapping``: ``unresolved`` / ``ambiguous`` / ``changed``: source_code -> reason -> series;
-      ``labels_left_out``: source_code -> reason -> rows; ``minted``: instruments created;
+      ``labels_left_out``: source_code -> reason -> rows; ``listed_not_priced``: source_code
+      -> reason -> symbols only listed, never priced (counted, never degrading); ``minted``:
+      instruments created;
       ``overlapping_windows``: symbols whose windows overlap on different instruments.
     - ``quality``: check -> flags (every check of ``CHECKS``, plus ``other``).
     - ``coverage``: ``passed``, ``worst_missing_share`` (None without a finite share),
@@ -455,6 +457,7 @@ def _mapping_section(mapping: Any) -> dict[str, Any]:
         "ambiguous": _per_source_reason(mapping.ambiguous),
         "changed": _per_source_reason(mapping.changed),
         "labels_left_out": _per_source_reason(mapping.labels_left_out, "rows"),
+        "listed_not_priced": _per_source_reason(mapping.listed_not_priced),
         "minted": len(mapping.minted),
         "overlapping_windows": ambiguous_mappings(mapping.identifiers)
         if mapping.identifiers.num_rows

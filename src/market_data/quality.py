@@ -445,14 +445,45 @@ def _superseded(fetch_log: pa.Table, s_days: np.ndarray | None) -> np.ndarray:
 
 def unsuperseded_failures(fetch_log: pa.Table, *, sessions: pa.Table | None = None) -> pa.Table:
     """The ``error``/``partial`` rows of ``fetch_log`` that no later fetch superseded (see
-    ``fetch_coverage``), for the run report. A failed row with a null range is never superseded.
+    ``fetch_coverage``), for the run report. A failed row with a null range (a whole-list
+    ``symbols`` fetch) is superseded only by a strictly later ``ok``/``empty``/``not_found``
+    row of the same (source_code, source_symbol) with a null range too (the same list fetched
+    again).
 
     Pass the fetch log of one kind (``build_fetch_log(kinds=(kind,))``): it has no kind column,
     so an ``ok`` actions fetch would otherwise supersede a failed prices fetch."""
     _check_statuses(fetch_log)
     failed = pc.is_in(fetch_log["status"], value_set=pa.array(FAILED_FETCH_STATUSES))
     keep = failed.to_numpy(zero_copy_only=False) & ~_superseded(fetch_log, _session_days(sessions))
+    keep &= ~_null_range_superseded(fetch_log)
     return fetch_log.filter(pa.array(keep))
+
+
+def _null_range_superseded(fetch_log: pa.Table) -> np.ndarray:
+    """Mask of failed rows with a null range followed (strictly later ``known_at``) by a
+    good row with a null range of the same (source_code, source_symbol)."""
+    out = np.zeros(fetch_log.num_rows, bool)
+    null = pc.and_(
+        pc.is_null(fetch_log["requested_from"]), pc.is_null(fetch_log["requested_to"])
+    ).to_numpy(zero_copy_only=False)
+    if not null.any():
+        return out
+    status = np.asarray(fetch_log["status"].to_pylist(), dtype=object)
+    known = fetch_log["known_at"].combine_chunks().cast(pa.int64()).to_numpy(zero_copy_only=False)
+    keys = list(
+        zip(
+            fetch_log["source_code"].to_pylist(),
+            fetch_log["source_symbol"].to_pylist(),
+            strict=True,
+        )
+    )
+    latest_good: dict[tuple[str, str], int] = {}
+    for i in np.flatnonzero(null & np.isin(status, NO_DATA_STATUSES)):
+        latest_good[keys[i]] = max(latest_good.get(keys[i], known[i]), known[i])
+    for i in np.flatnonzero(null & np.isin(status, FAILED_FETCH_STATUSES)):
+        good = latest_good.get(keys[i])
+        out[i] = good is not None and good > known[i]
+    return out
 
 
 def _windows(identifiers: pa.Table) -> tuple[pa.Table, set[str]]:

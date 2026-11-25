@@ -13,7 +13,8 @@ Rules
       be after every ``known_at`` of ``existing`` (a later run supersedes an earlier one).
     - A series' candidate composite FIGIs come from its ``composite_figi`` observations (each
       observation window kept, overlapping or touching windows of one composite merged: A, gap,
-      A leaves the gap unmapped; A, B, A gives three rows), else from its OpenFIGI results
+      A leaves the gap unmapped; A, B, A gives three rows; an undated sighting next to a dated
+      window of the same composite is dropped as stale), else from its OpenFIGI results
       (observations win: OpenFIGI results of a series that has a composite observation are
       ignored).
     - Export-dated sources (``export_dated_sources``, default ``private_history``: a
@@ -26,7 +27,10 @@ Rules
       span covered by none is reported ``unresolved`` (``uncovered_span``) while the covered
       parts are mapped. Overlapping windows, or several undated candidates, make the series
       ``ambiguous`` (``several_composite_figis``): not mapped. Without a span the observation
-      window is used; with no start at all: ``unresolved`` (``no_span``). Candidates entirely
+      window is used; with no start at all: ``unresolved`` (``no_span``). When ``spans`` are
+      given, a series without one, without published windows, a manual row or an OpenFIGI
+      answer is a symbol only listed (a symbols fetch), never priced: not a series, neither
+      mapped nor reported, counted in ``MappingResult.listed_not_priced``. Candidates entirely
       outside the span are dropped; none left: ``outside_span``. No candidate:
       ``no_composite_figi``.
     - A present-time candidate (a composite known only from OpenFIGI, or the single composite
@@ -143,7 +147,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -176,6 +180,7 @@ __all__ = [
     "LABEL_MANUAL_OVERRIDE",
     "LABEL_OUTSIDE_WINDOWS",
     "LABEL_SEVERAL_WINDOWS",
+    "LISTED_NOT_PRICED",
     "MANUAL_MAPPING_ENV",
     "MANUAL_SCHEMA",
     "MANUAL_SOURCE",
@@ -233,6 +238,8 @@ LABEL_COMPOSITE_NOT_MAPPED = "composite_not_mapped"
 LABEL_OUTSIDE_WINDOWS = "outside_windows"
 LABEL_SEVERAL_WINDOWS = "several_windows"
 LABEL_ANSWER_NOT_APPLIED = "answer_not_applied"
+# A non-export symbol observed in a list (a symbols fetch) but never priced: not a series.
+LISTED_NOT_PRICED = "listed_not_priced"
 # Sources whose identifier observations are dated at an export, not at the dates they describe
 # (the history-file adapter's default source code): their spans, not their dates, bound them.
 EXPORT_DATED_SOURCES = ("private_history",)
@@ -308,6 +315,8 @@ class MappingResult:
     minted: tuple[str, ...]  # instrument ids created by this run
     labels_left_out: pa.Table  # LABELS_LEFT_OUT_SCHEMA (counts, never a label)
     changed: pa.Table  # REPORT_SCHEMA: mapped series moved to another instrument (operator review)
+    # REPORT_SCHEMA: symbols only listed, never priced (not series: neither mapped nor reported)
+    listed_not_priced: pa.Table = field(default_factory=REPORT_SCHEMA.empty_table)
 
 
 @dataclass(frozen=True)
@@ -969,6 +978,7 @@ def build_mapping(
     mapping: list[dict[str, Any]] = []
 
     changed: list[tuple[Series, str, int]] = []
+    listed: list[tuple[Series, str, int]] = []
     applied: dict[Series, _Window] = {}  # present-time answers applied this run, per series
     extended: set[tuple] = set()  # natural keys of published rows whose end this run extends
     left: dict[Series, set[str]] = {}  # instruments a moved series no longer maps to
@@ -1022,6 +1032,16 @@ def build_mapping(
     for s in sorted(scope - manual_series):
         value = f"{s[0]}:{s[1]}"
         published = _published_windows(prior, value, s[0])
+        if (
+            spans is not None
+            and s not in span_of
+            and not published
+            and s[0] not in export_dated
+            and s not in from_figi
+        ):
+            # listed (a symbols fetch) but never priced: not a series, nothing to map
+            listed.append((s, LISTED_NOT_PRICED, len(observed.get(s, ()))))
+            continue
         if s not in span_of and published:
             # no span this run: never rewrite a published (bounded) window open-ended
             keep(s, value, published, answer_applied=names_kept(s, published))
@@ -1258,6 +1278,7 @@ def build_mapping(
         ambiguous=_report(ambiguous),
         minted=tuple(ids.minted),
         changed=_report(changed),
+        listed_not_priced=_report(listed),
         labels_left_out=pa.Table.from_pylist(
             [
                 {"source_code": s[0], "source_symbol": s[1], "reason": why, "rows": n}

@@ -23,6 +23,7 @@ from market_data.resolve.mapping import (
     CHANGED_COMPOSITE,
     CHANGED_EXPORT_COMPOSITE,
     LABEL_ANSWER_NOT_APPLIED,
+    LISTED_NOT_PRICED,
     MANUAL_MAPPING_ENV,
     MANUAL_SCHEMA,
     MANUAL_SOURCE,
@@ -227,8 +228,14 @@ def test_unresolved_reported():
     unr = report(result.unresolved)
     assert unr[("massive", "GONE")]["reason"] == UNRESOLVED_NO_COMPOSITE
     assert unr[("massive", "GONE")]["candidates"] == 0
-    assert unr[("massive", "NOFIGI")]["reason"] == UNRESOLVED_NO_COMPOSITE
     assert unr[("tiingo", "ONLYSPAN")]["reason"] == UNRESOLVED_NO_COMPOSITE
+    # with spans given, NOFIGI and NODATE (no span) are only listed, never priced
+    listed = report(result.listed_not_priced)
+    assert set(listed) == {("massive", "NOFIGI"), ("massive", "NODATE")}
+    assert ("massive", "NOFIGI") not in unr and ("massive", "NODATE") not in unr
+    # without any span table they are reported as before
+    unr = report(build(obs, figi).unresolved)
+    assert unr[("massive", "NOFIGI")]["reason"] == UNRESOLVED_NO_COMPOSITE
     assert unr[("massive", "NODATE")]["reason"] == UNRESOLVED_NO_SPAN
     assert unr[("massive", "NODATE")]["candidates"] == 1
     # SYNA (no span) and SYNC (no span) have an OpenFIGI composite but nothing dates them
@@ -1636,3 +1643,24 @@ def test_dated_observation_beats_a_stale_undated_one():
     assert resolve(m, "massive:ABC", date(2024, 3, 1)) == x
     assert resolve(m, "massive:ABC", date(2024, 9, 2)) is None  # never spliced past the end
     assert report(result.unresolved)[("massive", "ABC")]["reason"] == "uncovered_span"
+
+
+def test_listed_symbols_never_priced_are_not_series():
+    obs = observations(
+        ob("massive", "AAA", "composite_figi", CX),
+        ob("massive", "OLD1", "composite_figi", CY, None, date(2010, 1, 5)),
+        ob("massive", "OLD2", "composite_figi", CV, date(2001, 1, 2), date(2010, 1, 5)),
+        ob("massive", "NOFIGI", "ticker", "NOFIGI"),
+        ob("private_history", "t_nospan", "composite_figi", C1, END),
+    )
+    result = build(obs, spans=spans(("massive", "AAA", date(2024, 1, 2), END)))
+    assert mapping_rows(result, "massive:AAA")
+    for sym in ("OLD1", "OLD2", "NOFIGI"):
+        assert not mapping_rows(result, f"massive:{sym}")
+    assert set(report(result.unresolved)) == {("private_history", "t_nospan")}  # export: still
+    assert {k: r["reason"] for k, r in report(result.listed_not_priced).items()} == dict.fromkeys(
+        [("massive", "OLD1"), ("massive", "OLD2"), ("massive", "NOFIGI")], LISTED_NOT_PRICED
+    )
+    assert not result.minted or len(result.minted) == 1  # only AAA's instrument
+    # without any span table the observation windows still map (unchanged)
+    assert mapping_rows(build(obs), "massive:OLD2")

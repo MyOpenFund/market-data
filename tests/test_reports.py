@@ -493,3 +493,15 @@ def test_rewrite_replaces_atomically(tmp_path):
     json_path, _ = write_report(clean(), tmp_path)
     assert json.loads(json_path.read_text())["outcome"] == "ok"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["run-1-report.json", "run-1-report.md"]
+
+
+def test_listed_not_priced_counted_without_degrading():
+    from dataclasses import replace
+
+    from market_data.resolve.mapping import LISTED_NOT_PRICED
+
+    listed = report_table([(SRC, LABEL, LISTED_NOT_PRICED), (SRC, "OTHER", LISTED_NOT_PRICED)])
+    run = clean(mapping=replace(mapping(), listed_not_priced=listed))
+    assert run.outcome == "ok"
+    assert run.mapping["listed_not_priced"] == {SRC: {"listed_not_priced": 2}}
+    assert clean().mapping["listed_not_priced"] == {}

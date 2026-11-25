@@ -577,10 +577,12 @@ def map_identifiers(
         if observations
         else None
     )
-    span = _mapping.combine_spans(*spans) if spans else None
+    # always a table (empty without spans): a symbol only listed, never priced, is then no
+    # series (``mapping.LISTED_NOT_PRICED``)
+    span = _mapping.combine_spans(*spans)
     figi = None
     asked = 0
-    if figi_client is not None and span is not None:
+    if figi_client is not None:
         series = openfigi_series(obs, span)
         asked = len(series)
         if series:
@@ -602,7 +604,7 @@ def map_identifiers(
             [(INSTRUMENT_IDENTIFIERS, result.identifiers)], landing=landing, run_id=run_id
         )
         run = _run_dir(reports, run_id)
-        for name in ("unresolved", "ambiguous", "changed", "labels_left_out"):
+        for name in ("unresolved", "ambiguous", "changed", "labels_left_out", "listed_not_priced"):
             pq.write_table(getattr(result, name), run / f"mapping_{name}.parquet")
     summary = summarize_safely(run_id, started_at=started_at, mapping=result, written=written)
     counts = {
@@ -611,6 +613,7 @@ def map_identifiers(
         "unresolved": result.unresolved.num_rows,
         "ambiguous": result.ambiguous.num_rows,
         "changed": result.changed.num_rows,
+        "listed_not_priced": result.listed_not_priced.num_rows,
         "openfigi_jobs": asked,
     }
     return StepResult("map", summary, write, None, counts, run)
@@ -852,6 +855,8 @@ def report(
         for name in _SUMMARY_SECTIONS:
             if data.get(name) is not None:
                 _merge(sections.setdefault(name, {}), data[name])
+    if "mapping" in sections:  # a map piece saved before this count existed
+        sections["mapping"].setdefault("listed_not_priced", {})
     starts = [datetime.fromisoformat(p["summary"]["started_at"]) for p in pieces]
     if coverage_result is not None:
         sections["coverage"] = summarize(
