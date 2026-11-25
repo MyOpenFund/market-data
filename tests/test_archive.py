@@ -204,3 +204,27 @@ def test_empty_names_rejected(tmp_path):
 def test_root_is_absolute(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert RawArchive("rel").root.is_absolute()
+
+
+def test_history_with_refs_matches_put_refs(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    late = make(payload=b"late", at=T0 + timedelta(days=1))
+    early = make(payload=b"early")
+    ref_late, ref_early = arc.put(late), arc.put(early)
+    got = list(arc.history_with_refs("synth", "AAA", "prices"))
+    assert [(g.archive_ref, g.result) for g in got] == [(ref_early, early), (ref_late, late)]
+    assert list(arc.history("synth", "AAA", "prices")) == [early, late]
+    assert list(arc.history_with_refs("synth", "AAA", "actions")) == []
+
+
+def test_symbols_lists_stored_symbols_per_kind(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    for sym in ("BBB", "AAA", WHOLE_MARKET_SYMBOL, "BRK/B", "_market"):
+        arc.put(make(symbol=sym))
+    arc.put(make(symbol="CCC", kind="actions"))
+    arc.put(make(symbol="DDD", source_code="other"))
+    assert arc.symbols("synth", "prices") == sorted(
+        ["AAA", "BBB", "BRK/B", "_market", WHOLE_MARKET_SYMBOL]
+    )
+    assert arc.symbols("synth", "actions") == ["CCC"]
+    assert arc.symbols("nothing", "prices") == []

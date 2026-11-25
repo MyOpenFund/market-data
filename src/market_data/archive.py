@@ -19,6 +19,7 @@ import tempfile
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import quote
 
 from market_data.adapters.base import WHOLE_MARKET_SYMBOL, FetchResult
@@ -91,6 +92,13 @@ def _publish(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class ArchivedFetch(NamedTuple):
+    """One archived fetch and its archive reference (the ``put`` return value)."""
+
+    archive_ref: str
+    result: FetchResult
+
+
 def _iso(value: date | datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
@@ -131,6 +139,14 @@ class RawArchive:
         return (directory / f"{stem}.bin").relative_to(self.root).as_posix()
 
     def history(self, source_code: str, source_symbol: str, kind: str) -> Iterator[FetchResult]:
+        """Fetches of one series and kind, sorted by (fetched_at, archive_ref)."""
+        for entry in self.history_with_refs(source_code, source_symbol, kind):
+            yield entry.result
+
+    def history_with_refs(
+        self, source_code: str, source_symbol: str, kind: str
+    ) -> Iterator[ArchivedFetch]:
+        """Like ``history``, each fetch paired with its archive reference."""
         directory = self._dir(source_code, source_symbol, kind)
         if not directory.is_dir():
             return
@@ -152,7 +168,7 @@ class RawArchive:
                 raise ValueError(f"corrupted archive: payload missing for {ref}") from None
             if hashlib.sha256(payload).hexdigest() != meta["payload_sha256"]:
                 raise ValueError(f"corrupted archive: payload sha256 mismatch for {ref}")
-            yield FetchResult(
+            result = FetchResult(
                 source_code=meta["source_code"],
                 source_symbol=meta["source_symbol"],
                 kind=meta["kind"],
@@ -163,6 +179,21 @@ class RawArchive:
                 payload=payload,
                 content_type=meta["content_type"],
             )
+            yield ArchivedFetch(ref, result)
+
+    def symbols(self, source_code: str, kind: str) -> list[str]:
+        """Sorted distinct source symbols (``"*"`` included) archived for a source and kind.
+
+        Read from the sidecars, so encoded path segments never need decoding."""
+        base = self.root / _segment(source_code)
+        if not base.is_dir():
+            return []
+        found: set[str] = set()
+        for sidecar_path in base.glob(f"*/{kind}/*.json"):
+            meta = json.loads(sidecar_path.read_text())
+            if meta["source_code"] == source_code and meta["kind"] == kind:
+                found.add(meta["source_symbol"])
+        return sorted(found)
 
 
 def _parse_date(value: str | None) -> date | None:
