@@ -291,16 +291,43 @@ def build_prices(
 # --- corporate actions -------------------------------------------------------------------------
 
 
+def _calendar_errors() -> tuple[type[Exception], ...]:
+    from exchange_calendars import errors as xerrors
+    from pandas.errors import OutOfBoundsDatetime
+
+    return (xerrors.NoSessionsError, xerrors.DateOutOfBounds, OutOfBoundsDatetime)
+
+
 def _calendar(mic: str, start: date, end: date):
     import exchange_calendars as xcals
 
-    with warnings.catch_warnings():
-        # Upstream: exchange_calendars 4.13.2 calls Series.values on tz-aware data while
-        # building a calendar, which pandas 3.1 flags (same filter as asof.sessions).
-        warnings.filterwarnings(
-            "ignore", message="Series.values returning an ndarray", category=Warning
-        )
-        return xcals.get_calendar(mic, start=start.isoformat(), end=end.isoformat())
+    try:
+        with warnings.catch_warnings():
+            # Upstream: exchange_calendars 4.13.2 calls Series.values on tz-aware data while
+            # building a calendar, which pandas 3.1 flags (same filter as asof.sessions).
+            warnings.filterwarnings(
+                "ignore", message="Series.values returning an ndarray", category=Warning
+            )
+            return xcals.get_calendar(mic, start=start.isoformat(), end=end.isoformat())
+    except _calendar_errors() as exc:
+        raise ValueError(
+            f"exchange calendar {mic!r} cannot be built over {start.isoformat()}.."
+            f"{end.isoformat()}: {exc}"
+        ) from exc
+
+
+def _ex_date_open(cal, mic: str, ex: date) -> datetime:
+    """Open in UTC of the ex-date session, or of the next session when ex is not a session."""
+    import pandas as pd
+
+    try:
+        session = cal.date_to_session(pd.Timestamp(ex), direction="next")
+        return cal.session_open(session).to_pydatetime().astimezone(UTC)
+    except _calendar_errors() as exc:
+        raise ValueError(
+            f"exchange calendar {mic!r} has no session on or after ex-date {ex.isoformat()} "
+            f"within the built range (raise next_session_margin): {exc}"
+        ) from exc
 
 
 def build_actions(
@@ -313,15 +340,20 @@ def build_actions(
 ) -> BuildResult:
     """``corporate_actions`` rows of ``adapter``'s source for ``symbols`` (None: every symbol).
 
-    ``next_session_margin``: how far past the last ex-date the exchange calendar is built, so an
-    ex-date that is not a session finds the next session (default 14 days)."""
-    import pandas as pd
-
+    ``next_session_margin`` (> 0, default 14 days): the exchange calendar is built from the
+    earliest ex-date minus the margin to the latest plus the margin, so an ex-date that is not a
+    session finds the next session, and the range always holds a session even when the earliest
+    ex-date is a weekend or holiday. Calendar failures (out of the library's range, no next
+    session inside the margin) are ``ValueError``."""
+    if next_session_margin <= timedelta(0):
+        raise ValueError(f"next_session_margin must be positive, got {next_session_margin}")
     fetches = _rows(archive, adapter, "actions", symbols)
     ex_dates = [r["valid_date"] for _, _, rows in fetches for r in rows]
     cal = None
     if ex_dates:
-        cal = _calendar(mic, min(ex_dates), max(ex_dates) + next_session_margin)
+        cal = _calendar(
+            mic, min(ex_dates) - next_session_margin, max(ex_dates) + next_session_margin
+        )
     last: dict[tuple, tuple] = {}
     out: list[dict[str, Any]] = []
     groups = _observations(
@@ -338,8 +370,7 @@ def build_actions(
                 known_at, kind, basis = fetched_at, "collected", "fetch_time"
             else:
                 ex, announced = r["valid_date"], r["announce_date"]
-                session = cal.date_to_session(pd.Timestamp(ex), direction="next")
-                opened = cal.session_open(session).to_pydatetime().astimezone(UTC)
+                opened = _ex_date_open(cal, mic, ex)
                 first, basis = opened, "ex_date_assumed"
                 if announced is not None:
                     eod = datetime.combine(announced, time.max, tzinfo=cal.tz).astimezone(UTC)

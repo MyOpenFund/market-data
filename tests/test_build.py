@@ -308,9 +308,12 @@ def test_conflicting_values_within_one_fetch_raise(arc):
 
 
 def test_conflicting_first_values_within_one_fetch_raise(arc):
-    put(arc, [bar("AAA", "2026-01-05", 10.0), bar("AAA", "2026-01-05", 10.4)], utc(2026, 1, 7))
-    with pytest.raises(ValueError, match="conflicting values"):
+    ref = put(
+        arc, [bar("AAA", "2026-01-05", 10.0), bar("AAA", "2026-01-05", 10.4)], utc(2026, 1, 7)
+    )
+    with pytest.raises(ValueError, match="conflicting values") as err:
         build_prices(arc, FakeAdapter(), ["AAA"])
+    assert ref in str(err.value) and "'AAA'" in str(err.value)
 
 
 def test_tied_conflict_across_fetches_first_sighting_raises(arc):
@@ -622,3 +625,45 @@ def test_every_table_passes_conform(arc):
     for contract, table in ((PRICES, prices), (CORPORATE_ACTIONS, actions), (FETCH_LOG, log)):
         assert table.num_rows > 0
         assert conform(contract, table).equals(table)
+
+
+@pytest.mark.parametrize(
+    ("ex", "next_open"),
+    [("2026-01-10", utc(2026, 1, 12, 14, 30)), ("2026-01-19", utc(2026, 1, 20, 14, 30))],
+    ids=["saturday", "holiday"],
+)
+@pytest.mark.parametrize("announced", [None, "2026-01-02"], ids=["no-announce", "announce"])
+def test_earliest_ex_date_not_a_session(arc, ex, next_open, announced):
+    # The earliest (and only) ex-date of the build is a Saturday / Martin Luther King Day.
+    a = action("AAA", ex, announce_date=announced, amount=0.5, currency="USD")
+    put(arc, [a], utc(2026, 2, 1, 1), kind="actions")
+    (row,) = rows_of(build_actions(arc, FakeAdapter(), ["AAA"]).table)
+    if announced is None:
+        assert (row["known_at"], row["known_at_basis"]) == (next_open, "ex_date_assumed")
+    else:
+        assert (row["known_at"], row["known_at_basis"]) == (
+            utc(2026, 1, 3, 4, 59, 59, 999999),
+            "announce_date",
+        )
+
+
+def test_next_session_margin_parameter(arc):
+    put(arc, [action("AAA", "2026-01-10", amount=0.5)], utc(2026, 2, 1, 1), kind="actions")
+    # Saturday + 3 days reaches Monday's session.
+    t = build_actions(arc, FakeAdapter(), ["AAA"], next_session_margin=timedelta(days=3)).table
+    assert t["known_at"].to_pylist() == [utc(2026, 1, 12, 14, 30)]
+    # Saturday + 1 day: no next session inside the calendar -> a clear ValueError.
+    with pytest.raises(ValueError, match="calendar"):
+        build_actions(arc, FakeAdapter(), ["AAA"], next_session_margin=timedelta(days=1))
+
+
+@pytest.mark.parametrize("margin", [timedelta(0), timedelta(days=-1)])
+def test_next_session_margin_must_be_positive(arc, margin):
+    with pytest.raises(ValueError, match="next_session_margin"):
+        build_actions(arc, FakeAdapter(), ["AAA"], next_session_margin=margin)
+
+
+def test_calendar_out_of_range_is_a_value_error(arc):
+    put(arc, [action("AAA", "1600-01-04", amount=0.5)], utc(2026, 2, 1, 1), kind="actions")
+    with pytest.raises(ValueError, match="calendar"):
+        build_actions(arc, FakeAdapter(), ["AAA"])
