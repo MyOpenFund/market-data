@@ -1137,3 +1137,48 @@ def test_dividend_without_currency_is_counted_as_such(currency):
     assert report.table.num_rows == 0
     assert nonzero(report) == {CASH_WITHOUT_CURRENCY: (("AAA", DAY),)}
     assert CASH_WITHOUT_CURRENCY in KEPT_OUT_REASONS
+
+
+def _holds_key(value, key: str, depth: int = 0) -> bool:
+    """The key in a string, bytes, or the keys/values of headers, mappings, sequences and
+    requests (header values, not their repr)."""
+    if depth > 6:
+        return False
+    if isinstance(value, str | bytes):
+        return (key if isinstance(value, str) else key.encode()) in value
+    if isinstance(value, httpx.Request):
+        return _holds_key(value.headers, key, depth + 1)
+    if isinstance(value, httpx.Headers):
+        return any(_holds_key(v, key, depth + 1) for _, v in value.raw)
+    if isinstance(value, dict):
+        return any(
+            _holds_key(k, key, depth + 1) or _holds_key(v, key, depth + 1)
+            for k, v in value.items()
+        )
+    if isinstance(value, list | tuple | set | frozenset):
+        return any(_holds_key(v, key, depth + 1) for v in value)
+    return False
+
+
+def test_key_not_a_local_of_the_request_frames():
+    import sys
+
+    from market_data.adapters import massive as massive_module
+
+    leaks: list[str] = []
+
+    def inspect_frames(request):
+        assert request.headers["authorization"] == f"Bearer {FAKE_KEY}"
+        frame = sys._getframe()
+        while frame is not None:
+            if frame.f_code.co_filename == massive_module.__file__:
+                for name, value in frame.f_locals.items():
+                    if _holds_key(value, FAKE_KEY) or FAKE_KEY in repr(value):
+                        leaks.append(f"{frame.f_code.co_name}.{name}")
+            frame = frame.f_back
+        return httpx.Response(200, json=fixture("grouped_daily.json"))
+
+    a = make(Recorder(answer=inspect_frames))
+    list(a.fetch("prices", [], DAY, DAY))
+    assert leaks == []
+    assert FAKE_KEY not in repr(vars(a))

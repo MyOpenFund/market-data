@@ -237,3 +237,42 @@ def test_figi_results_refuses_job_errors_and_misalignment():
     assert figi_results([], []).num_rows == 0
     assert figi_results([], []).schema == FIGI_RESULT_SCHEMA
     assert isinstance(figi_results([], []), pa.Table)
+
+
+def test_key_not_a_local_of_the_request_frames():
+    import sys
+
+    from market_data.resolve import openfigi as openfigi_module
+
+    leaks: list[str] = []
+
+    def holds(value, depth=0) -> bool:
+        if depth > 6:
+            return False
+        if isinstance(value, str | bytes):
+            return (FAKE_KEY if isinstance(value, str) else FAKE_KEY.encode()) in value
+        if isinstance(value, httpx.Request):
+            return holds(value.headers, depth + 1)
+        if isinstance(value, httpx.Headers):
+            return any(holds(v, depth + 1) for _, v in value.raw)
+        if isinstance(value, dict):
+            return any(holds(k, depth + 1) or holds(v, depth + 1) for k, v in value.items())
+        if isinstance(value, list | tuple | set | frozenset):
+            return any(holds(v, depth + 1) for v in value)
+        return False
+
+    class Inspect(Recorder):
+        def __call__(self, request):
+            assert request.headers[API_KEY_HEADER] == FAKE_KEY
+            frame = sys._getframe()
+            while frame is not None:
+                if frame.f_code.co_filename == openfigi_module.__file__:
+                    for name, value in frame.f_locals.items():
+                        if holds(value) or FAKE_KEY in repr(value):
+                            leaks.append(f"{frame.f_code.co_name}.{name}")
+                frame = frame.f_back
+            return super().__call__(request)
+
+    out = client(Inspect(echo=True), FakeClock(), FAKE_KEY).map([us_ticker_job("ABC")])
+    assert len(out) == 1
+    assert leaks == []

@@ -125,7 +125,7 @@ import math
 import os
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -314,6 +314,21 @@ class ParseReport:
         return {reason: len(keys) for reason, keys in self.kept_out.items()}
 
 
+class _BearerAuth(httpx.Auth):
+    """Sets ``Authorization: Bearer <key>`` on each request as it is sent: the clear key is
+    never kept in a headers dict or a local of the fetch frames."""
+
+    def __init__(self, key: Secret) -> None:
+        self._key = key
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = "Bearer " + self._key.reveal()
+        yield request
+
+    def __repr__(self) -> str:
+        return "_BearerAuth(Secret(***))"
+
+
 class _KeptOut(Exception):
     """One row kept out of a parse (internal control flow, never escapes)."""
 
@@ -453,7 +468,7 @@ class MassiveAdapter:
                         f"start {start.isoformat()} is before {oldest.isoformat()}, outside "
                         f"max_history_days ({self.max_history_days}) of the plan"
                     )
-        self._header()
+        self._check_key()
         if kind == "symbols":
             return self._fetch_symbols()
         assert start is not None and end is not None
@@ -463,16 +478,15 @@ class MassiveAdapter:
             return self._fetch_grouped(start, end)
         return self._fetch_aggs(names, start, end)
 
-    def _header(self) -> dict[str, str]:
+    def _check_key(self) -> None:
+        """A key an HTTP header can carry (the auth hook sets it on each request)."""
         if not self._key:
             raise MassiveKeyError(f"no Massive API key: {_GET_A_KEY}")
-        value = self._key.reveal()
-        if not _KEY_CHARS.fullmatch(value):
+        if not _KEY_CHARS.fullmatch(self._key.reveal()):
             raise MassiveKeyError(
                 f"the Massive API key in {API_KEY_ENV} has characters an HTTP header cannot "
                 "carry (printable ASCII only); check it was copied whole"
             )
-        return {"Authorization": f"Bearer {value}"}
 
     def _closed_sessions(self, start: date, end: date) -> list[date]:
         """Sessions of ``mic`` in ``[start, end]`` whose close is not after now."""
@@ -630,13 +644,15 @@ class MassiveAdapter:
             self._sleep(self._next - now)
 
     def _get(self, url: str, params: Mapping[str, str] | None) -> tuple[bytes, Mapping[str, Any]]:
-        headers = self._header()
+        self._check_key()
+        assert self._key is not None
+        auth = _BearerAuth(self._key)
         for attempt in range(self.max_retries + 1):
             self._wait_turn()
             self._next = self._clock() + self._interval
             retry_after = None
             try:
-                response = self._http.get(url, params=params, headers=headers)
+                response = self._http.get(url, params=params, auth=auth)
             except httpx.HTTPError as exc:
                 error = f"Massive request failed: {type(exc).__name__}"
             else:

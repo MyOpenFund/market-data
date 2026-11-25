@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -97,6 +97,21 @@ class OpenFigiError(RuntimeError):
 def us_ticker_job(root: str) -> dict[str, Any]:
     """The mapping job for a US ticker root (composite exchange ``US``, unlisted included)."""
     return {"idType": "TICKER", "idValue": root, "exchCode": "US", "includeUnlistedEquities": True}
+
+
+class _KeyAuth(httpx.Auth):
+    """Sets the ``X-OPENFIGI-APIKEY`` header on each request as it is sent: the clear key is
+    never kept in a headers dict or a local of the request frames."""
+
+    def __init__(self, key: Secret) -> None:
+        self._key = key
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers[API_KEY_HEADER] = self._key.reveal()
+        yield request
+
+    def __repr__(self) -> str:
+        return "_KeyAuth(Secret(***))"
 
 
 class OpenFigiClient:
@@ -177,15 +192,14 @@ class OpenFigiClient:
 
     def _post(self, batch: list[dict[str, Any]]) -> Any:
         headers = {"Content-Type": "application/json"}
-        if self._key:
-            headers[API_KEY_HEADER] = self._key.reveal()
+        auth = _KeyAuth(self._key) if self._key else None
         body = json.dumps(batch).encode()
         for attempt in range(self.max_retries + 1):
             self._wait_turn()
             sent = self._clock()
             self._next = sent + self._interval
             try:
-                response = self._http.post(self._url, content=body, headers=headers)
+                response = self._http.post(self._url, content=body, headers=headers, auth=auth)
             except httpx.HTTPError as exc:
                 error = OpenFigiError(f"OpenFIGI request failed: {type(exc).__name__}")
             else:
