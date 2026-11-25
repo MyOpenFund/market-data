@@ -121,10 +121,20 @@ class FetchResult:
 
 @runtime_checkable
 class Adapter(Protocol):
-    """A source adapter. Optional attribute ``actions_fetch_kind`` (not part of the structural
-    check): the archived fetch kind whose payload also holds the corporate actions, for a source
-    with no separate actions request (Tiingo: ``"prices"``); ``build.build_actions`` reads those
-    fetches and parses each as kind ``actions``. Absent: ``"actions"``."""
+    """A source adapter. Optional attributes (not part of the structural check):
+
+    ``actions_fetch_kind``: the archived fetch kind whose payload also holds the corporate
+    actions, for a source with no separate actions request (Tiingo: ``"prices"``);
+    ``build.build_actions`` reads those fetches and parses each as kind ``actions``. Absent:
+    ``"actions"``.
+
+    ``corroborates_delisting``: True when the end of the source's mapping windows corroborates a
+    delisting, i.e. its windows end at an export date (a history file: a dead member's last
+    price ends its window, the export date ends its fetch-log row), so an ``ok``/``empty``
+    symbol fetch past the window means the name is gone (``quality.fetch_coverage`` rule 6).
+    Absent: False, which a live provider must keep (Massive and Tiingo declare False): one
+    ``empty`` answer for the next session (a halt, a late publication) or a renamed ticker is
+    no delisting. ``pipeline.corroborating_codes`` reads it."""
 
     source_code: str
     info: SourceInfo

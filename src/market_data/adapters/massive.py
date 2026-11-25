@@ -369,6 +369,8 @@ def _info() -> SourceInfo:
 
 class MassiveAdapter:
     source_code = SOURCE_CODE
+    # a live provider: one empty answer past a window is no delisting (fetch_coverage rule 6)
+    corroborates_delisting = False
 
     def __init__(
         self,

@@ -114,6 +114,7 @@ __all__ = [
     "archive_observations",
     "archive_spans",
     "build",
+    "corroborating_codes",
     "fetch",
     "landing_root",
     "load_history",
@@ -124,6 +125,7 @@ __all__ = [
     "plan_fetch",
     "report",
     "save_piece",
+    "shipped_adapter_classes",
     "store_coverage",
     "vendor_adjusted",
     "saved_artifacts",
@@ -789,6 +791,28 @@ def _merge(into: dict[str, Any], value: Mapping[str, Any]) -> None:
             into[key] = into.get(key, 0) + v
 
 
+def shipped_adapter_classes() -> dict[str, type]:
+    """Source code -> class of the adapters the CLI uses: the history file (``load-history``,
+    ``HISTORY_SOURCE``), Massive and Tiingo."""
+    from market_data.adapters import massive, tiingo
+    from market_data.adapters.file import FileHistory
+
+    return {
+        HISTORY_SOURCE: FileHistory,
+        massive.SOURCE_CODE: massive.MassiveAdapter,
+        tiingo.SOURCE_CODE: tiingo.TiingoAdapter,
+    }
+
+
+def corroborating_codes(adapters: Mapping[str, Any]) -> frozenset[str]:
+    """The source codes (keys) whose adapter (an instance or its class) declares
+    ``corroborates_delisting`` true (absent: false; see ``adapters.base.Adapter``):
+    ``quality.fetch_coverage``'s ``corroborating_sources``."""
+    return frozenset(
+        code for code, a in adapters.items() if getattr(a, "corroborates_delisting", False) is True
+    )
+
+
 def store_coverage(
     store: Any,
     *,
@@ -801,6 +825,7 @@ def store_coverage(
     max_missing_share: float = DEFAULT_MAX_MISSING_SHARE,
     min_delisting_gap_sessions: int = DEFAULT_MIN_DELISTING_GAP_SESSIONS,
     mic: str = DEFAULT_MIC,
+    corroborating_sources: Iterable[str] | None = None,
 ) -> CoverageResult:
     """The store's coverage of ``index_code`` as known at ``as_of``: ``load_market_inputs``
     (strict), ``membership_intervals`` and ``unresolved_members`` (``snapshot_precedence``,
@@ -808,7 +833,10 @@ def store_coverage(
     published (prices) fetch log, then ``coverage`` over the sessions from the first membership
     date to the last one closed at ``as_of`` (a session still open is left out). No membership
     (or no closed session) at all: an empty result that does not pass (the report's
-    ``coverage_empty``)."""
+    ``coverage_empty``). ``corroborating_sources``: the source codes passed to
+    ``fetch_coverage`` (its rule 6: windows ending at an export date corroborate a delisting);
+    None, those of the adapters the CLI uses (``shipped_adapter_classes``) that declare
+    ``corroborates_delisting``: the history file only."""
     inputs = load_market_inputs(
         store, as_of=as_of, allowed_restricted=frozenset(allowed_restricted)
     )
@@ -844,7 +872,15 @@ def store_coverage(
             "several price sources (or conflicting series of one source) for one instrument "
             "and session: pass --precedence (or make that source's mapping windows disjoint)"
         ) from None
-    covered = fetch_coverage(inputs.fetch_log, inputs.identifiers, as_of=as_of, sessions=cal)
+    if corroborating_sources is None:
+        corroborating_sources = corroborating_codes(shipped_adapter_classes())
+    covered = fetch_coverage(
+        inputs.fetch_log,
+        inputs.identifiers,
+        as_of=as_of,
+        sessions=cal,
+        corroborating_sources=frozenset(corroborating_sources),
+    )
     return coverage(
         intervals,
         resolved,

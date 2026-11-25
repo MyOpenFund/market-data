@@ -722,23 +722,27 @@ def returned(log: pa.Table, *ends) -> pa.Table:
     return log.set_column(i, log.schema.field(i), pa.array(list(ends), pa.date32()))
 
 
+ON = {"corroborating_sources": {SRC}}
+
+
 def test_symbol_fetch_after_the_last_window_corroborates_the_end():
-    # DEAD maps to A until the 4th (its last price); the fetch asked up to the 12th
+    # DEAD maps to A until the 4th (its last price); the fetch asked up to the 12th; the
+    # source declares that its windows end at an export date (rule 6 on)
     ids = identifiers([(INST_A, f"{SRC}:DEAD", date(2024, 1, 1), date(2024, 1, 5))])
     row = ("DEAD", date(2024, 1, 1), date(2024, 1, 12))
     for status in ("ok", "empty"):
         log = returned(fetch_log([(*row, status, utc(2024, 1, 13))]), date(2024, 1, 4))
-        assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+        assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, **ON)) == [
             (INST_A, date(2024, 1, 1), date(2024, 1, 12), status)
         ]
     # data returned after the window's end (someone else's): clipped as before
     log = returned(fetch_log([(*row, "ok", utc(2024, 1, 13))]), date(2024, 1, 8))
-    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, **ON)) == [
         (INST_A, date(2024, 1, 1), date(2024, 1, 4), "ok")
     ]
     # a failed fetch extends nothing
     log = returned(fetch_log([(*row, "error", utc(2024, 1, 13))]), date(2024, 1, 4))
-    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, **ON)) == [
         (INST_A, date(2024, 1, 1), date(2024, 1, 4), "error")
     ]
     # only the last window's instrument gets the extension
@@ -749,7 +753,7 @@ def test_symbol_fetch_after_the_last_window_corroborates_the_end():
         ]
     )
     log = returned(fetch_log([(*row, "ok", utc(2024, 1, 13))]), date(2024, 1, 4))
-    assert cov_rows(fetch_coverage(log, two, as_of=AS_OF)) == [
+    assert cov_rows(fetch_coverage(log, two, as_of=AS_OF, **ON)) == [
         (INST_A, date(2024, 1, 1), date(2024, 1, 2), "ok"),
         (INST_C, date(2024, 1, 3), date(2024, 1, 12), "ok"),
     ]
@@ -758,9 +762,77 @@ def test_symbol_fetch_after_the_last_window_corroborates_the_end():
         fetch_log([("*", date(2024, 1, 1), date(2024, 1, 12), "ok", utc(2024, 1, 13))]),
         date(2024, 1, 12),
     )
-    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, **ON)) == [
         (INST_A, date(2024, 1, 1), date(2024, 1, 4), "ok")
     ]
+
+
+def test_rule_6_is_off_by_default_and_per_source():
+    ids = identifiers([(INST_A, f"{SRC}:DEAD", date(2024, 1, 1), date(2024, 1, 5))])
+    log = returned(
+        fetch_log([("DEAD", date(2024, 1, 1), date(2024, 1, 12), "empty", utc(2024, 1, 13))]),
+        date(2024, 1, 4),
+    )
+    clipped = [(INST_A, date(2024, 1, 1), date(2024, 1, 4), "empty")]
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == clipped
+    other = {"corroborating_sources": {"another_source"}}
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, **other)) == clipped
+
+
+def test_live_source_empty_next_session_is_no_delisting():
+    """A live per-symbol source (Tiingo-like): the symbol's last price on the 5th closes its
+    window; one ``empty`` fetch for the next session (a halt, a late publication) is not a
+    delisting: the cell stays ``not_fetched`` and no exit is flagged."""
+    from open_data_store.market.coverage import delisting_exits
+
+    live = "tiingo"
+    last, nxt = SESSION_DAYS[3], SESSION_DAYS[4]  # Fri 5th, Mon 8th
+    ids = identifiers([(INST_B, f"{live}:XYZ", D, last + timedelta(days=1))])
+    log = returned(
+        fetch_log(
+            [
+                ("XYZ", D, last, "ok", close_at(last) + timedelta(hours=4)),
+                ("XYZ", nxt, nxt, "empty", close_at(nxt) + timedelta(hours=4)),
+            ],
+            source_code=live,
+        ),
+        last,
+        None,
+    )
+    # INST_C, another member priced every session, makes the 8th a published session
+    intervals = pa.table(
+        {
+            "instrument_id": pa.array([INST_B, INST_C]),
+            "valid_from": pa.array([D, D], pa.date32()),
+            "valid_to": pa.array([None, None], pa.date32()),
+        }
+    )
+    resolved = pa.table(
+        {
+            "instrument_id": pa.array([INST_B] * 4 + [INST_C] * 5),
+            "session_date": pa.array(SESSION_DAYS[:4] + SESSION_DAYS[:5], pa.date32()),
+            "close": pa.array([10.0] * 9),
+        }
+    )
+    days = SESSIONS.filter(pa.compute.less_equal(SESSIONS["session_date"], nxt))
+    covered = fetch_coverage(log, ids, as_of=AS_OF, sessions=days)
+    assert cov_rows(covered) == [(INST_B, D, last, "ok")]
+    cells = coverage(intervals, resolved, days, covered, min_delisting_gap_sessions=1)
+    b_cells = cells.per_member.filter(pa.compute.equal(cells.per_member["instrument_id"], INST_B))
+    by_day = dict(
+        zip(b_cells["session_date"].to_pylist(), b_cells["reason"].to_pylist(), strict=True)
+    )
+    assert by_day[nxt] == "not_fetched"
+    exits = delisting_exits(
+        intervals, resolved, days, fetch_coverage=covered, min_delisting_gap_sessions=1
+    )
+    assert exits.num_rows == 0
+    # the same log from a source that declares rule 6 is a delisting at the last price
+    on = fetch_coverage(log, ids, as_of=AS_OF, sessions=days, corroborating_sources={live})
+    exits = delisting_exits(
+        intervals, resolved, days, fetch_coverage=on, min_delisting_gap_sessions=1
+    )
+    assert [(r["instrument_id"], r["exit_date"]) for r in exits.to_pylist()] == [(INST_B, last)]
 
 
 def test_unusable_cash_counts_what_the_recipe_cannot_apply():
@@ -786,3 +858,22 @@ def test_unusable_cash_counts_what_the_recipe_cannot_apply():
     )  # fmt: skip
     assert unusable_cash(a) == {SRC: {CASH_WITHOUT_CURRENCY: 1, SPLIT_DAY_CASH_WITHOUT_BASIS: 1}}
     assert unusable_cash(NO_ACTIONS) == {}
+
+
+def test_adapters_declare_whether_their_windows_corroborate_a_delisting():
+    from market_data.adapters.file import FileHistory
+    from market_data.adapters.massive import MassiveAdapter
+    from market_data.adapters.tiingo import TiingoAdapter
+    from market_data.pipeline import corroborating_codes
+
+    assert FileHistory.corroborates_delisting is True
+    assert MassiveAdapter.corroborates_delisting is False
+    assert TiingoAdapter.corroborates_delisting is False
+
+    class ThirdParty:  # no attribute: rule 6 stays off for it
+        pass
+
+    found = corroborating_codes(
+        {"h": FileHistory, "m": MassiveAdapter, "t": TiingoAdapter, "x": ThirdParty}
+    )
+    assert found == {"h"}

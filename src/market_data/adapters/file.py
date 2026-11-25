@@ -1024,7 +1024,13 @@ class FileHistory:
     (default ``MAX_NON_SESSION_SHARE``, 0.5 %).
 
     Entry point: ``build_all(load_time)`` validates, builds every table and returns them with the
-    filled ``LoadReport``; the per-table methods are its parts."""
+    filled ``LoadReport``; the per-table methods are its parts.
+
+    ``corroborates_delisting`` is True: a member's window ends at its last filed price and its
+    fetch-log row at the export date, so an ``ok``/``empty`` row past the window corroborates a
+    delisting (``quality.fetch_coverage`` rule 6)."""
+
+    corroborates_delisting = True
 
     def __init__(
         self,

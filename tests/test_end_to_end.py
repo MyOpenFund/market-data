@@ -259,7 +259,10 @@ def test_history_then_massive_twice_then_a_restated_load(world, capsys):
         m.prices, m.identifiers, as_of=as_of, precedence=("private_history", "massive")
     )
     days = sessions("XNYS", cal.days[0], cal.days[-1])
-    covered = fetch_coverage(m.fetch_log, m.identifiers, as_of=as_of, sessions=days)
+    covered = fetch_coverage(
+        m.fetch_log, m.identifiers, as_of=as_of, sessions=days,
+        corroborating_sources=pipeline.corroborating_codes(pipeline.shipped_adapter_classes()),
+    )  # fmt: skip
     exits = delisting_exits(iv, rp, days, fetch_coverage=covered)
     assert [r["exit_date"] for r in exits.to_pylist()] == [cal.bbb_last]
 

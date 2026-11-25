@@ -244,6 +244,15 @@ point, and declare the adapter under the `market_data.adapters` entry point (nam
 value = a zero-argument callable returning the adapter). Then add its code to
 `MOF_MARKET_ADAPTERS`.
 
+Optional class attribute `corroborates_delisting` (default `False` when absent): set it to
+`True` only when your source's mapping windows end at an export date, as the history file's do
+(a dead member's last price ends its window, the export date ends its fetch-log row). The
+coverage then reads an `ok`/`empty` fetch past a symbol's last window as a corroborated delisting
+(`quality.fetch_coverage` rule 6, its `corroborating_sources`; `pipeline.corroborating_codes`
+reads the attribute, `pipeline.store_coverage` takes the codes). A live provider keeps `False`
+(Massive and Tiingo do): one empty answer for the next session (a halt, a late publication) or a
+renamed ticker is not a delisting.
+
 ```toml
 [project.entry-points."market_data.adapters"]
 my_source = "my_package.adapter:make_adapter"

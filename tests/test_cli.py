@@ -804,10 +804,24 @@ def test_history_delisting_is_corroborated_by_its_fetch_log(env, run):
     # BBB, dead on 2020-02-14, is still a member until the 2020-02-29 snapshot
     tail = [r for r in result.per_member.to_pylist() if r["instrument_id"] == bbb]
     assert {r["reason"] for r in tail if r["session_date"] > date(2020, 2, 14)} == {"delisted"}
+    # the history file is the only shipped adapter whose windows corroborate a delisting
+    assert pipeline.corroborating_codes(pipeline.shipped_adapter_classes()) == allowed
+    with Store.open(env["cfg"]) as store:
+        off = pipeline.store_coverage(
+            store,
+            index_code="IDX1",
+            as_of=as_of,
+            allowed_restricted=allowed,
+            corroborating_sources=(),
+        )
+    tail = [r for r in off.per_member.to_pylist() if r["instrument_id"] == bbb]
+    assert {r["reason"] for r in tail if r["session_date"] > date(2020, 2, 14)} == {"not_fetched"}
     iv = membership_intervals(m.snapshots, m.identifiers, index_code="IDX1", as_of=as_of)
     rp = resolve_prices(m.prices, m.identifiers, as_of=as_of, precedence=())
     cal = sessions("XNYS", date(2020, 1, 2), date(2020, 4, 9))
-    covered = fetch_coverage(m.fetch_log, m.identifiers, as_of=as_of, sessions=cal)
+    covered = fetch_coverage(
+        m.fetch_log, m.identifiers, as_of=as_of, sessions=cal, corroborating_sources=allowed
+    )
     exits = delisting_exits(iv, rp, cal, fetch_coverage=covered)
     assert (bbb, date(2020, 2, 14)) in {
         (r["instrument_id"], r["exit_date"]) for r in exits.to_pylist()

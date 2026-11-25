@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
@@ -67,6 +67,7 @@ __all__ = [
     "CASH_WITHOUT_CURRENCY",
     "CHECKS",
     "CORROBORATING_STATUSES",
+    "DEFAULT_CORROBORATING_SOURCES",
     "DEFAULT_DIVERGENCE_THRESHOLD",
     "DEFAULT_JUMP_THRESHOLD",
     "JUMP_EXCUSING_ACTIONS",
@@ -106,6 +107,10 @@ QUALITY_FLAGS_SCHEMA = pa.schema(
 # Statuses of a symbol-level fetch that, past the end of the symbol's last window, corroborate
 # that end (the source was asked and had nothing): ``fetch_coverage`` rule 6.
 CORROBORATING_STATUSES = ("ok", "empty")
+# Sources whose windows' end corroborates a delisting (``fetch_coverage`` rule 6): none by
+# default, rule 6 off. The pipeline passes the codes of the adapters that declare
+# ``corroborates_delisting`` (the history file).
+DEFAULT_CORROBORATING_SOURCES: frozenset[str] = frozenset()
 
 _EPOCH = date(1970, 1, 1)
 # Composite (symbol, day) keys: code * _SHIFT + day + _OFFSET, day in int32 range.
@@ -620,11 +625,13 @@ def _extend_last_window(
     hi: pa.ChunkedArray,
     last_start: Mapping[str, date],
     last_returned: Mapping[tuple[str, str], date | None],
+    corroborating_sources: Collection[str],
 ) -> pa.Array:
     """``hi`` with the symbol-level rows of a token's last (closed) window extended to the
-    fetch's end when the fetch says nothing came after the window (status in
-    ``CORROBORATING_STATUSES``) and no row of the symbol returned data after the window's end:
-    the source was asked and had nothing, which corroborates the end (a delisting)."""
+    fetch's end when the row's source is in ``corroborating_sources``, the fetch says nothing
+    came after the window (status in ``CORROBORATING_STATUSES``) and no row of the symbol
+    returned data after the window's end: the source was asked and had nothing, which
+    corroborates the end (a delisting)."""
     out = hi.to_pylist()
     rows = zip(
         part["token"].to_pylist(),
@@ -637,6 +644,8 @@ def _extend_last_window(
         strict=True,
     )
     for i, (token, code, symbol, status, f_to, w_from, w_to) in enumerate(rows):
+        if code not in corroborating_sources:
+            continue
         if w_to is None or f_to <= w_to or status not in CORROBORATING_STATUSES:
             continue
         if w_from != last_start[token]:
@@ -653,6 +662,7 @@ def fetch_coverage(
     *,
     as_of: datetime,
     sessions: pa.Table | None = None,
+    corroborating_sources: Collection[str] = DEFAULT_CORROBORATING_SOURCES,
 ) -> pa.Table:
     """Fetch-log ranges mapped to instruments: the store's ``FETCH_COVERAGE_SCHEMA``
     [instrument_id, covered_from, covered_to, status] (inclusive bounds), sorted.
@@ -678,12 +688,17 @@ def fetch_coverage(
        a fetch-log row touches that symbol (its own row, or a ``"*"`` row of its source);
        untouched ones are skipped (count them with ``ambiguous_mappings``).
     5. A ``"*"`` (whole-market) row covers every mapped instrument of its source over its range.
-    6. A symbol-level ``ok``/``empty`` row reaching past the end of the symbol's last (closed)
-       window covers that window's instrument through the row's ``requested_to`` when no row
-       of the symbol returned data after the window's end (``returned_to``): the source was
-       asked and had nothing, which corroborates the end (a history export's delisted member:
-       its last price ends the window, the export date ends the request). ``"*"`` rows are
-       unchanged (clipped to every window).
+    6. Only for the sources in ``corroborating_sources`` (default
+       ``DEFAULT_CORROBORATING_SOURCES``, empty: rule 6 off): a symbol-level ``ok``/``empty``
+       row reaching past the end of the symbol's last (closed) window covers that window's
+       instrument through the row's ``requested_to`` when no row of the symbol returned data
+       after the window's end (``returned_to``): the source was asked and had nothing, which
+       corroborates the end (a history export's delisted member: its last price ends the
+       window, the export date ends the request). Pass the codes of the sources whose windows
+       end at an export date (adapters declaring ``corroborates_delisting``, see
+       ``market_data.adapters.base.Adapter``); never a live provider's: one ``empty`` answer
+       for the next session (a halt, a late publication) or a renamed ticker would read as a
+       delisting. ``"*"`` rows are unchanged (clipped to every window).
 
     Ranges of one (source_code, source_symbol, status) are merged first; with ``sessions`` (pass
     the coverage recipe's own), ranges with no session between them merge too (daily grouped
@@ -739,7 +754,9 @@ def fetch_coverage(
         lo = pc.max_element_wise(part["f_from"], part["w_from"])
         hi = pc.min_element_wise(part["f_to"], part["w_to"])  # null w_to (open) is skipped
         if symbol_level:
-            hi = _extend_last_window(part, hi, last_start, last_returned)
+            hi = _extend_last_window(
+                part, hi, last_start, last_returned, frozenset(corroborating_sources)
+            )
         table = pa.table(
             [part["instrument_id"], lo, hi, part["status"]], schema=FETCH_COVERAGE_SCHEMA
         )

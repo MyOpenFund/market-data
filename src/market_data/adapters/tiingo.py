@@ -363,6 +363,8 @@ def _check_limit(name: str, value: int, ceiling: int) -> None:
 
 class TiingoAdapter:
     source_code = SOURCE_CODE
+    # a live provider: one empty answer past a window is no delisting (fetch_coverage rule 6)
+    corroborates_delisting = False
     # build.build_actions reads the actions from the archived fetches of this kind
     actions_fetch_kind = ACTIONS_FETCH_KIND
 
