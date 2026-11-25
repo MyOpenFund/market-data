@@ -15,19 +15,24 @@ Format (a directory)
     optional ``fields``, ``notes``. Then ``securities`` (required), ``prices_daily``,
     ``index_snapshots`` (at least one of them), ``corporate_actions`` and
     ``total_return_index`` (optional), each as Parquet (preferred) or CSV (UTF-8, comma,
-    header), possibly split into parts (``prices_daily_part001.parquet``, any
-    ``<name>*.parquet|csv``, read in natural file-name order: part2 before part10; one format per
-    table). Columns in ``FILE_COLUMNS``; dates ``YYYY-MM-DD``; ``.`` decimal; empty = unknown.
+    header), possibly split into parts: ``<name>.<ext>`` or ``<name>_part<digits>.<ext>``
+    (``prices_daily_part001.parquet``), read in natural file-name order (part2 before part10);
+    one format per table. Any other file is listed in ``report.ignored.files``.
+    Columns in ``FILE_COLUMNS``; dates ``YYYY-MM-DD``; ``.`` decimal; empty = unknown (also an
+    empty string in a Parquet column of any type). A Parquet ``member_id`` dictionary may hold
+    entries no row uses (e.g. unused pandas categories); they are ignored.
 
 Strict input (``validate()`` lists every problem; each table method raises ``HistoryFileError``
 while there is one). Refused:
     - a tab- or semicolon-separated file, an unnamed row-number column, a header ending with a
-      trailing comma (re-export as comma CSV or Parquet); a malformed CSV line (field count);
-      invalid UTF-8;
+      trailing comma, duplicated column names (named by position), a first line holding none of
+      the required columns ("no header line?": nothing of it is recorded), a header or
+      manifest field too long to parse (re-export as comma CSV or Parquet); a malformed CSV line
+      (field count); invalid UTF-8; a blank (whitespace-only) member id;
     - "unknown" placeholders, compared after trim + casefold: in numeric and date columns
       ``NUMERIC_SENTINELS`` (``-``, ``n/a``, ``na``, ``#n/a``); in text columns
-      ``TEXT_SENTINELS`` (``-``, ``--``, ``n/a``, ``null``, ``nan``) or any ``#n/a...`` prefix,
-      but not ``na`` (Amsterdam's exchange code, Namibia);
+      ``TEXT_SENTINELS`` (``-``, ``--``, ``n/a``, ``null``) or any ``#n/a...`` prefix, but
+      not ``na`` (Amsterdam's exchange code, Namibia) nor ``nan`` (a ticker);
     - NaN or infinite numbers; a fractional volume; a timezone-aware or non-midnight timestamp as
       a date; an ISIN not matching ``^[A-Z]{2}[A-Z0-9]{9}[0-9]$`` with a valid check digit; a
       FIGI (``figi``, ``composite_figi``, ``share_class_figi``) not matching
@@ -152,9 +157,9 @@ DEFAULT_EXCHANGE_MICS: Mapping[str, str] = MappingProxyType(
 )
 # Cell values that mean "unknown" in some exports; the format says empty, so they are refused
 # (compared after trim + casefold). In text columns "na" is a real value (Amsterdam's exchange
-# code, Namibia's country code), so it is not a text sentinel.
+# code, Namibia's country code) and so is "nan" (a ticker): neither is a text sentinel.
 NUMERIC_SENTINELS = ("-", "n/a", "na", "#n/a")
-TEXT_SENTINELS = ("-", "--", "n/a", "null", "nan")
+TEXT_SENTINELS = ("-", "--", "n/a", "null")
 TEXT_SENTINEL_PREFIX = "#n/a"
 # Tripwire: price (or vendor TR) rows dropped as non-session above this share of the loaded rows
 # refuse the load (dates that are not exchange-local trading dates).
@@ -177,8 +182,8 @@ _MANIFEST_REQUIRED = (
 )
 _MANIFEST_OPTIONAL = ("fields", "notes")
 _DIVIDENDS = ("gross", "net")
-_ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
-_FIGI = re.compile(r"^BBG[0-9A-Z]{9}$")
+_ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")  # always fullmatch
+_FIGI = re.compile(r"BBG[0-9A-Z]{9}")
 _ROW_NUMBER = re.compile(r"^(|Unnamed: ?\d+|__index_level_\d+__)$")
 _EOD = timedelta(days=1) - timedelta(microseconds=1)
 _TS = pa.timestamp("us", tz="UTC")
@@ -458,11 +463,12 @@ def _first_bad_utf8(col: pa.ChunkedArray) -> int | None:
     return None
 
 
+_MEMBER_COLUMNS = ("member_id", "spinoff_member_id")
 _TYPE_NAMES = {_D: "a date (YYYY-MM-DD)", _F: "a number", _I: "a whole number", _S: "text"}
 
 
 def _isin_ok(v: str) -> bool:
-    if not _ISIN.match(v):
+    if not _ISIN.fullmatch(v):
         return False
     digits = "".join(str(int(ch, 36)) for ch in v)
     total = 0
@@ -473,7 +479,7 @@ def _isin_ok(v: str) -> bool:
 
 
 def _figi_ok(v: str) -> bool:
-    return bool(_FIGI.match(v))
+    return bool(_FIGI.fullmatch(v))
 
 
 _FORMATS: Mapping[str, tuple[Callable[[str], bool], str]] = {
@@ -506,15 +512,15 @@ def _header_problems(fname: str, names: list[str], spec: _Spec) -> list[str]:
             "without it"
         )
         names = names[:-1]
-    numbered = [n for n in names if _ROW_NUMBER.match(n.strip())]
+    numbered = [i + 1 for i, n in enumerate(names) if _ROW_NUMBER.match(n.strip())]
     if numbered:
         out.append(
-            f"{fname}: unnamed row-number column {numbered[0]!r}: re-export as comma-separated "
-            "CSV or Parquet without the row number"
+            f"{fname}: unnamed row-number column at position {numbered[0]}: re-export as "
+            "comma-separated CSV or Parquet without the row number"
         )
-    dup = sorted({n for n in names if names.count(n) > 1})
+    dup = [i + 1 for i, n in enumerate(names) if names.index(n) != i]
     if dup:
-        out.append(f"{fname}: duplicated columns {dup}")
+        out.append(f"{fname}: duplicated column name(s) at position(s) {dup}")
     missing = [c for c in spec.required if c not in names]
     if missing:
         out.append(f"{fname}: missing required columns {missing}")
@@ -527,7 +533,13 @@ def _csv_header(path: Path) -> tuple[list[str], list[str]]:
         line = fh.readline().decode("utf-8-sig", errors="replace").rstrip("\r\n")
     if not line:
         return [], [f"{path.name}: empty file (a header line is required)"]
-    names = next(csv.reader(io.StringIO(line)))
+    try:
+        names = next(csv.reader(io.StringIO(line)))
+    except csv.Error:
+        return [], [
+            f"{path.name}: the first line cannot be parsed as a CSV header (a field too long, "
+            "or broken quoting)"
+        ]
     if "\t" in line:
         numbered = bool(_ROW_NUMBER.match(line.split("\t")[0].strip()))
         return [], [
@@ -544,12 +556,21 @@ def _csv_header(path: Path) -> tuple[list[str], list[str]]:
     return names, []
 
 
-def _known_columns(fname: str, names: list[str], spec: _Spec, ignored: Ignored) -> list[str]:
-    """The spec columns among ``names``; the others are listed in ``ignored`` and not read."""
+def _columns(
+    fname: str, names: list[str], spec: _Spec, ignored: Ignored
+) -> tuple[list[str], list[str]]:
+    """(spec columns among ``names``, problems). Other names are listed in ``ignored`` and not
+    read, but only once the line is known to be a header: with none of the required columns
+    it is probably a data row, and nothing of it is recorded or echoed."""
+    if not any(c in names for c in spec.required):
+        return [], [
+            f"{fname}: no header line? none of the required columns {list(spec.required)} is in "
+            "the first line"
+        ]
     unknown = [n for n in names if n not in spec.columns and n != ""]
     if unknown:
         ignored.columns[fname] = unknown
-    return [n for n in names if n in spec.columns]
+    return [n for n in names if n in spec.columns], _header_problems(fname, names, spec)
 
 
 def _diagnose_csv(path: Path, names: list[str], spec: _Spec) -> list[str]:
@@ -613,11 +634,9 @@ def _read_csv(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | Non
     names, problems = _csv_header(path)
     if problems:
         return None, problems
-    known = _known_columns(path.name, names, spec, ignored)
-    problems = _header_problems(path.name, names, spec)
+    names, problems = _columns(path.name, names, spec, ignored)
     if problems:
         return None, problems
-    names = known
     read_types = {}
     for n in names:
         t = spec.columns[n]
@@ -676,6 +695,8 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
     for name in table.column_names:
         target, col = spec.columns[name], table[name]
         try:
+            if target != _S and _is_text(col.type):
+                col = _empty_to_null(col)  # empty = unknown, whatever the column's type
             if target == _D:
                 col = _to_date(col)
             elif target == _S:
@@ -694,6 +715,13 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
                 + (f" ({reason})" if reason else "")
             )
             continue
+        if name in _MEMBER_COLUMNS:
+            blank = _text_map(col, lambda a: pc.equal(pc.utf8_trim_whitespace(a), ""), pa.bool_())
+            row = _first(blank)
+            if row is not None:
+                problems.append(
+                    f"{fname}: column {name!r} is blank (whitespace only) at {_where(fname, row)}"
+                )
         if pa.types.is_floating(col.type):
             row = _first(pc.invert(pc.is_finite(col)))
             if row is not None:
@@ -723,9 +751,7 @@ def _read_parquet(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table |
         schema = pq.read_schema(path)
     except (pa.ArrowInvalid, OSError):
         return None, [f"{path.name}: cannot be read as Parquet (not Parquet, or corrupted)"]
-    names = schema.names
-    known = _known_columns(path.name, names, spec, ignored)
-    problems = _header_problems(path.name, names, spec)
+    known, problems = _columns(path.name, schema.names, spec, ignored)
     if problems:
         return None, problems
     dictionary = [c for c in spec.dictionary if c in known and _is_text(schema.field(c).type)]
@@ -748,7 +774,12 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
             if not isinstance(raw, dict):
                 return None, [f"{path.name}: must be a JSON object"]
         else:
-            rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+            try:
+                rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+            except csv.Error:
+                return None, [
+                    f"{path.name}: cannot be parsed as CSV (a field too long, or broken quoting)"
+                ]
             if not rows or [c.strip() for c in rows[0]] != ["key", "value"]:
                 return None, [f"{path.name}: header must be 'key,value'"]
             raw = {}
@@ -826,7 +857,8 @@ def _discover(directory: Path, ignored: Ignored) -> tuple[dict[str, list[Path]],
     )
     claimed: set[Path] = set()
     for name in _SPECS:
-        parts = [p for p in data if p.stem.startswith(name)]
+        pattern = re.compile(rf"{re.escape(name)}(_part\d+)?\.(csv|parquet)")
+        parts = [p for p in data if pattern.fullmatch(p.name)]
         claimed.update(parts)
         if {p.suffix for p in parts} == {".csv", ".parquet"}:
             problems.append(f"{name}: both CSV and Parquet files; keep one format per table")
@@ -935,6 +967,9 @@ class _Member:
     token: str
     exchange_code: str
     mic: str | None
+
+
+_UNUSED = _Member(token="", exchange_code=NO_EXCHANGE_CODE, mic=None)
 
 
 class FileHistory:
@@ -1088,7 +1123,9 @@ class FileHistory:
 
     def _members_of(self, col: pa.ChunkedArray) -> tuple[pa.ChunkedArray, list[_Member]]:
         idx, ids = _member_index(col)
-        return idx, [self._members[m] for m in ids]
+        # validation guarantees every row's member is in securities; a dictionary entry that no
+        # row uses (e.g. an unused pandas category) may not be, and is never referenced
+        return idx, [self._members.get(m, _UNUSED) for m in ids]
 
     def _unmapped(
         self, table: str, idx: pa.ChunkedArray, members: list[_Member]

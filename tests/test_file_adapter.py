@@ -736,7 +736,7 @@ def test_rebuild_is_identical(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "sentinel", ["-", "--", " n/a ", "NULL", "NaN", "#N/A", "#N/A Field Not Applicable"]
+    "sentinel", ["-", "--", " n/a ", "NULL", "#N/A", "#N/A Field Not Applicable"]
 )
 def test_text_sentinels_rejected(tmp_path, sentinel):
     path = csv_export(tmp_path)
@@ -943,3 +943,133 @@ def test_build_all(tmp_path):
     assert result.report.fetch_log["members"] == 6
     with pytest.raises(ValueError, match="export_time"):
         fh.build_all(EXPORT - timedelta(seconds=1))
+
+
+# --- review round 2 ------------------------------------------------------------------------------
+
+
+def test_unused_dictionary_entry_tolerated(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pq.read_table(path / "prices_daily.parquet")
+    ids = table["member_id"].to_pylist()
+    values = sorted(set(ids)) + ["GHOST UN Equity"]  # a category no row uses, not in securities
+    member = pa.DictionaryArray.from_arrays(
+        pa.array([values.index(m) for m in ids], pa.int32()), pa.array(values)
+    )
+    pq.write_table(table.set_column(0, "member_id", member), path / "prices_daily.parquet")
+    fh = history(path)
+    assert fh.validate() == []
+    baseline = history(csv_export(tmp_path))
+    assert fh.prices().equals(baseline.prices())
+    result = fh.build_all(LOAD)
+    assert result.fetch_log.equals(baseline.fetch_log(LOAD))
+    assert "" not in set(result.prices["source_symbol"].to_pylist())
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "column"),
+    [
+        ("XS0000000AA7", '"XS0000000AA7\n"', "isin"),
+        ("BBG000FAKE01", '"BBG000FAKE01\n"', "figi"),
+    ],
+)
+def test_identifier_with_trailing_newline_refused(tmp_path, old, new, column):
+    path = csv_export(tmp_path)
+    edit_csv(path, "securities.csv", old, new)
+    problems = problems_of(history(path))
+    assert f"securities.csv: column {column!r} holds an invalid" in problems
+
+
+def test_overlong_header_field_and_manifest_field(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(path, "total_return_index.csv", '"' + "x" * 200_000 + "\nAAA,2020-01-31,1\n")
+    manifest = json.loads((path / "manifest.json").read_text())
+    (path / "manifest.json").unlink()
+    lines = ["key,value"] + [f'{k},"{v}"' for k, v in manifest.items()]
+    lines.append('notes2,"' + "y" * 200_000)
+    rewrite(path, "manifest.csv", "\n".join(lines) + "\n")
+    problems = problems_of(history(path))
+    assert "total_return_index.csv: the first line cannot be parsed as a CSV header" in problems
+    assert "manifest.csv: cannot be parsed as CSV" in problems
+    assert "xxxx" not in problems and "yyyy" not in problems
+
+
+def test_file_without_header_echoes_nothing(tmp_path):
+    path = csv_export(tmp_path)
+    lines = (path / "index_snapshots.csv").read_text().splitlines()
+    rewrite(path, "index_snapshots.csv", "\n".join(lines[1:]) + "\n")
+    fh = history(path)
+    problems = problems_of(fh)
+    assert "index_snapshots.csv: no header line?" in problems
+    assert "AAA" not in problems and "IDX1" not in problems
+    assert fh.report.ignored.columns == {}
+
+
+def test_duplicated_columns_named_by_position(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(
+        path,
+        "total_return_index.csv",
+        "member_id,date,tr_index,date\nAAA UN Equity,2020-01-31,1,2020-01-31\n",
+    )
+    problems = problems_of(history(path))
+    assert "total_return_index.csv: duplicated column name(s) at position(s) [4]" in problems
+
+
+def test_nan_is_a_value_in_text_columns(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "securities.csv", "active,,,FFF", "active,,,NAN")
+    fh = history(path)
+    assert fh.validate() == []
+    tickers = fh.observations(LOAD).filter(pc.equal(fh.observations(LOAD)["id_scheme"], "ticker"))
+    assert "NAN" in tickers["id_value"].to_pylist()
+
+
+def test_parquet_empty_string_in_numeric_column_is_null(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pq.read_table(path / "index_snapshots.parquet")
+    weights = ["" if w is None else str(w) for w in table["weight"].to_pylist()]
+    i = table.schema.get_field_index("weight")
+    pq.write_table(
+        table.set_column(i, "weight", pa.array(weights)), path / "index_snapshots.parquet"
+    )
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.snapshots().equals(history(csv_export(tmp_path)).snapshots())
+
+
+def test_blank_member_id_refused(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "prices_daily.csv", "BBB UW Equity,2020-01-31", "   ,2020-01-31")
+    problems = problems_of(history(path))
+    assert (
+        "prices_daily.csv: column 'member_id' is blank (whitespace only) at data row 10" in problems
+    )
+
+
+def test_discovery_matches_name_or_parts_only(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(path, "securities_notes.csv", "a,b\n1,2\n")
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.report.ignored.files == ["securities_notes.csv"]
+
+
+def test_tripwire_default_refuses(tmp_path):
+    fh = FileHistory(csv_export(tmp_path), salt=SALT)  # constructor default 0.005
+    assert fh.max_non_session_share == MAX_NON_SESSION_SHARE == 0.005
+    with pytest.raises(HistoryFileError, match="max_non_session_share 0.50%"):
+        fh.prices()
+
+
+def test_malformed_line_missing_field(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(
+        path,
+        "prices_daily.csv",
+        "BBB UW Equity,2020-01-31,2.9,60000,USD,,,",
+        "BBB UW Equity,2020-01-31,2.9,60000,USD,,",
+    )
+    problems = problems_of(history(path))
+    assert "prices_daily.csv: malformed line 11: 7 field(s) where the header has 8" in problems
+    assert "BBB" not in problems
