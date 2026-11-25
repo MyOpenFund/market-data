@@ -10,12 +10,16 @@ State directory: ``MOF_MARKET_STATE_DIR`` when set (``off`` disables persistence
 platform user cache directory + ``myopenfund/market-data`` (``~/Library/Caches`` on macOS,
 ``%LOCALAPPDATA%`` on Windows, ``$XDG_CACHE_HOME`` or ``~/.cache`` elsewhere).
 
-Best effort, never blocking: a missing, unreadable or corrupt file (not JSON, wrong shape, wrong
-version) is ignored without a warning and the state starts empty from it (the next save rewrites
-it); a failed write (read-only cache) is ignored too, the in-memory state still bounds this
-process. Writes are atomic (temp file in the same directory, then ``os.replace``) and the state is
-re-read and merged before each request, so runs one after the other share it; two processes
-running at the same moment can still race (no lock), as documented by the adapters.
+Best effort, never blocking: a missing, unreadable or corrupt file (larger than
+``MAX_STATE_BYTES`` = 1 MB, not UTF-8 JSON, nested too deep, numbers out of range, wrong shape,
+wrong version) is ignored without a warning and the state starts empty from it (the next save
+rewrites it); a failed write (read-only cache) is ignored too, the in-memory state still bounds this
+process. Clock jumps never hang a run: request times more than ``FUTURE_TOLERANCE_S`` (60 s)
+after now (a clock set back, a hand-edited file) are dropped, and the times left are counted as
+no later than now, so a wait is never longer than the rolling window itself. Writes are
+atomic (temp file in the same directory, then ``os.replace``) and the state is re-read and
+merged before each request, so runs one after the other share it; two processes running at
+the same moment can still race (no lock), as documented by the adapters.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import math
 import os
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -35,6 +40,8 @@ STATE_DIR_ENV = "MOF_MARKET_STATE_DIR"
 STATE_OFF = "off"
 STATE_VERSION = 1
 WINDOW_S = 86400.0  # request times older than this are dropped
+FUTURE_TOLERANCE_S = 60.0  # request times further ahead of now are dropped (clock jumps)
+MAX_STATE_BYTES = 1_000_000  # a larger state file is corrupt: ignored, never parsed
 
 
 def default_state_dir(env: Mapping[str, str] | None = None) -> Path | None:
@@ -71,15 +78,19 @@ class QuotaState:
         stored = self._load()
         if stored is not None:
             times, stored_month, symbols = stored
-            self.requests = sorted({*self.requests, *times})
+            # multiset union (max count per time): a request held both in memory and in the
+            # file counts once, two requests at one instant stay two
+            merged = Counter(self.requests) | Counter(times)
+            self.requests = sorted(merged.elements())
             if stored_month == month:
                 self.symbols |= symbols
-        horizon = now_s - WINDOW_S
-        self.requests = [t for t in self.requests if t > horizon]
+        horizon, ahead = now_s - WINDOW_S, now_s + FUTURE_TOLERANCE_S
+        self.requests = [t for t in self.requests if horizon < t <= ahead]
 
-    def since(self, after_s: float) -> list[float]:
-        """Request times strictly after ``after_s``, oldest first."""
-        return [t for t in self.requests if t > after_s]
+    def since(self, after_s: float, now_s: float) -> list[float]:
+        """Request times strictly after ``after_s``, oldest first, each counted as no later
+        than ``now_s`` (a time slightly ahead never lengthens a wait)."""
+        return [min(t, now_s) for t in self.requests if t > after_s]
 
     def record(self, at_s: float, symbol: str, month: str) -> None:
         self.refresh(at_s, month)
@@ -92,22 +103,13 @@ class QuotaState:
         if self.path is None:
             return None
         try:
-            body: Any = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):  # missing, unreadable, not UTF-8 or not JSON
+            if self.path.stat().st_size > MAX_STATE_BYTES:
+                return None
+            body: Any = json.loads(self.path.read_bytes()[: MAX_STATE_BYTES + 1].decode())
+            return _parse_state(body)
+        # missing, unreadable, not UTF-8 or JSON, nested too deep, a number out of range
+        except (OSError, ValueError, OverflowError, RecursionError, TypeError):
             return None
-        if not isinstance(body, dict) or body.get("version") != STATE_VERSION:
-            return None
-        times, month, symbols = body.get("requests"), body.get("month"), body.get("symbols")
-        if not isinstance(times, list) or not isinstance(month, str):
-            return None
-        if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
-            return None
-        if not all(
-            isinstance(t, int | float) and not isinstance(t, bool) and math.isfinite(t)
-            for t in times
-        ):
-            return None
-        return [float(t) for t in times], month, set(symbols)
 
     def _save(self) -> None:
         if self.path is None:
@@ -137,3 +139,22 @@ class QuotaState:
         finally:
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
+
+
+def _parse_state(body: Any) -> tuple[list[float], str, set[str]] | None:
+    if not isinstance(body, dict) or body.get("version") != STATE_VERSION:
+        return None
+    times, month, symbols = body.get("requests"), body.get("month"), body.get("symbols")
+    if not isinstance(times, list) or not isinstance(month, str):
+        return None
+    if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        return None
+    out = []
+    for t in times:
+        if isinstance(t, bool) or not isinstance(t, int | float):
+            return None
+        value = float(t)  # OverflowError for an integer beyond the float range
+        if not math.isfinite(value):
+            return None
+        out.append(value)
+    return out, month, set(symbols)

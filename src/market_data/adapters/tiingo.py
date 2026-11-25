@@ -53,25 +53,25 @@ Key and limits (spec §8.3: respected, never worked around)
     ``unique_symbols_per_month`` (``FREE_PLAN_UNIQUE_SYMBOLS_PER_MONTH`` = 500) distinct symbols
     in the current UTC month. The budget is kept across runs in a small JSON file
     (``market_data.adapters._quota``): ``state_dir`` (default: ``MOF_MARKET_STATE_DIR``, else the
-    platform user cache directory + ``myopenfund/market-data``; None or ``"off"`` disables it)
-    holds ``tiingo-quota.json``, the request times of the last 24 hours and the month's symbols
-    only (never the key), written atomically and re-read before each request. A corrupt or
-    unreadable file is ignored without a warning (the budget starts empty from it and the next
-    request rewrites it); a failed write is ignored (best effort). The state is per user cache,
-    not per key, and two processes running at the same moment can race (no lock): Tiingo's own
-    limits then answer 429. Times come from ``clock`` (the wall clock by default, so they
-    survive a restart). A fetch that would exceed the daily or symbol cap is refused before any
-    request (``TiingoQuotaError``); a cap reached during a fetch (retries) stops it before the
-    next request, without waiting (an ``error`` FetchResult, then ``TiingoQuotaError``). The
-    adapter is **silent while it waits** (the hourly budget can hold a request for up to an
-    hour): progress is the caller's job (B9). A 429, a 5xx or a transport error is retried: wait
-    ``Retry-After`` seconds when sent, else ``backoff_s * 2**n`` (n = retries so far); after
-    ``max_retries`` retries, or when a wait would exceed ``max_wait_s``, ``TiingoError`` (no
-    retry storm; after a 429 it says the free hourly allocation is probably spent and to retry
-    in about an hour). Any other non-200 answer (redirects included, never followed) is a
-    ``TiingoError`` naming the HTTP status. Clock, sleep, wall time (``now``), the state
-    directory and the HTTP transport are injectable. The adapter holds an HTTP client:
-    ``close()`` it, or use it as a context manager.
+    platform user cache directory + ``myopenfund/market-data``; None or ``"off"`` disables it) holds
+    ``tiingo-quota.json``, the request times of the last 24 hours and the month's symbols only
+    (never the key), written atomically and re-read before each request; times more than 60 s ahead
+    of now (clock jumps) are dropped, so a wait never exceeds the rolling window. A corrupt or
+    unreadable file (or one over 1 MB) is ignored without a warning (the budget starts empty from it
+    and the next request rewrites it); a failed write is ignored (best effort). The state is per
+    user cache, not per key, and two processes running at the same moment can race (no lock):
+    Tiingo's own limits then answer 429. Times come from ``clock`` (the wall clock by default, so
+    they survive a restart). A fetch that would exceed the daily or symbol cap is refused before any
+    request (``TiingoQuotaError``); a cap reached during a fetch (retries) stops it before the next
+    request, without waiting (an ``error`` FetchResult, then ``TiingoQuotaError``). The adapter is
+    **silent while it waits** (the hourly budget can hold a request for up to an hour): progress is
+    the caller's job (B9). A 429, a 5xx or a transport error is retried: wait ``Retry-After``
+    seconds when sent, else ``backoff_s * 2**n`` (n = retries so far); after ``max_retries``
+    retries, or when a wait would exceed ``max_wait_s``, ``TiingoError`` (no retry storm; after a
+    429 it says the free hourly allocation is probably spent and to retry in about an hour). Any
+    other non-200 answer (redirects included, never followed) is a ``TiingoError`` naming the HTTP
+    status. Clock, sleep, wall time (``now``), the state directory and the HTTP transport are
+    injectable. The adapter holds an HTTP client: ``close()`` it, or use it as a context manager.
 
 Parse (``parse`` / ``parse_report`` / ``parse_actions`` / ``parse_vendor_adjusted``)
     source_symbol = the fetch's symbol; valid_date = the calendar date part of ``date``
@@ -577,7 +577,8 @@ class TiingoAdapter:
 
     def _sent_today(self) -> int:
         """Requests of the last 24 hours (this run and earlier ones sharing the state)."""
-        return len(self._quota.since(self._clock() - _DAY_S))
+        now = self._clock()
+        return len(self._quota.since(now - _DAY_S, now))
 
     def _check_caps(self, symbol: str) -> None:
         self._refresh_quota()
@@ -597,7 +598,7 @@ class TiingoAdapter:
         request (silently: the caller shows progress)."""
         now = self._clock()
         ready = now if self._next is None else max(now, self._next)
-        recent = self._quota.since(now - _HOUR_S)
+        recent = self._quota.since(now - _HOUR_S, now)  # times ahead count as now
         if recent:
             ready = max(ready, recent[-1] + self.min_spacing_s)
         if len(recent) >= self.per_hour:

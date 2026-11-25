@@ -8,7 +8,13 @@ import httpx
 import pyarrow as pa
 import pytest
 
-from market_data.adapters._quota import QuotaState, default_state_dir
+from market_data.adapters import tiingo as tiingo_module
+from market_data.adapters._quota import (
+    FUTURE_TOLERANCE_S,
+    MAX_STATE_BYTES,
+    QuotaState,
+    default_state_dir,
+)
 from market_data.adapters.base import (
     RAW_ACTION_SCHEMA,
     RAW_PRICE_SCHEMA,
@@ -923,7 +929,11 @@ def test_state_file_never_holds_the_key(tmp_path):
         b'{"version": 1, "requests": [1e400], "month": "2026-12", "symbols": []}',
         b'{"version": 1, "requests": [], "month": 5, "symbols": []}',
         b'{"version": 1, "requests": [], "month": "2026-12", "symbols": [1]}',
+        b'{"version": 1, "requests": [1' + b"0" * 400 + b'], "month": "2026-12", "symbols": []}',
+        b"[" * 100_000 + b"]" * 100_000,  # RecursionError in json.loads
+        b'{"version": 1, "requests": [], "month": "2026-12", "symbols": []}' + b" " * 1_000_000,
     ],
+    ids=lambda c: f"{len(c)}-bytes",
 )
 def test_corrupt_state_file_is_ignored_without_warning(tmp_path, content):
     state = tmp_path / "state"
@@ -1000,13 +1010,33 @@ def test_key_not_kept_in_a_headers_dict():
     assert a._http.headers.get("authorization") is None
     leaks: list[str] = []
 
+    def holds_key(value, depth=0) -> bool:
+        """The key in a string, bytes, or the keys/values of headers, mappings, sequences and
+        requests (header values, not their repr)."""
+        if depth > 6:
+            return False
+        if isinstance(value, str | bytes):
+            return (FAKE_KEY if isinstance(value, str) else FAKE_KEY.encode()) in value
+        if isinstance(value, httpx.Request):
+            return holds_key(value.headers, depth + 1)
+        if isinstance(value, httpx.Headers):
+            return any(holds_key(v, depth + 1) for _, v in value.raw)
+        if isinstance(value, dict):
+            return any(holds_key(k, depth + 1) or holds_key(v, depth + 1) for k, v in value.items())
+        if isinstance(value, list | tuple | set | frozenset):
+            return any(holds_key(v, depth + 1) for v in value)
+        return False
+
+    assert holds_key(httpx.Headers({"Authorization": f"Token {FAKE_KEY}"}))  # the probe works
+    assert holds_key({"h": {"Authorization": f"Token {FAKE_KEY}"}})
+
     def inspect_frames(request):
         assert request.headers["authorization"] == f"Token {FAKE_KEY}"
         frame = sys._getframe()
         while frame is not None:
-            if frame.f_code.co_filename.endswith("tiingo.py"):  # the adapter's own frames
+            if frame.f_code.co_filename == tiingo_module.__file__:  # the adapter's frames
                 for name, value in frame.f_locals.items():
-                    if FAKE_KEY in repr(value):
+                    if holds_key(value) or FAKE_KEY in repr(value):
                         leaks.append(f"{frame.f_code.co_name}.{name}")
             frame = frame.f_back
         return httpx.Response(200, json=[])
@@ -1014,3 +1044,52 @@ def test_key_not_kept_in_a_headers_dict():
     list(make(Recorder(answer=inspect_frames)).fetch("prices", ["AAA"], DAY, DAY))
     assert leaks == []
     assert QuotaState("tiingo", None).path is None
+
+
+@pytest.mark.parametrize("ahead", [3600.0, 1e12, FUTURE_TOLERANCE_S + 1])
+def test_future_times_in_the_state_never_hang_a_run(tmp_path, ahead):
+    state, clk = tmp_path / "state", FakeClock()
+    state.mkdir()
+    times = [clk.now + ahead] * 60  # a clock set back, or a hand-edited file
+    body = {"version": 1, "requests": times, "month": "2026-12", "symbols": []}
+    (state / "tiingo-quota.json").write_text(json.dumps(body))
+    out = list(make(always([]), clk, state_dir=state).fetch("prices", ["AAA", "BBB"], DAY, DAY))
+    assert len(out) == 2 and clk.sleeps == [1.5]
+    kept = json.loads((state / "tiingo-quota.json").read_text())["requests"]
+    assert kept == [1000.0, 1001.5]  # the future times are dropped from the file
+
+
+def test_times_slightly_ahead_count_as_now(tmp_path):
+    state, clk = tmp_path / "state", FakeClock()
+    state.mkdir()
+    times = [clk.now + 30.0] * 2  # within the tolerance: kept, but never lengthen a wait
+    body = {"version": 1, "requests": times, "month": "2026-12", "symbols": []}
+    (state / "tiingo-quota.json").write_text(json.dumps(body))
+    list(make(always([]), clk, state_dir=state, per_hour=2).fetch("prices", ["AAA"], DAY, DAY))
+    assert clk.sleeps == [3600.0]  # the rolling window itself, never more
+    assert max(clk.sleeps) <= 3600 + FUTURE_TOLERANCE_S
+
+
+def test_oversized_state_file_is_not_parsed(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "tiingo-quota.json").write_bytes(b" " * (MAX_STATE_BYTES + 1))
+
+    def never(*a, **kw):
+        raise AssertionError("an oversized state file was parsed")
+
+    monkeypatch.setattr("market_data.adapters._quota.json.loads", never)
+    quota = QuotaState("tiingo", state)
+    quota.refresh(1000.0, "2026-12")
+    assert quota.requests == [] and MAX_STATE_BYTES == 1_000_000
+
+
+def test_simultaneous_requests_stay_two_in_the_state(tmp_path):
+    quota = QuotaState("tiingo", tmp_path / "state")
+    quota.record(1000.0, "AAA", "2026-12")
+    quota.record(1000.0, "BBB", "2026-12")
+    again = QuotaState("tiingo", tmp_path / "state")
+    again.refresh(1000.0, "2026-12")
+    assert again.requests == [1000.0, 1000.0]
+    again.refresh(1000.0, "2026-12")  # re-reading never double counts
+    assert again.requests == [1000.0, 1000.0]
