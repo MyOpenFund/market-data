@@ -1054,3 +1054,126 @@ def test_one_composite_twice_on_a_symbol_keeps_the_gap():
         resolve(m, "massive:ABC", d) for d in (date(2008, 1, 2), date(2012, 1, 3), date(2020, 1, 2))
     ] == [x, y, x]
     assert result.unresolved.num_rows == 0 and result.ambiguous.num_rows == 0
+
+
+# --- fix round 3: present-time answers never rewrite published windows -------------------------
+
+
+def recycled_published():
+    obs = observations(
+        ob("massive", "ABC", "composite_figi", CX, date(2005, 1, 3), date(2010, 1, 4)),
+        ob("massive", "ABC", "composite_figi", CY, date(2012, 1, 3)),
+    )
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    return build(obs, spans=sp), sp
+
+
+def test_present_time_answer_never_splices_published_windows():
+    first, sp = recycled_published()
+    x, y = instrument_of(first.identifiers, CX), instrument_of(first.identifiers, CY)
+    # K1: a third composite with two published windows: reported, nothing changes, no crash
+    figi = figi_results([("massive", "ABC")], [{"data": [{"figi": CV, "compositeFIGI": CV}]}])
+    second = build(None, figi, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert report(second.ambiguous)[("massive", "ABC")]["reason"] == "openfigi_changed"
+    assert second.minted == () and not mapping_rows(second, "massive:ABC")
+    # K2: an answer naming the newest published instrument never re-dates it from 2005
+    figi = figi_results([("massive", "ABC")], [{"data": [{"figi": CY, "compositeFIGI": CY}]}])
+    longer = spans(("massive", "ABC", date(2005, 1, 3), END + timedelta(days=10)))
+    second = build(None, figi, spans=longer, existing=first.identifiers, load_time=LATER)
+    rows = mapping_rows(second, "massive:ABC")
+    assert [(r["instrument_id"], r["valid_date"], r["valid_to"]) for r in rows] == [
+        (y, date(2012, 1, 3), END + timedelta(days=11))  # only the end grows
+    ]
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert [resolve(m, "massive:ABC", d) for d in (date(2008, 1, 2), date(2011, 1, 3))] == [x, None]
+    # an answer naming the older published instrument: reported, nothing changes
+    figi = figi_results([("massive", "ABC")], [{"data": [{"figi": CX, "compositeFIGI": CX}]}])
+    second = build(None, figi, spans=sp, existing=first.identifiers, load_time=LATER)
+    assert report(second.ambiguous)[("massive", "ABC")]["reason"] == "openfigi_changed"
+    assert not mapping_rows(second, "massive:ABC")
+
+
+def test_stale_answer_never_withdraws_a_published_mapping():
+    sp = spans(("tiingo", "DEAD", date(2005, 1, 3), END))
+    figi = openfigi_one([("tiingo", "DEAD")])
+    first = build(None, figi, spans=sp)
+    later = LOAD + timedelta(days=60)  # 31+ days after the span end
+    second = build(None, figi, spans=sp, existing=first.identifiers, load_time=later)
+    assert report(second.ambiguous)[("tiingo", "DEAD")]["reason"] == "openfigi_stale"
+    assert not mapping_rows(second, "tiingo:DEAD")  # nothing closed, nothing re-emitted
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "tiingo:DEAD", date(2010, 1, 4)) == instrument_of(first.identifiers, CX)
+    # a newcomer claiming the same composite: the published series stays, the newcomer is out
+    both = openfigi_one([("tiingo", "DEAD"), ("tiingo", "NEW")])
+    sp2 = spans(("tiingo", "DEAD", date(2005, 1, 3), END), ("tiingo", "NEW", date(2012, 1, 3), END))
+    second = build(None, both, spans=sp2, existing=first.identifiers, load_time=LATER)
+    assert {k[1]: r["reason"] for k, r in report(second.ambiguous).items()} == {
+        "DEAD": "openfigi_shared",
+        "NEW": "openfigi_shared",
+    }
+    assert not mapping_rows(second, "tiingo:DEAD") and not mapping_rows(second, "tiingo:NEW")
+
+
+def test_kept_window_reports_the_span_it_does_not_cover():
+    first = build(
+        None,
+        openfigi_one([("tiingo", "LIVE")]),
+        spans=spans(("tiingo", "LIVE", date(2005, 1, 3), END)),
+    )
+    longer = spans(("tiingo", "LIVE", date(2005, 1, 3), END + timedelta(days=20)))
+    second = build(None, None, spans=longer, existing=first.identifiers, load_time=LATER)
+    assert report(second.unresolved)[("tiingo", "LIVE")]["reason"] == "uncovered_span"
+    assert not mapping_rows(second, "tiingo:LIVE")
+
+
+def test_openfigi_rows_of_an_unregistered_source_stay_under_it():
+    sp = spans(("history2", "tok", date(2005, 1, 3), END))
+    result = build(None, openfigi_one([("history2", "tok")]), spans=sp)
+    derived = [r for r in result.identifiers.to_pylist() if r["id_scheme"] != "source_symbol"]
+    assert derived and {r["source_code"] for r in derived} == {"history2"}
+
+
+def test_cik_link_ignores_closed_and_dead_open_series_and_never_doubles():
+    from open_data_store.sources import SourceInfo
+
+    registry = dict(discover_sources())
+    registry["tiingo"] = SourceInfo("tiingo", "x", "", "", "open")
+    private = observations(
+        ob("private_history", "t1", "composite_figi", CX, END),
+        ob("private_history", "t1", "ticker", "LIV", END),
+    )
+    dead = observations(
+        ob("tiingo", "OLD", "composite_figi", CX, date(2005, 1, 3), date(2010, 1, 4))
+    )
+    sp = spans(
+        ("private_history", "t1", date(2005, 1, 3), END),
+        ("tiingo", "OLD", date(2005, 1, 3), date(2010, 1, 3)),
+    )
+    ids = build(pa.concat_tables([private, dead]), spans=sp).identifiers
+    sec = pa.table({"cik": [1], "ticker": ["LIV"]})
+    linked = link_issuers(ids, sec, load_time=LATER, as_of=END, sources=registry)
+    # a dead open-source series never publishes a link found through the private token
+    assert {r["source_code"] for r in rows_of(linked, id_scheme="cik")} == {"private_history"}
+    # the link's source moving between restricted sources never leaves two open CIKs
+    massive = build(
+        observations(ob("massive", "LIV", "composite_figi", CX, date(2005, 1, 3))),
+        spans=spans(("massive", "LIV", date(2005, 1, 3), END)),
+        existing=linked,
+        load_time=LATER + timedelta(days=1),
+    )
+    both = pa.concat_tables([linked, massive.identifiers])
+    again = link_issuers(both, sec, load_time=LATER + timedelta(days=2), as_of=END)
+    assert again.num_rows == both.num_rows  # same CIK: nothing new
+    moved = link_issuers(
+        both,
+        pa.table({"cik": [7], "ticker": ["LIV"]}),
+        load_time=LATER + timedelta(days=2),
+        as_of=END,
+    )
+    now = latest(moved, INSTRUMENT_IDENTIFIERS.natural_key)
+    open_ciks = [
+        r["id_value"]
+        for r in rows_of(now, id_scheme="cik")
+        if r["valid_to"] is None or r["valid_to"] > r["valid_date"]
+    ]
+    assert open_ciks == ["0000000007"]

@@ -30,16 +30,21 @@ Rules
       outside the span are dropped; none left: ``outside_span``. No candidate:
       ``no_composite_figi``.
     - A present-time candidate (a composite known only from OpenFIGI, or the single composite
-      observation of a non-export source with neither ``valid_date`` nor ``valid_to``) is not
-      mapped (``ambiguous``) when it contradicts the series' published open mapping
-      (``openfigi_changed``: the published mapping is kept, a manual row decides), when another
-      series of the same source claims it (``openfigi_shared``; claimants: this run's
-      observations and OpenFIGI answers, the published open mapping rows of ``existing`` and
-      the manual targets), or when the series' span ended more than ``max_openfigi_age_days``
-      (default 30) before the load date (``openfigi_stale``: the symbol may name someone else
-      now).
+      observation of a non-export source with neither ``valid_date`` nor ``valid_to``) never
+      re-dates, closes or replaces a published window. For a series without published
+      windows it is not mapped (``ambiguous``) when another series of the same source claims
+      it (``openfigi_shared``; claimants: this run's observations and OpenFIGI answers, the
+      published open mapping rows of ``existing`` and the manual targets) or when the series'
+      span ended more than ``max_openfigi_age_days`` (default 30) before the load date
+      (``openfigi_stale``: the symbol may name someone else now). For a series with published
+      windows: when it names the instrument of the newest published window and is neither
+      shared nor stale, it may only extend that window's end to this run's span end;
+      otherwise nothing changes and the series is reported (``openfigi_changed`` when it names
+      another instrument, else ``openfigi_shared`` / ``openfigi_stale``). Only a manual row
+      closes a published mapping.
     - A series with published open mapping rows and no span or no candidate this run keeps
-      its published windows as they are (absence of evidence never unmaps nor re-dates).
+      its published windows as they are (absence of evidence never unmaps nor re-dates); the
+      part of this run's span they leave uncovered is reported ``uncovered_span``.
     - Reports carry [source_code, source_symbol, reason, candidates] and never a label; write
       them to private reports only.
     - Mapping rows carry the series' ``source_code`` (``id_value`` =
@@ -64,8 +69,9 @@ Rules
       without a date takes its instrument's window start.
     - OpenFIGI-derived rows (``composite_figi``, ``figi``, ``share_class_figi``, ``ticker``)
       are dated at the load date and open-ended (present-time answers: never a span start or
-      an exit date), under the series' own source when it is restricted (a private token's
-      FIGIs stay ``private_history``), else ``openfigi``. A row already published open (same
+      an exit date), under the series' own source when it is restricted or unregistered (fail
+      closed: a private token's FIGIs stay ``private_history``), else ``openfigi``; they are
+      emitted only for a series whose answer this run applied. A row already published open (same
       instrument, scheme, value, source) is not emitted again.
     - Manual mapping (``load_manual_mapping``; a reviewed private CSV at
       ``MOF_MARKET_MANUAL_MAPPING``) wins for every series it names: that series gets only the
@@ -763,6 +769,7 @@ def build_mapping(
     export_dated_sources: Collection[str] = EXPORT_DATED_SOURCES,
     max_openfigi_age_days: int = MAX_OPENFIGI_AGE_DAYS,
     restricted: frozenset[str] | None = None,
+    registered: frozenset[str] | None = None,
 ) -> MappingResult:
     """``INSTRUMENT_IDENTIFIERS`` rows (identifier observations and ``source_symbol`` mapping
     rows) plus the unresolved and ambiguous series and the labels left out. See the module
@@ -774,13 +781,15 @@ def build_mapping(
     their ``known_at``); ``spans``: ``SPAN_SCHEMA``; ``manual``: ``MANUAL_SCHEMA``
     (``load_manual_mapping``); ``export_dated_sources``: sources whose labels are dated at an
     export (the span rule); ``max_openfigi_age_days``: how long after a series' span ends an
-    OpenFIGI (present-time) answer may still map it; ``restricted``: restricted source codes
-    (default: the registry's)."""
+    OpenFIGI (present-time) answer may still map it; ``restricted`` / ``registered``:
+    restricted and registered source codes (default: the registry's)."""
     load = _check_load_time(load_time)
     if max_openfigi_age_days < 0:
         raise ValueError("max_openfigi_age_days must be >= 0")
     load_date = load.astimezone(UTC).date()
-    restricted = restricted_codes() if restricted is None else frozenset(restricted)
+    registry = discover_sources() if registered is None else None
+    registered = frozenset(registry) if registry is not None else frozenset(registered)
+    restricted = restricted_codes(registry) if restricted is None else frozenset(restricted)
     export_dated = frozenset(export_dated_sources)
     obs = _observation_rows(observations)
     figi = _figi_rows(figi_results)
@@ -849,9 +858,18 @@ def build_mapping(
     kept: set[str] = set()  # id_values whose published windows this run keeps as they are
     mapping: list[dict[str, Any]] = []
 
-    def keep(s: Series, value: str, published: list[_Window]) -> None:
+    applied: dict[Series, _Window] = {}  # present-time answers applied this run, per series
+
+    def keep(s: Series, value: str, published: list[_Window], candidates: int = 0) -> None:
+        """Keep the published windows as they are; report the part of this run's span they
+        leave uncovered."""
         windows_of[s] = published
         kept.add(value)
+        first, last = span_of.get(s, (None, None))
+        if first is not None:
+            items = [(w.start, w.end) for w in published]
+            if _gap(items, first, last + _DAY if last else None):
+                unresolved.append((s, UNRESOLVED_UNCOVERED_SPAN, candidates))
 
     for s in sorted(scope - manual_series):
         value = f"{s[0]}:{s[1]}"
@@ -876,19 +894,49 @@ def build_mapping(
             or (s[0] not in export_dated and next(iter(candidates.values())) == [(None, None)])
         )
         if present_time:
-            # an undated answer describes today: never applied to someone else's series, an
-            # old series, or over a published mapping it contradicts
+            # an undated answer describes today: never applied to someone else's series or an
+            # old series, and never re-dating, closing or replacing a published window
             (c,) = candidates
             last = span_of.get(s, (None, None))[1]
-            if published and ids.by_composite.get(c) not in {w.instrument_id for w in published}:
-                ambiguous.append((s, AMBIGUOUS_OPENFIGI_CHANGED, 1))
-                keep(s, value, published)
-                continue
+            doubt = None
             if claims[(s[0], c)] - {s}:
-                ambiguous.append((s, AMBIGUOUS_OPENFIGI_SHARED, 1))
+                doubt = AMBIGUOUS_OPENFIGI_SHARED
+            elif last is not None and (load_date - last).days > max_openfigi_age_days:
+                doubt = AMBIGUOUS_OPENFIGI_STALE
+            if published:
+                newest = max(published, key=lambda w: w.start)
+                if ids.by_composite.get(c) != newest.instrument_id:
+                    doubt = AMBIGUOUS_OPENFIGI_CHANGED
+                if doubt:
+                    # reported, never withdrawn: only a manual row closes a published mapping
+                    ambiguous.append((s, doubt, 1))
+                    keep(s, value, published, 1)
+                    continue
+                # the answer confirms the newest published window: it may only extend its end
+                end = last + _DAY if last else None
+                grown = newest.end is not None and (end is None or end > newest.end)
+                if grown:
+                    reason = next(
+                        r["link_reason"]
+                        for r in prior
+                        if r["id_scheme"] == SYMBOL_SCHEME
+                        and r["id_value"] == value
+                        and r["source_code"] == s[0]
+                        and r["valid_date"] == newest.start
+                        and r["instrument_id"] == newest.instrument_id
+                    )
+                    mapping.append(
+                        _row(newest.instrument_id, SYMBOL_SCHEME, value, newest.start, end,
+                             s[0], load, reason)
+                    )  # fmt: skip
+                    newest = _Window(newest.instrument_id, newest.start, end, c)
+                else:
+                    newest = _Window(newest.instrument_id, newest.start, newest.end, c)
+                keep(s, value, [w for w in published if w.start != newest.start] + [newest], 1)
+                applied[s] = newest
                 continue
-            if last is not None and (load_date - last).days > max_openfigi_age_days:
-                ambiguous.append((s, AMBIGUOUS_OPENFIGI_STALE, 1))
+            if doubt:
+                ambiguous.append((s, doubt, 1))
                 continue
         status, windows, uncovered = _candidate_windows(
             candidates, span_of.get(s), span_rule=s[0] in export_dated
@@ -905,6 +953,8 @@ def build_mapping(
             inst = ids.for_composite(composite)
             windows_of[s].append(_Window(inst, start, end, composite))
             mapping.append(_row(inst, SYMBOL_SCHEME, value, start, end, s[0], load))
+        if present_time:
+            applied[s] = windows_of[s][0]
 
     # two or more symbols of one source on one instrument in this batch: a venue change (or a
     # rename); a symbol added in a later run alone is not relabelled
@@ -964,14 +1014,12 @@ def build_mapping(
     }
     for r in figi:
         s = (r["source_code"], r["source_symbol"])
-        if s not in via_openfigi or s in manual_series or not windows_of.get(s):
+        w = applied.get(s)
+        if s not in via_openfigi or w is None or r["composite_figi"] != w.composite:
             continue
-        (w,) = windows_of[s]
-        if r["composite_figi"] != w.composite:
-            continue
-        # present-time answers: dated at the load, under the series' source when restricted,
-        # emitted only when not already published open (no new row per run)
-        source = s[0] if s[0] in restricted else OPENFIGI_SOURCE
+        # present-time answers: dated at the load, under the series' source when restricted
+        # or unregistered (fail closed), emitted only when not already published open
+        source = s[0] if s[0] in restricted or s[0] not in registered else OPENFIGI_SOURCE
         for scheme in ("composite_figi", "figi", "share_class_figi", "ticker"):
             if r[scheme] and (w.instrument_id, scheme, r[scheme], source) not in published_open:
                 labels.append(
@@ -1034,16 +1082,19 @@ def link_issuers(
     observation), open-ended; ``known_at`` = ``load_time`` (``collected`` / ``load_time``).
 
     Idempotent: an instrument whose published ``sec`` cik row (read latest) already holds the
-    CIK gets nothing new; one holding another CIK gets that row closed (re-emitted with
-    ``valid_to = valid_date``) and the new one. Feeding the output back in at the same
+    CIK gets nothing new; open cik rows holding another CIK (under ``sec`` or one of the
+    instrument's series sources) are closed (re-emitted with ``valid_to = valid_date`` under
+    their own source) and the new one added. Feeding the output back in at the same
     ``load_time`` adds nothing; closing a row published at this very ``load_time`` raises.
 
-    Source of the row: ``sec`` when the instrument has at least one series (``source_symbol``
-    row) of an open source; otherwise (known only through restricted series, e.g. a private
-    token) the most restrictive of its series' sources, so the link never makes a private-only
-    instrument visible to a default read. Most restrictive: no_public_display, then
-    no_ml_training, then the code (alphabetical). ``sources`` is the registry (default:
-    ``discover_sources()``); an unregistered code counts as restricted."""
+    Source of the row: ``sec`` when the instrument has at least one live series (an open
+    ``source_symbol`` window reaching ``as_of - max_staleness_days``) of an open source (a dead
+    open series never publishes a link found through a private one); otherwise (known only
+    through restricted series, e.g. a private token) the most restrictive of its series'
+    sources, so the link never makes a private-only instrument visible to a default read.
+    Most restrictive: no_public_display, then no_ml_training, then the code (alphabetical).
+    ``sources`` is the registry (default: ``discover_sources()``); an unregistered code counts
+    as restricted."""
     load = _check_load_time(load_time)
     if not isinstance(as_of, date) or isinstance(as_of, datetime):
         raise TypeError("as_of must be a date")
@@ -1052,15 +1103,24 @@ def link_issuers(
     _require(sec_tickers, ("cik", "ticker"), "sec_tickers")
     rows = latest(identifiers, _KEY).to_pylist() if identifiers.num_rows else []
     registry = discover_sources() if sources is None else dict(sources)
+    floor = as_of - timedelta(days=max_staleness_days)
+    # series sources per instrument, from open (non-empty) windows; "live" ones reach floor
     series_sources: dict[str, set[str]] = defaultdict(set)
+    live_sources: dict[str, set[str]] = defaultdict(set)
     for r in rows:
-        if r["id_scheme"] == SYMBOL_SCHEME:
-            series_sources[r["instrument_id"]].add(r["id_value"].partition(":")[0])
+        if r["id_scheme"] != SYMBOL_SCHEME:
+            continue
+        if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
+            continue  # closed: says nothing about the instrument any more
+        code = r["id_value"].partition(":")[0]
+        series_sources[r["instrument_id"]].add(code)
+        if r["valid_to"] is None or r["valid_to"] - _DAY >= floor:
+            live_sources[r["instrument_id"]].add(code)
 
     def link_source(inst: str) -> str:
+        if any(c in registry and registry[c].access == "open" for c in live_sources[inst]):
+            return SEC_SOURCE  # an open series trades it now
         codes = series_sources.get(inst, set())
-        if any(c in registry and registry[c].access == "open" for c in codes):
-            return SEC_SOURCE
         if not codes:
             return SEC_SOURCE  # pragma: no cover - a current instrument has a series
 
@@ -1080,7 +1140,6 @@ def link_issuers(
             continue
         end = date.max if r["valid_to"] is None else r["valid_to"] - _DAY
         last[r["instrument_id"]] = max(last.get(r["instrument_id"], date.min), end)
-    floor = as_of - timedelta(days=max_staleness_days)
     current = {i for i, d in last.items() if d >= floor}
 
     latest_ticker: dict[str, tuple[date, set[str]]] = {}
@@ -1113,10 +1172,16 @@ def link_issuers(
             raise ValueError("sec_tickers holds a CIK that is not a number") from None
         ciks[_norm_ticker(ticker)].add(f"{number:010d}")
 
-    published: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    # open cik rows an earlier link may have written: source sec or one of the instrument's
+    # series sources (the link's source can move between them as series come and go)
+    published: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
-        if r["id_scheme"] == "cik" and (r["valid_to"] is None or r["valid_to"] > r["valid_date"]):
-            published[(r["instrument_id"], r["source_code"])].append(r)
+        if r["id_scheme"] != "cik" or (
+            r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]
+        ):
+            continue
+        if r["source_code"] == SEC_SOURCE or r["source_code"] in series_sources[r["instrument_id"]]:
+            published[r["instrument_id"]].append(r)
 
     load_date = load.astimezone(UTC).date()
     new: list[dict[str, Any]] = []
@@ -1125,15 +1190,19 @@ def link_issuers(
             continue
         inst, cik = next(iter(insts)), next(iter(ciks[t]))
         source = link_source(inst)
-        old = published.get((inst, source), [])
-        if any(r["id_value"] == cik for r in old):
-            continue  # unchanged
+        old = published.get(inst, [])
+        same = [r for r in old if r["id_value"] == cik]
+        if any(r["source_code"] == source for r in same) or (same and source != SEC_SOURCE):
+            continue  # unchanged (a restricted link never moves for a mere source change)
         for r in old:
+            if r["id_value"] == cik:
+                continue
             if r["known_at"] >= load:
                 raise ValueError("load_time must be after the published cik row it would close")
             new.append(
-                _row(inst, "cik", r["id_value"], r["valid_date"], r["valid_date"], source, load)
-            )
+                _row(inst, "cik", r["id_value"], r["valid_date"], r["valid_date"],
+                     r["source_code"], load)
+            )  # fmt: skip
         new.append(_row(inst, "cik", cik, load_date, None, source, load))
     base = identifiers.select(_SCHEMA.names).cast(_SCHEMA)
     table = pa.concat_tables([base, pa.Table.from_pylist(new, schema=_SCHEMA)])
