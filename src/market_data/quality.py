@@ -68,6 +68,7 @@ __all__ = [
     "DEFAULT_JUMP_THRESHOLD",
     "JUMP_EXCUSING_ACTIONS",
     "QUALITY_FLAGS_SCHEMA",
+    "ambiguous_mappings",
     "check_prices",
     "fetch_coverage",
     "unsuperseded_failures",
@@ -368,11 +369,27 @@ def _session_days(sessions: pa.Table | None) -> np.ndarray | None:
 
 
 def _space(start: np.ndarray, end: np.ndarray, s_days: np.ndarray | None):
-    """Inclusive day ranges as half-open [lo, hi) in the merge space: calendar days, or session
-    indices when ``s_days`` is given (two ranges with no session between them touch)."""
-    if s_days is None:
+    """Inclusive day ranges as half-open [lo, hi) in the merge space, where two ranges touch
+    when ``lo`` of one <= ``hi`` of the other.
+
+    Without sessions the space is calendar days. With ``s_days``, days within [first session,
+    last session] map to session indices (ranges with no session between them touch: Friday and
+    Monday), and days outside keep calendar-day steps on either side (never collapsed: the
+    calendar says nothing there, so only calendar adjacency merges or supersedes)."""
+    if s_days is None or not s_days.size:
         return start, end + 1
-    return np.searchsorted(s_days, start, "left"), np.searchsorted(s_days, end, "right")
+    first, last, n = s_days[0], s_days[-1], s_days.size
+    lo = np.where(
+        start < first,
+        start - first,
+        np.where(start > last, n + (start - last) - 1, np.searchsorted(s_days, start, "left")),
+    )
+    hi = np.where(
+        end < first,
+        end - first + 1,
+        np.where(end > last, n + (end - last), np.searchsorted(s_days, end, "right")),
+    )
+    return lo, hi
 
 
 def _bounds(fetch_log: pa.Table) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -438,25 +455,25 @@ def unsuperseded_failures(fetch_log: pa.Table, *, sessions: pa.Table | None = No
     return fetch_log.filter(pa.array(keep))
 
 
-def _windows(identifiers: pa.Table) -> pa.Table:
+def _windows(identifiers: pa.Table) -> tuple[pa.Table, set[str]]:
     """Mapping windows of ``source_symbol`` identifiers (read latest, store cover rule):
-    token, source_code, w_from, w_to (inclusive; null = open), instrument_id."""
+    token, source_code, w_from, w_to (inclusive; null = open), instrument_id; and the tokens
+    whose windows overlap while naming different instruments (ambiguous)."""
     rows: dict[str, list] = {k: [] for k in ("token", "w_source", "w_from", "w_to", "inst")}
-    for token, windows in sorted(symbol_mappings(identifiers).items()):
+    ambiguous: set[str] = set()
+    mappings = symbol_mappings(identifiers) if identifiers.num_rows else {}
+    for token, windows in sorted(mappings.items()):
         windows = sorted(windows, key=lambda w: w[0])
         for a, (start_a, end_a, inst_a) in enumerate(windows):
             for start_b, _end_b, inst_b in windows[a + 1 :]:
                 if inst_b != inst_a and (end_a is None or start_b < end_a):
-                    raise ValueError(
-                        f"ambiguous mapping for symbol {token!r} from {start_b.isoformat()}: "
-                        f"several instruments {sorted({inst_a, inst_b})}; fix the mapping upstream"
-                    )
+                    ambiguous.add(token)
             rows["token"].append(token)
             rows["w_source"].append(token.split(":", 1)[0])
             rows["w_from"].append(start_a)
             rows["w_to"].append(None if end_a is None else end_a - timedelta(days=1))
             rows["inst"].append(inst_a)
-    return pa.table(
+    table = pa.table(
         {
             "token": pa.array(rows["token"], pa.string()),
             "w_source": pa.array(rows["w_source"], pa.string()),
@@ -465,6 +482,14 @@ def _windows(identifiers: pa.Table) -> pa.Table:
             "instrument_id": pa.array(rows["inst"], pa.string()),
         }
     )
+    return table, ambiguous
+
+
+def ambiguous_mappings(identifiers: pa.Table) -> int:
+    """Number of ``source_symbol`` tokens whose mapping windows (read latest) overlap while
+    naming different instruments. ``fetch_coverage`` refuses them only when a fetch-log row
+    touches them; this count lets a run report the untouched ones."""
+    return len(_windows(identifiers)[1])
 
 
 def _merged_runs(log: pa.Table, start, end, s_days: np.ndarray | None) -> pa.Table:
@@ -513,18 +538,24 @@ def fetch_coverage(
     2. A failed row (``error``/``partial``) is dropped when strictly later ``ok``/``empty``/
        ``not_found`` rows of the same (source_code, source_symbol or ``"*"``) cover its whole
        range (one row or their union): a transient failure must not veto delistings forever.
-       Unsuperseded failures are kept (the store's coverage lets them veto).
+       Unsuperseded failures are kept (the store's coverage lets them veto). Keys never mix: a
+       failed symbol-level fetch is not cleared by a later ``"*"`` ``ok``, nor the reverse.
+       With ``sessions``, a part of the failed range outside the calendar must be covered day
+       by day (see ``_space``).
     3. Rows with a null bound cover nothing and are dropped (``unsuperseded_failures`` still
        reports such failures).
     4. Each ``<source_code>:<source_symbol>`` maps through the ``source_symbol`` identifiers, read
        latest, a window ``[valid_date, valid_to)`` covering the day (the store's ``_mapping``
        rule); a range spanning several windows is split; an unmapped symbol covers nothing.
-       Overlapping windows of one symbol naming different instruments raise ``ValueError``.
+       Overlapping windows of one symbol naming different instruments raise ``ValueError`` when
+       a fetch-log row touches that symbol (its own row, or a ``"*"`` row of its source);
+       untouched ones are skipped (count them with ``ambiguous_mappings``).
     5. A ``"*"`` (whole-market) row covers every mapped instrument of its source over its range.
 
     Ranges of one (source_code, source_symbol, status) are merged first; with ``sessions`` (pass
     the coverage recipe's own), ranges with no session between them merge too (daily grouped
-    fetches Friday and Monday become one range), which keeps a whole-market history compact."""
+    fetches Friday and Monday become one range), which keeps a whole-market history compact;
+    outside the calendar's first and last session only calendar-adjacent ranges merge."""
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("as_of must be a timezone-aware datetime")
     _check_statuses(fetch_log)
@@ -540,7 +571,7 @@ def fetch_coverage(
         return FETCH_COVERAGE_SCHEMA.empty_table()
     log = log.take(pa.array(keep, pa.int64()))
     runs = _merged_runs(log, start[keep], end[keep], s_days)
-    windows = _windows(identifiers)
+    windows, ambiguous = _windows(identifiers)
     if not windows.num_rows:
         return FETCH_COVERAGE_SCHEMA.empty_table()
 
@@ -549,6 +580,15 @@ def fetch_coverage(
     own = own.append_column(
         "token", pc.binary_join_element_wise(own["source_code"], own["source_symbol"], ":")
     )
+    whole_sources = set(runs.filter(whole)["source_code"].to_pylist())
+    own_tokens = set(own["token"].to_pylist())
+    touched = sorted(t for t in ambiguous if t in own_tokens or t.split(":", 1)[0] in whole_sources)
+    if touched:
+        raise ValueError(
+            f"ambiguous mapping for {len(touched)} symbol(s) of the fetch log (overlapping "
+            f"windows naming several instruments); fix the mapping upstream; first "
+            f"{min(len(touched), MAX_LISTED)}: {touched[:MAX_LISTED]}"
+        )
     parts = [
         own.join(windows, "token", join_type="inner"),
         runs.filter(whole).join(windows, "source_code", "w_source", join_type="inner"),

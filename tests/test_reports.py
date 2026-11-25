@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 
 import pyarrow as pa
 import pytest
-from open_data_store.contracts.standard.market import FETCH_LOG
+from open_data_store.contracts.standard.market import FETCH_LOG, INSTRUMENT_IDENTIFIERS
 from open_data_store.market.coverage import (
     COVERAGE_PER_MEMBER_SCHEMA,
     COVERAGE_PER_SESSION_SCHEMA,
@@ -16,6 +16,7 @@ from market_data.adapters.file import Ignored, LoadReport
 from market_data.build import BuildResult
 from market_data.quality import QUALITY_FLAGS_SCHEMA
 from market_data.reports import (
+    OTHER,
     REPORTS_ENV,
     RunSummary,
     kept_out_counts,
@@ -39,9 +40,13 @@ def report_table(rows) -> pa.Table:
     )
 
 
-def mapping(unresolved=(), ambiguous=(), changed=(), left_out=()) -> MappingResult:
+def mapping(
+    unresolved=(), ambiguous=(), changed=(), left_out=(), identifiers=None
+) -> MappingResult:
     return MappingResult(
-        identifiers=pa.table({}),
+        identifiers=INSTRUMENT_IDENTIFIERS.schema.empty_table()
+        if identifiers is None
+        else identifiers,
         unresolved=report_table(unresolved),
         ambiguous=report_table(ambiguous),
         minted=("mof:" + "a" * 32,),
@@ -87,11 +92,11 @@ def flags(rows) -> pa.Table:
     )
 
 
-def failed_log(status: str) -> pa.Table:
+def failed_log(status: str, symbol: str = LABEL) -> pa.Table:
     return pa.Table.from_pylist(
         [
             {
-                "source_symbol": LABEL,
+                "source_symbol": symbol,
                 "fetch_id": "r1",
                 "requested_from": date(2024, 1, 2),
                 "requested_to": date(2024, 1, 5),
@@ -135,13 +140,13 @@ def test_outcome_ok_only_with_clean_evidence():
 
 
 def test_outcome_degraded_on_unresolved():
-    run = clean(mapping=mapping(unresolved=[(SRC, LABEL, "no_answer")]))
+    run = clean(mapping=mapping(unresolved=[(SRC, LABEL, "no_composite_figi")]))
     assert run.outcome == "degraded"
     assert "unresolved_identifiers" in run.reasons
 
 
 def test_outcome_degraded_on_ambiguous():
-    run = clean(mapping=mapping(ambiguous=[(SRC, LABEL, "several_composites")]))
+    run = clean(mapping=mapping(ambiguous=[(SRC, LABEL, "several_composite_figis")]))
     assert run.outcome == "degraded"
     assert "ambiguous_identifiers" in run.reasons
 
@@ -173,8 +178,87 @@ def test_outcome_error_on_raised_failure_keeps_no_message():
 def test_never_ok_by_default():
     run = summarize("run-1", started_at=STARTED)
     assert run.outcome == "degraded"
-    assert run.reasons == ("nothing_recorded",)
+    assert run.reasons == ("mapping_not_recorded", "fetch_logs_not_recorded")
     assert RunSummary(run_id="run-2", started_at=STARTED).outcome == "degraded"
+
+
+def test_outcome_degraded_without_mapping_evidence():
+    run = clean(mapping=None)
+    assert run.reasons == ("mapping_not_recorded",)
+
+
+@pytest.mark.parametrize(
+    "fetch_logs",
+    [
+        None,
+        {},
+        {"actions": failed_log("ok")},
+        {"prices": FETCH_LOG.schema.empty_table()},
+    ],
+)
+def test_outcome_degraded_without_a_prices_fetch_log(fetch_logs):
+    run = clean(fetch_logs=fetch_logs)
+    assert run.outcome == "degraded"
+    assert run.reasons == ("fetch_logs_not_recorded",)
+
+
+def test_history_file_fetch_log_is_prices_evidence():
+    load = LoadReport(fetch_log={"members": 3, "ok": 3, "empty": 0})
+    assert clean(fetch_logs=None, load_report=load).outcome == "ok"
+    empty = LoadReport(fetch_log={"members": 0})
+    assert clean(fetch_logs=None, load_report=empty).reasons == ("fetch_logs_not_recorded",)
+
+
+def test_outcome_degraded_on_empty_coverage():
+    run = clean(coverage=coverage_result([]))
+    assert run.reasons == ("coverage_empty",)
+    assert run.coverage["worst_missing_share"] is None
+
+
+def test_changed_mappings_counted_without_degrading():
+    run = clean(mapping=mapping(changed=[(SRC, LABEL, "composite_changed")]))
+    assert run.outcome == "ok"
+    assert run.mapping["changed"] == {SRC: {"composite_changed": 1}}
+
+
+def test_overlapping_mapping_windows_degrade_as_ambiguous():
+    ids = pa.Table.from_pylist(
+        [
+            {
+                "instrument_id": inst,
+                "id_scheme": "source_symbol",
+                "id_value": f"{SRC}:AAA",
+                "valid_to": None,
+                "link_reason": None,
+                "known_at_basis": "load_time",
+                "valid_date": start,
+                "known_at": STARTED,
+                "known_at_kind": "collected",
+                "source_code": "openfigi",
+                "source_doc_id": None,
+            }
+            for inst, start in (
+                ("mof:" + "a" * 32, date(2024, 1, 1)),
+                ("mof:" + "b" * 32, date(2024, 1, 5)),
+            )
+        ],
+        schema=INSTRUMENT_IDENTIFIERS.schema,
+    )
+    run = clean(mapping=mapping(identifiers=ids))
+    assert run.mapping["overlapping_windows"] == 1
+    assert run.reasons == ("ambiguous_identifiers",)
+
+
+def test_nan_missing_share_serialised_as_null_and_skipped():
+    cov = coverage_result([0.0, 0.01])
+    per = cov.per_session.set_column(
+        5, "missing_share", pa.array([float("nan"), 0.01], pa.float64())
+    )
+    run = clean(coverage=CoverageResult(cov.per_member, per, True))
+    assert run.coverage["worst_missing_share"] == 0.01
+    per = per.set_column(5, "missing_share", pa.array([float("nan")] * 2, pa.float64()))
+    run = clean(coverage=CoverageResult(cov.per_member, per, True))
+    assert json.loads(json.dumps(run.to_dict()))["coverage"]["worst_missing_share"] is None
 
 
 def test_kept_out_rows_and_flags_do_not_degrade_but_are_counted():
@@ -199,6 +283,7 @@ def test_kept_out_rows_and_flags_do_not_degrade_but_are_counted():
         "jump_without_action": 2,
         "missing_session": 1,
         "vendor_divergence": 0,
+        OTHER: 0,
     }
     assert run.builder_drops == {"prices": {"non_session": 1, "intraday_partial": 0}}
 
@@ -210,6 +295,36 @@ def test_run_id_and_error_validated():
         RunSummary(run_id="r", started_at=STARTED, error=f"boom {LABEL}")
     with pytest.raises(ValueError, match="timezone-aware"):
         RunSummary(run_id="r", started_at=datetime(2024, 1, 1))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"quality": {LABEL: 1}},
+        {"quality": {"non_positive": "1"}},
+        {"quality": {"non_positive": True}},
+        {"written": {"prices": -1}},
+        {"written": {LABEL: 1}},
+        {"failed_fetches": {"prices": {LABEL: 1}}},
+        {"kept_out": {SRC: {"prices": {"non_finite": {"keys": 1}}}}},
+        {"mapping": {"unresolved": {}}},
+        {"coverage": {"passed": True}},
+    ],
+)
+def test_run_summary_fields_validated(fields):
+    with pytest.raises(ValueError, match="RunSummary"):
+        RunSummary(run_id="r", started_at=STARTED, **fields)
+
+
+def test_summarize_maps_free_text_keys():
+    with pytest.raises(ValueError, match="contract"):
+        clean(written={LABEL: 1})
+    with pytest.raises(ValueError, match="fetch kind"):
+        clean(fetch_logs={LABEL: failed_log("ok")})
+    with pytest.raises(ValueError, match="fetch kind"):
+        clean(kept_out={SRC: {LABEL: {}}})
+    run = clean(kept_out={LABEL: {"prices": {LABEL: {"keys": 1, "rows": 2}}}})
+    assert run.kept_out == {OTHER: {"prices": {OTHER: {"keys": 1, "rows": 2}}}}
 
 
 # --- kept-out counts ----------------------------------------------------------------------------
@@ -288,21 +403,28 @@ def test_kept_out_counts_reads_actions_from_the_prices_payload():
 
 def full_run() -> RunSummary:
     load = LoadReport(
-        dropped={"prices_daily": {"bad_close": 2}},
-        unmapped_exchanges={"securities": {"ZZ": 1}},
+        dropped={"prices": {"non_session": 2, LABEL: 1}, LABEL: {"duplicate_row": 1}},
+        unmapped_exchanges={"prices": {LABEL: 1, "ZZ": 2}, LABEL: {"YY": 1}},
+        unknown_action_types={LABEL + " merger": 2, "Odd lot": 1},
         ignored=Ignored(
-            files=[f"{LABEL}.csv"], columns={"prices.csv": [LABEL]}, manifest_keys=[LABEL]
+            files=[f"{LABEL}.csv"],
+            columns={f"{LABEL}.csv": [LABEL, "x"], "prices.csv": "3 unknown column(s)"},
+            manifest_keys=[LABEL],
         ),
-        fetch_log={"ok": 3},
+        fetch_log={"members": 3, "ok": 3, LABEL: 1},
     )
     return clean(
         mapping=mapping(
-            unresolved=[(SRC, LABEL, "no_answer"), ("private_history", "t_" + "0" * 20, "x")],
-            ambiguous=[(SRC, LABEL, "several_composites")],
+            unresolved=[
+                (SRC, LABEL, "no_composite_figi"),
+                ("private_history", "t_" + "0" * 20, LABEL),
+                (LABEL, "x", "no_span"),
+            ],
+            ambiguous=[(SRC, LABEL, "several_composite_figis")],
             changed=[(SRC, LABEL, "composite_changed")],
-            left_out=[(SRC, LABEL, "stale", 4)],
+            left_out=[(SRC, LABEL, "outside_windows", 4)],
         ),
-        quality=flags([(LABEL, date(2024, 1, 2), "non_positive")]),
+        quality=flags([(LABEL, date(2024, 1, 2), "non_positive"), ("X", date(2024, 1, 2), LABEL)]),
         fetch_logs={"prices": failed_log("error")},
         load_report=load,
         kept_out={SRC: {"prices": {"non_finite": {"keys": 1, "rows": 1}}}},
@@ -321,13 +443,22 @@ def test_write_report_files(tmp_path):
         "ambiguous_identifiers",
         "failed_fetches",
     }
-    assert data["mapping"]["unresolved"] == {"private_history": {"x": 1}, SRC: {"no_answer": 1}}
-    assert data["mapping"]["labels_left_out"] == {SRC: {"stale": 4}}
-    assert data["file_load"]["ignored"] == {
-        "files": 1,
-        "columns": {"prices.csv": 1},
-        "manifest_keys": 1,
+    assert data["mapping"]["unresolved"] == {
+        OTHER: {"no_span": 1},
+        "private_history": {OTHER: 1},
+        SRC: {"no_composite_figi": 1},
     }
+    assert data["mapping"]["labels_left_out"] == {SRC: {"outside_windows": 4}}
+    assert data["quality"]["non_positive"] == 1 and data["quality"][OTHER] == 1
+    load = data["file_load"]
+    assert load["ignored"] == {"files": 1, "column_files": 2, "columns": 5, "manifest_keys": 1}
+    assert load["unmapped_exchanges"] == {
+        "prices": {"distinct": 2, "rows": 3},
+        OTHER: {"distinct": 1, "rows": 1},
+    }
+    assert load["unknown_action_types"] == {"distinct": 2, "rows": 3}
+    assert load["dropped"] == {"prices": {"non_session": 2, OTHER: 1}, OTHER: {"duplicate_row": 1}}
+    assert load["fetch_log"] == {"members": 3, "ok": 3, OTHER: 1}
     md = md_path.read_text()
     assert "degraded" in md and "run-1" in md
     assert not list((tmp_path / "reports").glob(".*"))  # no temp file left behind

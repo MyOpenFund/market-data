@@ -4,19 +4,23 @@ Silent-failure doctrine: a run is never ``ok`` by default. ``RunSummary.outcome`
 
 - ``error`` when the run raised (``error`` holds the exception's type name only: messages can
   quote keys, i.e. symbols);
-- ``ok`` only when there is no error, something was recorded, no unresolved or ambiguous
-  identifier in the mapping (when given), no unsuperseded failed fetch (when fetch logs are
-  given) and the coverage passed (when given);
+- ``ok`` only when there is no error and the evidence is there and clean: a mapping was recorded
+  with no unresolved or ambiguous identifier (``MappingResult.unresolved`` / ``ambiguous``, and
+  overlapping mapping windows); a prices fetch log was recorded (a non-empty
+  ``fetch_logs["prices"]``, or the history-file load's fetch-log summary with members) with no
+  unsuperseded failed fetch of any kind; the coverage, when given, has sessions and passed;
 - ``degraded`` otherwise; ``reasons`` says why (``REASONS``).
 
-Kept-out rows, builder drops and quality flags are counted but do not degrade a run: they are
-flagged, not hidden (§12).
+Kept-out rows, builder drops, changed mappings and quality flags are counted but do not degrade a
+run: they are flagged, not hidden (§12).
 
-Label-free: a summary holds counts, closed vocabularies (reasons, checks, statuses), source codes,
-contract names, session dates and opaque instrument ids only — never a source symbol, a member
-id or an export name, even though reports live on a private path (``MOF_MARKET_REPORTS``). Mapping
-tables are counted per (source_code, reason); quality flags per check; the history-file
-``LoadReport`` is copied except ``ignored``, reduced to counts.
+Label-free: a summary holds counts, closed vocabularies, source codes, contract names, session
+dates and booleans only — never a source symbol, a member id, an exchange code, an export's
+action-type text, a column or file name. ``summarize`` maps every caller-provided key to a known
+vocabulary (unknown reasons become ``"other"``) or to a count; ``RunSummary`` validates its
+fields at construction (only known keys, counts as non-negative ints, source codes as short
+lowercase codes), so no free text reaches a report even though reports live on a private path
+(``MOF_MARKET_REPORTS``).
 
 ``write_report(run, dir)`` writes ``<run_id>-report.json`` (machine) and ``<run_id>-report.md``
 (human), atomically, into ``dir`` or ``MOF_MARKET_REPORTS`` (no default), never inside a git
@@ -27,27 +31,32 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import re
 import tempfile
-from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+from open_data_store.contracts.standard.market import LINK_REASONS, MARKET_CONTRACTS
 from open_data_store.market.coverage import CoverageResult
 
-from market_data.adapters.base import FetchResult
-from market_data.build import ROW_STATUSES, BuildResult
-from market_data.quality import CHECKS, unsuperseded_failures
+from market_data.adapters import file as _file
+from market_data.adapters import massive as _massive
+from market_data.adapters import tiingo as _tiingo
+from market_data.adapters.base import FETCH_KINDS, FetchResult
+from market_data.build import DROP_REASONS, ROW_STATUSES, BuildResult
+from market_data.quality import CHECKS, ambiguous_mappings, unsuperseded_failures
+from market_data.resolve import mapping as _mapping
 
 __all__ = [
     "DEFAULT_MAX_LISTED_SESSIONS",
+    "OTHER",
     "OUTCOMES",
     "REASONS",
     "REPORTS_ENV",
@@ -60,17 +69,54 @@ __all__ = [
 REPORTS_ENV = "MOF_MARKET_REPORTS"
 OUTCOMES = ("ok", "degraded", "error")
 REASONS = (
-    "nothing_recorded",
+    "mapping_not_recorded",
     "unresolved_identifiers",
     "ambiguous_identifiers",
+    "fetch_logs_not_recorded",
     "failed_fetches",
+    "coverage_empty",
     "coverage_failed",
 )
 # Over-threshold session dates listed in a report (the count is always given).
 DEFAULT_MAX_LISTED_SESSIONS = 20
-_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+OTHER = "other"  # any key outside a known vocabulary
 
-Counts = Mapping[str, int]
+_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SOURCE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_CONTRACTS = tuple(c.name for c in MARKET_CONTRACTS)
+_KEPT_OUT = tuple(sorted({*_massive.KEPT_OUT_REASONS, *_tiingo.KEPT_OUT_REASONS, OTHER}))
+_FILE_TABLES = (*_CONTRACTS, OTHER)
+_FILE_DROPS = (
+    _file.DROP_DUPLICATE_ROW,
+    _file.DROP_NON_SESSION,
+    _file.DROP_AFTER_EXPORT,
+    _file.DROP_UNMAPPED_EXCHANGE,
+    _file.DROP_UNKNOWN_ACTION_TYPE,
+    OTHER,
+)
+_FILE_FETCH_LOG = (
+    "members",
+    "ok",
+    "empty",
+    "empty_with_unloaded_prices",
+    "unloaded_price_rows",
+    OTHER,
+)
+_MAPPING_REASONS = tuple(
+    sorted(
+        {
+            getattr(_mapping, name)
+            for name in dir(_mapping)
+            if name.startswith(("UNRESOLVED_", "AMBIGUOUS_", "CHANGED_", "LABEL_"))
+            and isinstance(getattr(_mapping, name), str)
+        }
+        | set(LINK_REASONS)
+        | {OTHER}
+    )
+)
+_MAPPING_TABLES = ("unresolved", "ambiguous", "changed", "labels_left_out")
+_QUALITY = (*CHECKS, OTHER)
+_BUILD_DROPS = (*DROP_REASONS, OTHER)
 
 
 def _aware(value: datetime | None, name: str) -> None:
@@ -78,21 +124,150 @@ def _aware(value: datetime | None, name: str) -> None:
         raise ValueError(f"{name} must be timezone-aware")
 
 
+# --- validation ---------------------------------------------------------------------------------
+
+Check = Callable[[Any, str], None]
+
+
+def _fail(path: str, what: str) -> None:
+    raise ValueError(f"RunSummary.{path}: {what}")
+
+
+def _count(value: Any, path: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(path, f"expected a non-negative int, got {type(value).__name__}")
+
+
+def _source_key(key: Any) -> bool:
+    return isinstance(key, str) and bool(_SOURCE.fullmatch(key))
+
+
+def _in(vocab: Iterable[str]) -> Callable[[Any], bool]:
+    allowed = frozenset(vocab)
+    return lambda key: key in allowed
+
+
+def _tree(*levels: Callable[[Any], bool], leaf: Check = _count) -> Check:
+    """A nested mapping whose keys at depth i satisfy levels[i] and whose leaves pass ``leaf``."""
+
+    def check(value: Any, path: str) -> None:
+        if not levels:
+            leaf(value, path)
+            return
+        if not isinstance(value, Mapping):
+            _fail(path, "expected a mapping")
+        for key, sub in value.items():
+            if not levels[0](key):
+                _fail(path, "unknown key (keys come from a closed vocabulary)")
+            _tree(*levels[1:], leaf=leaf)(sub, f"{path}[{key}]")
+
+    return check
+
+
+def _record(fields: Mapping[str, Check]) -> Check:
+    """A mapping with exactly ``fields`` (each validated)."""
+
+    def check(value: Any, path: str) -> None:
+        if not isinstance(value, Mapping) or set(value) != set(fields):
+            _fail(path, f"expected exactly the keys {sorted(fields)}")
+        for key, sub_check in fields.items():
+            sub_check(value[key], f"{path}.{key}")
+
+    return check
+
+
+def _share(value: Any, path: str) -> None:
+    if value is not None and not (isinstance(value, float) and math.isfinite(value)):
+        _fail(path, "expected a finite float or None")
+
+
+def _flag(value: Any, path: str) -> None:
+    if not isinstance(value, bool):
+        _fail(path, "expected a bool")
+
+
+def _iso_dates(value: Any, path: str) -> None:
+    if not isinstance(value, list):
+        _fail(path, "expected a list of ISO dates")
+    for v in value:
+        try:
+            ok = isinstance(v, str) and date.fromisoformat(v).isoformat() == v
+        except ValueError:
+            ok = False
+        if not ok:
+            _fail(path, "expected ISO dates (YYYY-MM-DD)")
+
+
+_KEYS_ROWS = _record({"keys": _count, "rows": _count})
+_DISTINCT_ROWS = _record({"distinct": _count, "rows": _count})
+_PER_SOURCE_REASON = _tree(_source_key, _in(_MAPPING_REASONS))
+_PER_KIND_SOURCE = _tree(_in(FETCH_KINDS), _source_key)
+_SECTIONS: dict[str, Check] = {
+    "builder_drops": _tree(_in(_CONTRACTS), _in(_BUILD_DROPS)),
+    "kept_out": _tree(_source_key, _in(FETCH_KINDS), _in(_KEPT_OUT), leaf=_KEYS_ROWS),
+    "file_load": _record(
+        {
+            "dropped": _tree(_in(_FILE_TABLES), _in(_FILE_DROPS)),
+            "unmapped_exchanges": _tree(_in(_FILE_TABLES), leaf=_DISTINCT_ROWS),
+            "unknown_action_types": _DISTINCT_ROWS,
+            "ignored": _record(
+                {
+                    "files": _count,
+                    "column_files": _count,
+                    "columns": _count,
+                    "manifest_keys": _count,
+                }
+            ),
+            "fetch_log": _tree(_in(_FILE_FETCH_LOG)),
+            "unlisted_spinoff_targets": _count,
+        }
+    ),
+    "mapping": _record(
+        {
+            **dict.fromkeys(_MAPPING_TABLES, _PER_SOURCE_REASON),
+            "minted": _count,
+            "overlapping_windows": _count,
+        }
+    ),
+    "quality": _tree(_in(_QUALITY)),
+    "coverage": _record(
+        {
+            "passed": _flag,
+            "worst_missing_share": _share,
+            "sessions": _count,
+            "sessions_over_threshold": _count,
+            "over_threshold_sessions": _iso_dates,
+        }
+    ),
+    "fetches": _PER_KIND_SOURCE,
+    "failed_fetches": _PER_KIND_SOURCE,
+    "written": _tree(_in(_CONTRACTS)),
+}
+
+
 @dataclass(frozen=True)
 class RunSummary:
-    """Counts of one run (see the module docstring). Build one with ``summarize``.
+    """Counts of one run (see the module docstring). Build one with ``summarize``; every field
+    is validated at construction.
 
-    Sections left ``None`` were not part of the run; they neither pass nor fail it.
+    Sections left ``None`` were not recorded: they neither pass nor fail a check of their own,
+    but missing mapping or fetch-log evidence keeps the run from ``ok``.
 
     - ``builder_drops``: contract -> drop reason -> distinct keys (``BuildResult.counts()``).
     - ``kept_out``: source_code -> kind -> reason -> ``{"keys": n, "rows": n}``
       (``kept_out_counts``: distinct (symbol, date) keys vs payload rows).
-    - ``file_load``: the history-file ``LoadReport`` as a dict (``ignored`` as counts).
+    - ``file_load``: the history-file ``LoadReport`` as counts: ``dropped`` (contract -> reason
+      -> rows), ``unmapped_exchanges`` (contract -> distinct codes and rows),
+      ``unknown_action_types`` (distinct and rows), ``ignored`` (files, files with ignored
+      columns, columns, manifest keys), ``fetch_log`` summary, ``unlisted_spinoff_targets``.
     - ``mapping``: ``unresolved`` / ``ambiguous`` / ``changed``: source_code -> reason -> series;
-      ``labels_left_out``: source_code -> reason -> rows; ``minted``: instruments created.
-    - ``quality``: check -> flags (every check of ``CHECKS``).
-    - ``coverage``: ``passed``, ``worst_missing_share``, ``sessions_over_threshold``,
-      ``over_threshold_sessions`` (ISO dates, the first ``DEFAULT_MAX_LISTED_SESSIONS``).
+      ``labels_left_out``: source_code -> reason -> rows; ``minted``: instruments created;
+      ``overlapping_windows``: symbols whose windows overlap on different instruments.
+    - ``quality``: check -> flags (every check of ``CHECKS``, plus ``other``).
+    - ``coverage``: ``passed``, ``worst_missing_share`` (None without a finite share),
+      ``sessions``, ``sessions_over_threshold``, ``over_threshold_sessions`` (ISO dates, the
+      first ``DEFAULT_MAX_LISTED_SESSIONS``).
+    - ``fetches``: kind -> source_code -> fetch-log rows recorded.
     - ``failed_fetches``: kind -> source_code -> unsuperseded failed fetches.
     - ``written``: contract -> rows written.
     """
@@ -101,14 +276,15 @@ class RunSummary:
     started_at: datetime
     finished_at: datetime | None = None
     error: str | None = None
-    builder_drops: Mapping[str, Counts] | None = None
-    kept_out: Mapping[str, Mapping[str, Mapping[str, Counts]]] | None = None
+    builder_drops: Mapping[str, Any] | None = None
+    kept_out: Mapping[str, Any] | None = None
     file_load: Mapping[str, Any] | None = None
     mapping: Mapping[str, Any] | None = None
-    quality: Counts | None = None
+    quality: Mapping[str, Any] | None = None
     coverage: Mapping[str, Any] | None = None
-    failed_fetches: Mapping[str, Counts] | None = None
-    written: Counts | None = None
+    fetches: Mapping[str, Any] | None = None
+    failed_fetches: Mapping[str, Any] | None = None
+    written: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not _RUN_ID.fullmatch(self.run_id):
@@ -122,6 +298,10 @@ class RunSummary:
             isinstance(self.error, str) and self.error.isidentifier()
         ):
             raise ValueError("error must be an exception type name (an identifier), not a message")
+        for name, check in _SECTIONS.items():
+            value = getattr(self, name)
+            if value is not None:
+                check(value, name)
 
     @property
     def reasons(self) -> tuple[str, ...]:
@@ -129,27 +309,24 @@ class RunSummary:
         if self.error is not None:
             return ()
         out = []
-        sections = (
-            self.builder_drops,
-            self.kept_out,
-            self.file_load,
-            self.mapping,
-            self.quality,
-            self.coverage,
-            self.failed_fetches,
-            self.written,
-        )
-        if all(s is None for s in sections):
-            out.append("nothing_recorded")
-        if self.mapping is not None:
-            if _total(self.mapping.get("unresolved", {})):
+        if self.mapping is None:
+            out.append("mapping_not_recorded")
+        else:
+            if _total(self.mapping["unresolved"]):
                 out.append("unresolved_identifiers")
-            if _total(self.mapping.get("ambiguous", {})):
+            if _total(self.mapping["ambiguous"]) or self.mapping["overlapping_windows"]:
                 out.append("ambiguous_identifiers")
+        provider = _total((self.fetches or {}).get("prices", {}))
+        history = (self.file_load or {}).get("fetch_log", {}).get("members", 0)
+        if not (provider or history):
+            out.append("fetch_logs_not_recorded")
         if self.failed_fetches is not None and _total(self.failed_fetches):
             out.append("failed_fetches")
-        if self.coverage is not None and not self.coverage.get("passed", False):
-            out.append("coverage_failed")
+        if self.coverage is not None:
+            if not self.coverage["sessions"]:
+                out.append("coverage_empty")
+            elif not self.coverage["passed"]:
+                out.append("coverage_failed")
         return tuple(out)
 
     @property
@@ -185,14 +362,28 @@ def _plain(value: Any) -> Any:
         return {str(k): _plain(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_plain(v) for v in value]
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
     return value
 
 
 # --- section builders ---------------------------------------------------------------------------
+
+
+def _known(key: Any, vocab: Iterable[str]) -> str:
+    return key if key in vocab else OTHER
+
+
+def _source(code: Any) -> str:
+    return code if _source_key(code) else OTHER
+
+
+def _require(key: Any, vocab: Iterable[str], what: str) -> str:
+    if key not in vocab:
+        raise ValueError(f"unknown {what} {key!r}; expected one of {sorted(vocab)}")
+    return key
+
+
+def _bump(out: dict, key: str, n: int) -> None:
+    out[key] = out.get(key, 0) + int(n)
 
 
 def _add(out: dict[str, dict[str, int]], reason: str, keys: int, rows: int) -> None:
@@ -212,7 +403,8 @@ def kept_out_counts(
     fetches), summed. Only fetches whose status is in ``ROW_STATUSES`` are parsed (the others
     carry no rows). An adapter whose actions come in another kind's payload
     (``actions_fetch_kind``, Tiingo) has those payloads parsed as ``actions`` too. A payload
-    unusable as a whole raises ``ValueError``, as it does in the builder."""
+    unusable as a whole raises ``ValueError``, as it does in the builder. Reasons outside the
+    adapters' vocabularies are counted under ``other``."""
     wanted = set(kinds)
     actions_kind = getattr(adapter, "actions_fetch_kind", None)
     out: dict[str, dict[str, dict[str, int]]] = {}
@@ -230,24 +422,19 @@ def kept_out_counts(
             keys, rows = report.counts(), report.row_counts
             per = out.setdefault(view.kind, {})
             for reason in sorted(set(keys) | set(rows)):
-                _add(per, reason, keys.get(reason, 0), rows.get(reason, 0))
+                _add(per, _known(reason, _KEPT_OUT), keys.get(reason, 0), rows.get(reason, 0))
     return out
 
 
 def _per_source_reason(table: pa.Table, weight: str | None = None) -> dict[str, dict[str, int]]:
-    out: dict[str, dict[str, int]] = defaultdict(dict)
+    out: dict[str, dict[str, int]] = {}
     if table.num_rows == 0:
-        return {}
-    aggs = [(weight, "sum")] if weight else [("reason", "count")]
-    grouped = table.group_by(["source_code", "reason"]).aggregate(aggs)
-    value = f"{weight}_sum" if weight else "reason_count"
-    for src, reason, n in zip(
-        grouped["source_code"].to_pylist(),
-        grouped["reason"].to_pylist(),
-        grouped[value].to_pylist(),
-        strict=True,
-    ):
-        out[src][reason] = int(n)
+        return out
+    srcs = table["source_code"].to_pylist()
+    reasons = table["reason"].to_pylist()
+    weights = table[weight].to_pylist() if weight else [1] * len(srcs)
+    for src, reason, n in zip(srcs, reasons, weights, strict=True):
+        _bump(out.setdefault(_source(src), {}), _known(reason, _MAPPING_REASONS), n or 0)
     return {s: dict(sorted(r.items())) for s, r in sorted(out.items())}
 
 
@@ -258,44 +445,73 @@ def _mapping_section(mapping: Any) -> dict[str, Any]:
         "changed": _per_source_reason(mapping.changed),
         "labels_left_out": _per_source_reason(mapping.labels_left_out, "rows"),
         "minted": len(mapping.minted),
+        "overlapping_windows": ambiguous_mappings(mapping.identifiers)
+        if mapping.identifiers.num_rows
+        else 0,
     }
 
 
+_LEADING_INT = re.compile(r"\s*(\d+)")
+
+
+def _column_count(cols: Any) -> int:
+    if isinstance(cols, (list, tuple)):
+        return len(cols)
+    match = _LEADING_INT.match(str(cols))  # "N unknown column(s)"
+    return int(match.group(1)) if match else 1
+
+
 def _load_section(report: Any) -> dict[str, Any]:
+    dropped: dict[str, dict[str, int]] = {}
+    for table, reasons in report.dropped.items():
+        per = dropped.setdefault(_known(table, _FILE_TABLES), {})
+        for reason, n in reasons.items():
+            _bump(per, _known(reason, _FILE_DROPS), n)
+    exchanges = {
+        _known(table, _FILE_TABLES): {
+            "distinct": len(codes),
+            "rows": sum(int(n) for n in codes.values()),
+        }
+        for table, codes in report.unmapped_exchanges.items()
+    }
+    fetch_log: dict[str, int] = {}
+    for key, n in report.fetch_log.items():
+        _bump(fetch_log, _known(key, _FILE_FETCH_LOG), n)
     ignored = report.ignored
     return {
-        "dropped": _plain(report.dropped),
-        "unmapped_exchanges": _plain(report.unmapped_exchanges),
-        "unknown_action_types": _plain(report.unknown_action_types),
+        "dropped": dropped,
+        "unmapped_exchanges": exchanges,
+        "unknown_action_types": {
+            "distinct": len(report.unknown_action_types),
+            "rows": sum(int(n) for n in report.unknown_action_types.values()),
+        },
         "ignored": {
             "files": len(ignored.files),
-            "columns": {
-                fname: (len(cols) if isinstance(cols, list) else 1)
-                for fname, cols in sorted(ignored.columns.items())
-            },
+            "column_files": len(ignored.columns),
+            "columns": sum(_column_count(c) for c in ignored.columns.values()),
             "manifest_keys": len(ignored.manifest_keys),
         },
-        "fetch_log": _plain(report.fetch_log),
+        "fetch_log": fetch_log,
         "unlisted_spinoff_targets": int(report.unlisted_spinoff_targets),
     }
 
 
 def _quality_section(flags: pa.Table) -> dict[str, int]:
-    counts = dict.fromkeys(CHECKS, 0)
+    counts = dict.fromkeys(_QUALITY, 0)
     if flags.num_rows:
-        values = pc.value_counts(flags["check"]).to_pylist()
-        for item in values:
-            counts[item["values"]] = int(item["counts"])
+        for item in pc.value_counts(flags["check"]).to_pylist():
+            _bump(counts, _known(item["values"], CHECKS), item["counts"])
     return counts
 
 
 def _coverage_section(result: CoverageResult, max_listed: int) -> dict[str, Any]:
     per = result.per_session
-    shares = per["missing_share"].to_numpy(zero_copy_only=False) if per.num_rows else []
+    shares = per["missing_share"].to_pylist() if per.num_rows else []
+    finite = [s for s in shares if s is not None and math.isfinite(s)]
     over = per.filter(per["over_threshold"]) if per.num_rows else per
     return {
         "passed": bool(result.passed),
-        "worst_missing_share": float(max(shares)) if len(shares) else 0.0,
+        "worst_missing_share": float(max(finite)) if finite else None,
         "sessions": per.num_rows,
         "sessions_over_threshold": over.num_rows,
         "over_threshold_sessions": [
@@ -304,16 +520,30 @@ def _coverage_section(result: CoverageResult, max_listed: int) -> dict[str, Any]
     }
 
 
-def _failed_section(
+def _fetch_sections(
     fetch_logs: Mapping[str, pa.Table], sessions: pa.Table | None
-) -> dict[str, dict[str, int]]:
-    out: dict[str, dict[str, int]] = {}
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    rows: dict[str, dict[str, int]] = {}
+    failed: dict[str, dict[str, int]] = {}
     for kind, log in sorted(fetch_logs.items()):
-        left = unsuperseded_failures(log, sessions=sessions)
-        per: dict[str, int] = {}
-        for src in left["source_code"].to_pylist():
-            per[src] = per.get(src, 0) + 1
-        out[kind] = dict(sorted(per.items()))
+        _require(kind, FETCH_KINDS, "fetch kind")
+        per_rows = rows.setdefault(kind, {})
+        for src in log["source_code"].to_pylist():
+            _bump(per_rows, _source(src), 1)
+        per_failed = failed.setdefault(kind, {})
+        for src in unsuperseded_failures(log, sessions=sessions)["source_code"].to_pylist():
+            _bump(per_failed, _source(src), 1)
+    return rows, failed
+
+
+def _kept_out_section(kept_out: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for src, kinds in kept_out.items():
+        per_src = out.setdefault(_source(src), {})
+        for kind, reasons in kinds.items():
+            per_kind = per_src.setdefault(_require(kind, FETCH_KINDS, "fetch kind"), {})
+            for reason, counts in reasons.items():
+                _add(per_kind, _known(reason, _KEPT_OUT), counts["keys"], counts["rows"])
     return out
 
 
@@ -324,7 +554,7 @@ def summarize(
     finished_at: datetime | None = None,
     error: BaseException | None = None,
     builds: Mapping[str, BuildResult] | None = None,
-    kept_out: Mapping[str, Mapping[str, Mapping[str, Counts]]] | None = None,
+    kept_out: Mapping[str, Mapping[str, Mapping[str, Mapping[str, int]]]] | None = None,
     load_report: Any = None,
     mapping: Any = None,
     quality: pa.Table | None = None,
@@ -338,28 +568,47 @@ def summarize(
 
     ``builds``: contract name -> ``BuildResult``; ``kept_out``: source_code ->
     ``kept_out_counts(...)``; ``load_report``: the history-file ``LoadReport``; ``mapping``: a
-    ``MappingResult``; ``quality``: ``check_prices`` flags (several sources concatenated);
-    ``coverage``: the store's ``CoverageResult``; ``fetch_logs``: kind -> that kind's fetch log
+    ``MappingResult`` (its ``identifiers`` are checked for overlapping windows); ``quality``:
+    ``check_prices`` flags (several sources concatenated); ``coverage``: the store's
+    ``CoverageResult``; ``fetch_logs``: kind -> that kind's fetch log
     (``build_fetch_log(kinds=(kind,))``, every source concatenated), failures superseded as in
     ``quality.fetch_coverage`` (``sessions``: the same merge rule); ``written``: contract -> rows
-    written; ``error``: the exception the run raised (only its type name is kept)."""
+    written; ``error``: the exception the run raised (only its type name is kept).
+
+    Contract names and fetch kinds must be known (``ValueError`` otherwise); reasons outside a
+    known vocabulary are counted under ``other``; source codes that are not short lowercase
+    codes are counted under ``other``; free-text keys (exchange codes, action-type labels,
+    column and file names) become counts."""
     if max_listed_sessions < 0:
         raise ValueError(f"max_listed_sessions must be >= 0, got {max_listed_sessions!r}")
+    fetches = failed = None
+    if fetch_logs is not None:
+        fetches, failed = _fetch_sections(fetch_logs, sessions)
+    builder_drops = None
+    if builds is not None:
+        builder_drops = {}
+        for name, build in sorted(builds.items()):
+            per = builder_drops.setdefault(_require(name, _CONTRACTS, "contract"), {})
+            for reason, n in build.counts().items():
+                _bump(per, _known(reason, _BUILD_DROPS), n)
     return RunSummary(
         run_id=run_id,
         started_at=started_at,
         finished_at=finished_at,
         error=None if error is None else type(error).__name__,
-        builder_drops=(
-            None if builds is None else {k: dict(b.counts()) for k, b in sorted(builds.items())}
-        ),
-        kept_out=None if kept_out is None else _plain(kept_out),
+        builder_drops=builder_drops,
+        kept_out=None if kept_out is None else _kept_out_section(kept_out),
         file_load=None if load_report is None else _load_section(load_report),
         mapping=None if mapping is None else _mapping_section(mapping),
         quality=None if quality is None else _quality_section(quality),
         coverage=None if coverage is None else _coverage_section(coverage, max_listed_sessions),
-        failed_fetches=None if fetch_logs is None else _failed_section(fetch_logs, sessions),
-        written=None if written is None else {k: int(v) for k, v in sorted(written.items())},
+        fetches=fetches,
+        failed_fetches=failed,
+        written=(
+            None
+            if written is None
+            else {_require(k, _CONTRACTS, "contract"): int(v) for k, v in sorted(written.items())}
+        ),
     )
 
 
@@ -429,6 +678,7 @@ def _markdown(data: Mapping[str, Any]) -> str:
     for title, key in (
         ("Rows written", "written"),
         ("Coverage", "coverage"),
+        ("Fetches recorded", "fetches"),
         ("Failed fetches (unsuperseded)", "failed_fetches"),
         ("Identifier mapping", "mapping"),
         ("Quality flags", "quality"),

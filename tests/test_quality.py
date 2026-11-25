@@ -14,6 +14,7 @@ from market_data.adapters.tiingo import VENDOR_ADJUSTED_SCHEMA
 from market_data.quality import (
     CHECKS,
     QUALITY_FLAGS_SCHEMA,
+    ambiguous_mappings,
     check_prices,
     fetch_coverage,
     unsuperseded_failures,
@@ -596,3 +597,99 @@ def test_superseded_error_no_longer_vetoes_a_delisting():
         "reason"
     ].to_pylist()
     assert reasons == ["ok", "ok"] + ["delisted"] * 7
+
+
+def test_sessions_never_collapse_days_outside_the_calendar():
+    # Calendar: 2024-01-02 .. 2024-01-12. A 2010-2012 error vs an unrelated 2015 ok.
+    log = fetch_log(
+        [
+            ("BBB", date(2010, 1, 1), date(2012, 12, 31), "error", utc(2024, 1, 20)),
+            ("BBB", date(2015, 6, 1), date(2015, 6, 30), "ok", utc(2024, 2, 1)),
+        ]
+    )
+    assert unsuperseded_failures(log, sessions=SESSIONS).num_rows == 1
+    # An error straddling the calendar start, a later ok covering only the calendar part.
+    log = fetch_log(
+        [
+            ("BBB", date(2023, 12, 1), SESSION_DAYS[3], "error", utc(2024, 1, 20)),
+            ("BBB", SESSION_DAYS[0], SESSION_DAYS[3], "ok", utc(2024, 2, 1)),
+        ]
+    )
+    assert unsuperseded_failures(log, sessions=SESSIONS).num_rows == 1
+    # Same after the calendar end.
+    log = fetch_log(
+        [
+            ("BBB", SESSION_DAYS[5], date(2024, 1, 20), "error", utc(2024, 1, 21)),
+            ("BBB", SESSION_DAYS[5], SESSION_DAYS[8], "ok", utc(2024, 2, 1)),
+        ]
+    )
+    assert unsuperseded_failures(log, sessions=SESSIONS).num_rows == 1
+    # Distant ok ranges outside the calendar stay apart.
+    ids = identifiers([(INST_B, f"{SRC}:BBB", date(2010, 1, 1), None)])
+    log = fetch_log(
+        [
+            ("BBB", date(2015, 1, 1), date(2015, 1, 31), "ok", utc(2024, 2, 1)),
+            ("BBB", date(2019, 6, 1), date(2019, 6, 30), "ok", utc(2024, 2, 1)),
+        ]
+    )
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, sessions=SESSIONS)) == [
+        (INST_B, date(2015, 1, 1), date(2015, 1, 31), "ok"),
+        (INST_B, date(2019, 6, 1), date(2019, 6, 30), "ok"),
+    ]
+
+
+def test_sessions_keep_calendar_adjacency_across_the_calendar_edges():
+    ids = identifiers([(INST_B, f"{SRC}:BBB", date(2010, 1, 1), None)])
+    log = fetch_log(
+        [
+            ("BBB", date(2023, 12, 20), date(2024, 1, 1), "ok", utc(2024, 2, 1)),
+            ("BBB", SESSION_DAYS[0], SESSION_DAYS[8], "ok", utc(2024, 2, 1)),
+            ("BBB", date(2024, 1, 13), date(2024, 1, 20), "ok", utc(2024, 2, 1)),
+        ]
+    )
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF, sessions=SESSIONS)) == [
+        (INST_B, date(2023, 12, 20), date(2024, 1, 20), "ok"),
+    ]
+    # A failed range across the start is superseded by later rows covering it day by day.
+    log = fetch_log(
+        [
+            ("BBB", date(2023, 12, 30), SESSION_DAYS[3], "error", utc(2024, 1, 20)),
+            ("BBB", date(2023, 12, 30), date(2024, 1, 1), "ok", utc(2024, 2, 1)),
+            ("BBB", SESSION_DAYS[0], SESSION_DAYS[3], "empty", utc(2024, 2, 1)),
+        ]
+    )
+    assert unsuperseded_failures(log, sessions=SESSIONS).num_rows == 0
+
+
+def test_untouched_ambiguous_symbol_does_not_raise():
+    ids = identifiers(
+        [
+            (INST_A, f"{SRC}:AAA", date(2024, 1, 1), None),
+            (INST_B, f"{SRC}:AAA", date(2024, 1, 5), None),  # ambiguous, but never fetched
+            (INST_C, f"{SRC}:CCC", date(2024, 1, 1), None),
+        ]
+    )
+    log = fetch_log([("CCC", date(2024, 1, 2), date(2024, 1, 5), "ok", utc(2024, 1, 6))])
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+        (INST_C, date(2024, 1, 2), date(2024, 1, 5), "ok")
+    ]
+    assert ambiguous_mappings(ids) == 1
+    # A "*" row of the source touches every symbol of it: refused.
+    star = fetch_log([("*", date(2024, 1, 2), date(2024, 1, 5), "ok", utc(2024, 1, 6))])
+    with pytest.raises(ValueError, match="ambiguous"):
+        fetch_coverage(star, ids, as_of=AS_OF)
+    # Another source's "*" row does not.
+    other = fetch_log(
+        [("*", date(2024, 1, 2), date(2024, 1, 5), "ok", utc(2024, 1, 6))], source_code="zz"
+    )
+    assert fetch_coverage(other, ids, as_of=AS_OF).num_rows == 0
+
+
+def test_symbol_failure_not_cleared_by_a_later_whole_market_ok():
+    log = fetch_log(
+        [
+            ("BBB", date(2024, 1, 2), date(2024, 1, 5), "error", utc(2024, 1, 6)),
+            ("*", date(2024, 1, 2), date(2024, 1, 5), "ok", utc(2024, 1, 7)),
+        ]
+    )
+    assert unsuperseded_failures(log)["source_symbol"].to_pylist() == ["BBB"]
