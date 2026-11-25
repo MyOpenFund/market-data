@@ -28,6 +28,7 @@ dependencies = [
     "myopenfund-open-data-store[writer,recipes] @ git+https://github.com/MyOpenFund/open-data-store@6b5d399fccd7f13e668fc77bb77c1869a7812141",
     "exchange_calendars>=4.13",
     "httpx>=0.27",
+    "numpy>=1.26",
     "pandas>=2",
     "pyarrow>=17",
 ]

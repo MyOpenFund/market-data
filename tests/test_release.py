@@ -101,3 +101,41 @@ def test_wheel_guard_fails_on_a_direct_reference_in_requires_dist(tmp_path):
 
 def test_wheel_guard_refuses_a_missing_wheel(tmp_path):
     assert _run("--wheel", str(tmp_path / "none.whl")).returncode == 2
+
+
+# import name -> distribution name, for the third-party imports of the package
+_DISTRIBUTIONS = {"open_data_store": "myopenfund-open-data-store"}
+
+
+def test_every_third_party_import_is_a_declared_dependency():
+    import ast
+    import sys
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = {
+        re.split(r"[\s\[<>=!@;~]", dep, maxsplit=1)[0].lower().replace("_", "-")
+        for dep in pyproject["project"]["dependencies"]
+    }
+    imported = set()
+    for path in (ROOT / "src" / "market_data").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".")[0])
+    third_party = imported - set(sys.stdlib_module_names) - {"market_data", "__future__"}
+    missing = {
+        name
+        for name in third_party
+        if _DISTRIBUTIONS.get(name, name).lower().replace("_", "-") not in declared
+    }
+    assert missing == set()
+
+
+def test_ci_actions_are_pinned_by_sha():
+    for name in ("ci.yml", "release.yml"):
+        text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        uses = re.findall(r"uses:\s*(\S+)", text)
+        assert uses, name
+        for ref in uses:
+            assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", ref), (name, ref)
