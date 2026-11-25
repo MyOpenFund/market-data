@@ -1,0 +1,9 @@
+{
+  "export_time": "2020-04-02T18:00:00+00:00",
+  "adjustment": "None",
+  "dates_timezone": "America/New_York",
+  "dividends": "gross",
+  "source_description": "Synthetic history-file export for tests (fake members, fake indices)",
+  "fields": "close, volume, currency, open, high, low",
+  "notes": "AAA split and dividend on 2020-03-02; BBB dead on 2020-02-14; CCC quoted in GBp; EEE on unmapped exchange ZZ"
+}

@@ -55,16 +55,16 @@ drop nothing today). ``counts()`` gives reason -> number of distinct keys, for t
 
 Session opens and the exchange time zone come from ``exchange_calendars`` directly (the version
 open-data-store's ``recipes`` extra pins; declared here with a lower bound only), since
-``sessions`` returns closes only.
+``sessions`` returns closes only; the action ``known_at`` rule lives in ``market_data._calendars``,
+shared with the history-file adapter.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
@@ -72,6 +72,12 @@ import pyarrow.compute as pc
 from open_data_store.contracts.standard.market import CORPORATE_ACTIONS, FETCH_LOG, PRICES
 from open_data_store.market.asof import sessions
 
+from market_data._calendars import (
+    NEXT_SESSION_MARGIN,
+    action_known_at,
+    actions_calendar,
+    check_margin,
+)
 from market_data.adapters.base import (
     FETCH_KINDS,
     RAW_ACTION_SCHEMA,
@@ -99,8 +105,6 @@ ROW_STATUSES = ("ok", "empty", "partial")
 DROP_NON_SESSION = "non_session"
 DROP_INTRADAY_PARTIAL = "intraday_partial"
 DROP_REASONS = (DROP_NON_SESSION, DROP_INTRADAY_PARTIAL)
-# Default calendar margin past the last ex-date, so a non-session ex-date finds its next session.
-NEXT_SESSION_MARGIN = timedelta(days=14)
 
 _RAW_SCHEMAS = {
     "prices": RAW_PRICE_SCHEMA,
@@ -291,45 +295,6 @@ def build_prices(
 # --- corporate actions -------------------------------------------------------------------------
 
 
-def _calendar_errors() -> tuple[type[Exception], ...]:
-    from exchange_calendars import errors as xerrors
-    from pandas.errors import OutOfBoundsDatetime
-
-    return (xerrors.NoSessionsError, xerrors.DateOutOfBounds, OutOfBoundsDatetime)
-
-
-def _calendar(mic: str, start: date, end: date):
-    import exchange_calendars as xcals
-
-    try:
-        with warnings.catch_warnings():
-            # Upstream: exchange_calendars 4.13.2 calls Series.values on tz-aware data while
-            # building a calendar, which pandas 3.1 flags (same filter as asof.sessions).
-            warnings.filterwarnings(
-                "ignore", message="Series.values returning an ndarray", category=Warning
-            )
-            return xcals.get_calendar(mic, start=start.isoformat(), end=end.isoformat())
-    except _calendar_errors() as exc:
-        raise ValueError(
-            f"exchange calendar {mic!r} cannot be built over {start.isoformat()}.."
-            f"{end.isoformat()}: {exc}"
-        ) from exc
-
-
-def _ex_date_open(cal, mic: str, ex: date) -> datetime:
-    """Open in UTC of the ex-date session, or of the next session when ex is not a session."""
-    import pandas as pd
-
-    try:
-        session = cal.date_to_session(pd.Timestamp(ex), direction="next")
-        return cal.session_open(session).to_pydatetime().astimezone(UTC)
-    except _calendar_errors() as exc:
-        raise ValueError(
-            f"exchange calendar {mic!r} has no session on or after ex-date {ex.isoformat()} "
-            f"within the built range (raise next_session_margin): {exc}"
-        ) from exc
-
-
 def build_actions(
     archive: RawArchive,
     adapter: Adapter,
@@ -345,15 +310,12 @@ def build_actions(
     session finds the next session, and the range always holds a session even when the earliest
     ex-date is a weekend or holiday. Calendar failures (out of the library's range, no next
     session inside the margin) are ``ValueError``."""
-    if next_session_margin <= timedelta(0):
-        raise ValueError(f"next_session_margin must be positive, got {next_session_margin}")
+    check_margin(next_session_margin)
     fetches = _rows(archive, adapter, "actions", symbols)
     ex_dates = [r["valid_date"] for _, _, rows in fetches for r in rows]
     cal = None
     if ex_dates:
-        cal = _calendar(
-            mic, min(ex_dates) - next_session_margin, max(ex_dates) + next_session_margin
-        )
+        cal = actions_calendar(mic, ex_dates, next_session_margin)
     last: dict[tuple, tuple] = {}
     out: list[dict[str, Any]] = []
     groups = _observations(
@@ -369,17 +331,9 @@ def build_actions(
             if prior is not None:
                 known_at, kind, basis = fetched_at, "collected", "fetch_time"
             else:
-                ex, announced = r["valid_date"], r["announce_date"]
-                opened = _ex_date_open(cal, mic, ex)
-                first, basis = opened, "ex_date_assumed"
-                if announced is not None:
-                    eod = datetime.combine(announced, time.max, tzinfo=cal.tz).astimezone(UTC)
-                    if eod <= opened:
-                        first, basis = eod, "announce_date"
-                kind = "published"
-                if fetched_at < first:  # the cap binds: the stored known_at is a fetch time
-                    first, kind, basis = fetched_at, "collected", "fetch_time"
-                known_at = first
+                known_at, kind, basis = action_known_at(
+                    cal, mic, r["valid_date"], r["announce_date"], fetched_at
+                )
             last[key] = value
             out.append(
                 {
