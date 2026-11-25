@@ -800,7 +800,8 @@ def store_coverage(
     (strict), ``membership_intervals`` and ``unresolved_members`` (``snapshot_precedence``,
     ``staleness_days``), ``resolve_prices`` (``precedence``), ``quality.fetch_coverage`` of the
     published (prices) fetch log, then ``coverage`` over the sessions from the first membership
-    date to ``as_of``. No membership at all: an empty result that does not pass (the report's
+    date to the last one closed at ``as_of`` (a session still open is left out). No membership
+    (or no closed session) at all: an empty result that does not pass (the report's
     ``coverage_empty``)."""
     inputs = load_market_inputs(
         store, as_of=as_of, allowed_restricted=frozenset(allowed_restricted)
@@ -814,7 +815,13 @@ def store_coverage(
     intervals = membership_intervals(inputs.snapshots, inputs.identifiers, **kw)
     first = pc.min(intervals["valid_from"]).as_py() if intervals.num_rows else None
     last = as_of.astimezone(UTC).date()
-    if first is None or first > last:
+    cal = None
+    if first is not None and first <= last:
+        # only sessions closed at as_of: today's session is not over (nor published) yet
+        cal = sessions(mic, first, last)
+        closed = pc.less_equal(cal["close_utc"], pa.scalar(as_of, cal["close_utc"].type))
+        cal = cal.filter(closed)
+    if cal is None or not cal.num_rows:
         return CoverageResult(
             COVERAGE_PER_MEMBER_SCHEMA.empty_table(),
             COVERAGE_PER_SESSION_SCHEMA.empty_table(),
@@ -824,7 +831,6 @@ def store_coverage(
     resolved = resolve_prices(
         inputs.prices, inputs.identifiers, as_of=as_of, precedence=tuple(precedence)
     )
-    cal = sessions(mic, first, last)
     covered = fetch_coverage(inputs.fetch_log, inputs.identifiers, as_of=as_of, sessions=cal)
     return coverage(
         intervals,

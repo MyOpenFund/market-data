@@ -812,3 +812,19 @@ def test_history_delisting_is_corroborated_by_its_fetch_log(env, run):
     assert (bbb, date(2020, 2, 14)) in {
         (r["instrument_id"], r["exit_date"]) for r in exits.to_pylist()
     }
+
+
+def test_store_coverage_leaves_out_a_session_not_closed_at_as_of(env, run):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    allowed = frozenset({"private_history"})
+    with Store.open(env["cfg"]) as store:
+        for as_of, last in (
+            (datetime(2020, 4, 3, 15, 0, tzinfo=UTC), date(2020, 4, 2)),  # Friday, open
+            (datetime(2020, 4, 3, 20, 0, tzinfo=UTC), date(2020, 4, 3)),  # at the close
+        ):
+            result = pipeline.store_coverage(
+                store, index_code="IDX1", as_of=as_of, allowed_restricted=allowed
+            )
+            assert max(result.per_session["session_date"].to_pylist()) == last
