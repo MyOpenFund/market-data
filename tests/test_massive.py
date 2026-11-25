@@ -18,8 +18,10 @@ from market_data.adapters.base import (
 from market_data.adapters.massive import (
     AMBIGUOUS_ACTION,
     API_KEY_ENV,
+    BAD_CURRENCY,
     BAD_IDENTIFIER,
     BAD_RATIO,
+    BAD_TIMESTAMP,
     BAD_VOLUME,
     BASE_URL,
     CONFLICTING_DUPLICATE,
@@ -29,9 +31,11 @@ from market_data.adapters.massive import (
     KEPT_OUT_REASONS,
     MISSING_FIELD,
     NON_FINITE,
+    NON_POSITIVE_AMOUNT,
     NON_POSITIVE_CLOSE,
     NOT_AN_OBJECT,
     NULL_AMOUNT,
+    SEQ_OVERFLOW,
     UNKNOWN_ADJUSTMENT_TYPE,
     UNKNOWN_DISTRIBUTION_TYPE,
     MassiveAdapter,
@@ -927,3 +931,196 @@ def test_context_manager_closes_the_client():
     with make() as a:
         assert not a._http.is_closed
     assert a._http.is_closed
+
+
+# --- review round 2: out-of-range values never crash; actions deduped by id ---------------------
+
+
+def grouped_raw(raw: bytes) -> FetchResult:
+    return FetchResult("massive", "*", "prices", DAY, DAY, NOW, "ok", raw, "application/json")
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (b'{"results":[{"T":"BBB","c":1,"v":1e30},{"T":"AAA","c":1}]}', BAD_VOLUME),
+        (b'{"results":[{"T":"BBB","c":1,"v":9223372036854775808},{"T":"AAA","c":1}]}', BAD_VOLUME),
+        (b'{"results":[{"T":"BBB","c":1' + b"0" * 400 + b'},{"T":"AAA","c":1}]}', NON_FINITE),
+        (
+            b'{"results":[{"T":"BBB","c":1,"o":-1' + b"0" * 400 + b'},{"T":"AAA","c":1}]}',
+            NON_FINITE,
+        ),
+        (b'{"results":[{"T":"BBB","c":1e400},{"T":"AAA","c":1}]}', NON_FINITE),
+    ],
+)
+def test_out_of_range_numbers_are_kept_out_at_parse_and_fetch(raw, reason):
+    report = make().parse_report(grouped_raw(raw))
+    assert report.table["source_symbol"].to_pylist() == ["AAA"]
+    assert nonzero(report) == {reason: (("BBB", DAY),)}
+    (out,) = make(Recorder([(200, {}, raw)])).fetch("prices", [], DAY, DAY)
+    assert out.status == "ok" and out.payload == raw
+
+
+def test_volume_at_the_int64_bound_is_kept():
+    raw = b'{"results":[{"T":"AAA","c":1,"v":9223372036854775807}]}'
+    assert make().parse(grouped_raw(raw))["volume"].to_pylist() == [2**63 - 1]
+
+
+@pytest.mark.parametrize("stamp", [1e20, -1e20, 9e15, -3e12])
+def test_bar_timestamp_out_of_range_is_kept_out(stamp):
+    body = {"results": [{"c": 1, "t": stamp}, {"c": 2, "t": 1795064400000}]}
+    report = make().parse_report(result("prices", body, symbol="AAA", frm=DAY, to=DAY))
+    assert report.table["close"].to_pylist() == [2.0]
+    assert nonzero(report) == {BAD_TIMESTAMP: (("AAA", None),)}
+    rec = Recorder([ok(body)])
+    (out,) = make(rec).fetch("prices", ["AAA"], date(2026, 11, 19), DAY)
+    assert out.status == "ok"
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [BASE_URL + "/x\x00y", BASE_URL + "/" + "a" * 70000],
+)
+def test_unexpected_failure_is_an_error_row_and_a_massive_error(next_url):
+    page = {"status": "OK", "results": [div("AAA", 1.0)], "next_url": next_url}
+    it = make(Recorder([ok(page)])).fetch("actions", [], DAY, DAY)
+    failed = next(it)
+    assert (failed.status, failed.payload) == ("error", ERROR_PAYLOAD)
+    with pytest.raises(MassiveError, match="InvalidURL") as exc:
+        next(it)
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+
+
+def test_any_exception_in_a_fetch_is_logged_as_error(monkeypatch):
+    a = make(Recorder([ok(fixture("grouped_daily.json"))]))
+
+    def boom(result):
+        raise KeyError(f"payload detail {FAKE_KEY}")
+
+    monkeypatch.setattr(a, "parse_report", boom)
+    it = a.fetch("prices", [], DAY, DAY)
+    assert next(it).status == "error"
+    with pytest.raises(MassiveError, match="fetch failed: KeyError") as exc:
+        next(it)
+    assert FAKE_KEY not in str(exc.value)
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+
+
+def test_rows_sharing_a_vendor_id_are_deduped():
+    same = div("AAA", 1.0, "recurring", id="x1")
+    report = make().parse_report(result("actions", {"results": [same, dict(same)]}))
+    assert [(r["action_seq"], r["amount"]) for r in report.table.to_pylist()] == [(0, 1.0)]
+    assert nonzero(report) == {DUPLICATE_ROW: (("AAA", DAY),)}
+    rows = [div("AAA", 1.0, id="x1"), div("AAA", 2.0, id="x1"), div("AAA", 3.0, id="x2")]
+    report = make().parse_report(result("actions", {"results": rows}))
+    # the conflicting id keeps its slot: x2 stays seq 1 whatever the vendor repairs later
+    assert [(r["action_seq"], r["amount"]) for r in report.table.to_pylist()] == [(1, 3.0)]
+    assert nonzero(report) == {CONFLICTING_DUPLICATE: (("AAA", DAY),)}
+    assert report.row_counts[CONFLICTING_DUPLICATE] == 2
+
+
+def test_kept_out_action_keeps_its_seq_slot(tmp_path):
+    bad = div("AAA", None, id="a")
+    good = div("AAA", 2.0, id="b")
+    report = make().parse_report(result("actions", {"results": [good, bad]}))
+    assert [(r["action_seq"], r["amount"]) for r in report.table.to_pylist()] == [(1, 2.0)]
+    assert nonzero(report) == {NULL_AMOUNT: (("AAA", DAY),)}
+    # the vendor repairs the lower-id row the next night: b keeps its identity
+    arc = RawArchive(tmp_path / "arc")
+    for night, rows in (
+        (NOW, [bad, good]),
+        (NOW + timedelta(days=1), [{**bad, "cash_amount": 1.0}, good]),
+    ):
+        payload = json.dumps({"results": rows}).encode()
+        arc.put(FetchResult("massive", "*", "actions", DAY, DAY, night, "ok", payload, "x/json"))
+    built = build_actions(arc, make(), None).table.to_pylist()
+    assert sorted((r["action_seq"], r["amount"], r["known_at_kind"]) for r in built) == [
+        (0, 1.0, "published"),  # first sighting of the repaired row
+        (1, 2.0, "published"),  # unchanged: never re-emitted under a new seq
+    ]
+    assert len(built) == 2
+
+
+def test_action_seq_overflow_is_kept_out():
+    rows = [div("AAA", 1.0, id=f"{i:06d}") for i in range(2**15 + 2)]
+    report = make().parse_report(result("actions", {"results": rows}))
+    assert report.table.num_rows == 2**15
+    assert report.row_counts[SEQ_OVERFLOW] == 2
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "reason", "kept"),
+    [
+        (0, "USD", NON_POSITIVE_AMOUNT, None),
+        (-1.0, "USD", NON_POSITIVE_AMOUNT, None),
+        (1.0, " usd ", None, "USD"),
+        (1.0, "GBp", BAD_CURRENCY, None),
+        (1.0, "GBX", BAD_CURRENCY, None),
+        (1.0, "US", BAD_CURRENCY, None),
+        (1.0, "US D", BAD_CURRENCY, None),
+    ],
+)
+def test_dividend_amount_and_currency(amount, currency, reason, kept):
+    row = div("AAA", amount, "recurring", currency=currency)
+    report = make().parse_report(result("actions", {"results": [row]}))
+    assert report.table["currency"].to_pylist() == ([kept] if kept else [])
+    assert nonzero(report) == ({reason: (("AAA", DAY),)} if reason else {})
+
+
+@pytest.mark.parametrize("value", ["20261120", "2026-11-20T00:00:00Z", "2026-W47-5"])
+def test_only_plain_iso_dates_are_dates(value):
+    report = make().parse_report(
+        result("actions", {"results": [div("AAA", 1.0, ex_dividend_date=value)]})
+    )
+    assert report.table.num_rows == 0 and nonzero(report) == {MISSING_FIELD: (("AAA", None),)}
+
+
+def test_null_date_of_the_other_kind_is_not_ambiguous():
+    row = split("AAA", 1, 2, ex_dividend_date=None)
+    report = make().parse_report(result("actions", {"results": [row]}))
+    assert report.table["action_type"].to_pylist() == ["split"] and nonzero(report) == {}
+
+
+def test_symbols_ticker_stripped_consistently():
+    rows = [{"ticker": " BBB ", "cik": "12"}]
+    table = make().parse(result("symbols", {"results": rows}))
+    assert [(r["source_symbol"], r["id_scheme"], r["id_value"]) for r in table.to_pylist()] == [
+        ("BBB", "ticker", "BBB"),
+        ("BBB", "cik", "0000000012"),
+    ]
+
+
+def test_delisted_out_of_range_is_kept_out():
+    rows = [{"ticker": "A", "delisted_utc": "9999-12-31T00:00:00Z"},
+            {"ticker": "B", "delisted_utc": "0001-01-01T00:00:00+05:00"}]  # fmt: skip
+    report = make().parse_report(result("symbols", {"results": rows}))
+    assert report.table.num_rows == 0
+    assert nonzero(report) == {MISSING_FIELD: (("A", None), ("B", None))}
+
+
+def test_self_referencing_next_url_stops():
+    page = {"status": "OK", "results": [div("AAA", 1.0)],
+            "next_url": BASE_URL + "/stocks/v1/dividends?cursor=x"}  # fmt: skip
+    rec = Recorder(answer=lambda r: httpx.Response(200, json=page))
+    it = make(rec).fetch("actions", [], DAY, DAY)
+    assert next(it).status == "error"
+    with pytest.raises(MassiveError, match="repeats"):
+        next(it)
+    assert len(rec.requests) == 2
+
+
+def test_max_pages_bounds_a_list():
+    counter = iter(range(100))
+
+    def endless(request):
+        nxt = f"{BASE_URL}/stocks/v1/dividends?cursor={next(counter)}"
+        return httpx.Response(200, json={"results": [], "next_url": nxt})
+
+    rec = Recorder(answer=endless)
+    it = make(rec, max_pages=3).fetch("actions", [], DAY, DAY)
+    assert next(it).status == "error"
+    with pytest.raises(MassiveError, match="max_pages"):
+        next(it)
+    assert len(rec.requests) == 3
+    with pytest.raises(ValueError, match="max_pages"):
+        make(max_pages=0)

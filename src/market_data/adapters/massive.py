@@ -30,7 +30,8 @@ follows ``next_url`` exactly as Massive gives it and is yielded as ONE FetchResu
 its pages arrived, its payload one merged JSON object ``{"status": "OK", "results": [...]}``
 (plus ``"adjusted": false`` for aggregates), the rows of every page in page order; the raw page
 bytes are not kept. A ``next_url`` on another scheme or host than ``base_url`` is refused, so the
-key never leaves for another server.
+key never leaves for another server; a ``next_url`` repeating a page already fetched, or a list
+longer than ``max_pages`` (default 1000) pages, is a failure (no runaway cursor).
 
 Failures are logged (rulings 68, 69): when a request fails (after the bounded retries), or an
 answer is unusable as a whole (not JSON, ``status: ERROR``, ``results`` not a list, prices
@@ -38,6 +39,9 @@ flagged ``adjusted: true``), ``fetch`` yields a FetchResult with status ``error`
 requested range and the payload ``ERROR_PAYLOAD`` (``{"results": []}``), then raises
 ``MassiveError``: the fetch log records the failure, nothing is ever archived as ``ok`` that
 ``parse`` would refuse (``fetch`` runs ``parse_report`` on each payload before yielding it).
+Any other exception while fetching (an invalid URL, a bug) takes the same path: an ``error``
+FetchResult, then a ``MassiveError`` naming the exception type only (no ``__cause__`` or
+``__context__``, whose text could hold a URL or payload data).
 
 Key and quota (spec §8.3: respected, never worked around)
     The key comes from ``MASSIVE_API_KEY`` (``from_env``), is held in a ``Secret`` and sent only
@@ -65,16 +69,25 @@ Parse (``parse`` / ``parse_report``)
     currency ``USD``.
     dividends → ``RAW_ACTION_SCHEMA``: ``ex_dividend_date`` → valid_date, ``declaration_date`` →
     announce_date, ``record_date``, ``pay_date``, raw ``cash_amount`` (never
-    ``split_adjusted_cash_amount``) → amount, ``currency``; ``distribution_type`` ``recurring`` →
+    ``split_adjusted_cash_amount``) → amount, ``currency`` stripped and upper-cased (3 letters,
+    never a minor unit: ``GBp``-style as given, ``GBX``, ``ZAX``, ``ILA``); ``distribution_type``
+    ``recurring`` →
     ``cash_dividend_regular``, ``special``/``supplemental``/``irregular`` →
     ``cash_dividend_special``. ``source_action_type`` = the raw type.
     splits → ``execution_date`` → valid_date, ``split_from`` → ratio_old, ``split_to`` →
     ratio_new; ``adjustment_type`` ``forward_split``/``reverse_split`` → ``split``,
     ``stock_dividend`` → ``stock_dividend``.
-    A row is a dividend when it has ``ex_dividend_date``, a split when it has ``execution_date``.
-    action_seq: the rows are first sorted by the vendor's stable ``id`` (rows without one after,
-    by all their fields), then numbered from 0 per (symbol, ex-date, action_type), so page
-    boundaries and a vendor reordering from one night to the next never change an identity.
+    A row is a dividend when its ``ex_dividend_date`` is not null, a split when its
+    ``execution_date`` is not null. Dates are plain ``YYYY-MM-DD`` only.
+    action_seq: the rows are first sorted by the vendor's stable ``id`` (as text; rows without
+    one after, by all their fields) and rows sharing one ``id`` are one vendor action
+    (identical: kept once, ``duplicate_row``; different: all kept out,
+    ``conflicting_duplicate``); then numbered from 0 per (symbol, ex-date, action_type), so page
+    boundaries and a vendor reordering from one night to the next never change an identity. A
+    row kept out once its identity is known (symbol, ex-date and a known type: bad amount,
+    currency, ratio, date, or a conflicting id) still takes its slot, so a later vendor repair of
+    a lower-id row does not shift the others; a row of unknown type takes none. A seq beyond the
+    int16 column is kept out (``seq_overflow``).
     symbols → ``RAW_SYMBOL_SCHEMA``: per ticker one row per present scheme among ``ticker``,
     ``composite_figi``, ``share_class_figi``, ``cik`` (zero-padded to 10 digits), with ``name``;
     valid_date = ``list_date`` when present, else null; valid_to = the UTC calendar date of
@@ -83,17 +96,22 @@ Parse (``parse`` / ``parse_report``)
 Kept out, never blocking (ruling 69): a bad row never blocks a source. It is kept out and
 counted under a reason: ``not_an_object``; ``missing_field`` (a required field absent, of the
 wrong type or not a valid date: ``T``/``t``/``c``, ``ticker``, the ex-date, the currency of a
-dividend, a ``list_date``/``delisted_utc``); ``non_finite`` (NaN or infinite number);
-``non_positive_close``; ``bad_volume`` (not a non-negative integer); ``bad_ratio`` (a split
-ratio null, zero or negative); ``null_amount`` (a dividend without ``cash_amount``);
+dividend, a ``list_date``/``delisted_utc``, including one out of the calendar's range);
+``non_finite`` (NaN, infinite, or beyond the float range); ``non_positive_close``;
+``bad_volume`` (not an integer in ``0..MAX_VOLUME``, the int64 column); ``bad_timestamp`` (a bar
+``t`` outside ``TIMESTAMP_RANGE``); ``bad_ratio`` (a split ratio null, zero or negative);
+``null_amount`` (a dividend without ``cash_amount``); ``non_positive_amount`` (zero or negative);
+``bad_currency``; ``seq_overflow``;
 ``ambiguous_action`` (both an ex-dividend and an execution date); ``unknown_distribution_type``
 and ``unknown_adjustment_type`` (any other or missing type: never guessed); for prices,
 ``duplicate_row`` (an exact repeat of a (symbol, date) bar, kept once) and
 ``conflicting_duplicate`` (one (symbol, date) with different values: every such bar out, since
-there is no honest choice); for symbols, ``bad_identifier`` (that one scheme dropped, the
-ticker's other schemes kept). ``parse_report`` returns ``kept_out``: reason -> sorted tuple of
-distinct ``(source_symbol, valid_date)`` KEYS (the builder's drop-count shape; ``""`` / None
-where the row has no symbol / date), ``counts()`` the number of distinct keys per reason and
+there is no honest choice; for actions, the same per vendor ``id``); for symbols,
+``bad_identifier`` (that one scheme dropped, the ticker's other schemes kept; the ticker is
+stripped, the same in source_symbol and id_value). ``parse_report`` returns ``kept_out``:
+reason -> sorted tuple of distinct ``(source_symbol, valid_date)`` KEYS (the builder's
+drop-count shape; ``""`` / None where the row has no symbol / date), ``counts()`` the number of
+distinct keys per reason and
 ``row_counts`` the number of rows per reason. Only a payload unusable as a whole raises
 ``ValueError``.
 """
@@ -132,13 +150,16 @@ __all__ = [
     "AGGS_LIMIT",
     "AMBIGUOUS_ACTION",
     "API_KEY_ENV",
+    "BAD_CURRENCY",
     "BAD_IDENTIFIER",
     "BAD_RATIO",
+    "BAD_TIMESTAMP",
     "BAD_VOLUME",
     "BASE_URL",
     "CONFLICTING_DUPLICATE",
     "DEFAULT_BACKOFF_S",
     "DEFAULT_MAX_HISTORY_DAYS",
+    "DEFAULT_MAX_PAGES",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_WAIT_S",
     "DEFAULT_TIMEOUT_S",
@@ -148,14 +169,19 @@ __all__ = [
     "FREE_PLAN_RPM",
     "KEPT_OUT_REASONS",
     "LIST_LIMIT",
+    "MAX_VOLUME",
+    "MINOR_UNIT_CURRENCIES",
     "MISSING_FIELD",
     "NON_FINITE",
+    "NON_POSITIVE_AMOUNT",
     "NON_POSITIVE_CLOSE",
     "NOT_AN_OBJECT",
     "NULL_AMOUNT",
+    "SEQ_OVERFLOW",
     "SOURCE_CODE",
     "SPLIT_TYPES",
     "TICKERS_LIMIT",
+    "TIMESTAMP_RANGE",
     "UNKNOWN_ADJUSTMENT_TYPE",
     "UNKNOWN_DISTRIBUTION_TYPE",
     "MassiveAdapter",
@@ -173,6 +199,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_S = 15.0
 DEFAULT_MAX_WAIT_S = 300.0
 DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_MAX_PAGES = 1000  # pages of one list before giving up (a runaway next_url)
 DEFAULT_MAX_HISTORY_DAYS = 730  # the free plan's 2-year window
 AGGS_LIMIT = 50000  # documented maximum of the aggregates endpoint
 LIST_LIMIT = 5000  # documented maximum of /stocks/v1/dividends and /stocks/v1/splits
@@ -186,6 +213,15 @@ _MINUTE_S = 60.0
 _CIK_WIDTH = 10
 _KEY_CHARS = re.compile(r"[\x21-\x7e]+")  # visible ASCII: what an HTTP header can carry
 _STATUS_WORD = re.compile(r"[A-Z_]{1,32}")
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_CURRENCY = re.compile(r"[A-Z]{3}")
+_MINOR_UNIT_GIVEN = re.compile(r"[A-Z]{2}[a-z]")  # GBp, ZAc, ILa: minor units as given
+MAX_VOLUME = 2**63 - 1  # int64, the volume column
+MAX_SEQ = 2**15 - 1  # int16, the action_seq column
+# Minor-unit codes (pence, cents, agorot) a per-share amount must never be read in.
+MINOR_UNIT_CURRENCIES = frozenset({"GBX", "ZAX", "ILA"})
+# Bar timestamps outside this range (UTC) are not dates of a daily bar (``bad_timestamp``).
+TIMESTAMP_RANGE = (datetime(1900, 1, 1, tzinfo=UTC), datetime(2200, 1, 1, tzinfo=UTC))
 
 DIVIDEND_TYPES = {
     "recurring": "cash_dividend_regular",
@@ -205,6 +241,10 @@ NON_POSITIVE_CLOSE = "non_positive_close"
 BAD_VOLUME = "bad_volume"
 BAD_RATIO = "bad_ratio"
 NULL_AMOUNT = "null_amount"
+NON_POSITIVE_AMOUNT = "non_positive_amount"
+BAD_CURRENCY = "bad_currency"
+BAD_TIMESTAMP = "bad_timestamp"
+SEQ_OVERFLOW = "seq_overflow"
 AMBIGUOUS_ACTION = "ambiguous_action"
 UNKNOWN_DISTRIBUTION_TYPE = "unknown_distribution_type"
 UNKNOWN_ADJUSTMENT_TYPE = "unknown_adjustment_type"
@@ -219,6 +259,10 @@ KEPT_OUT_REASONS = (
     BAD_VOLUME,
     BAD_RATIO,
     NULL_AMOUNT,
+    NON_POSITIVE_AMOUNT,
+    BAD_CURRENCY,
+    BAD_TIMESTAMP,
+    SEQ_OVERFLOW,
     AMBIGUOUS_ACTION,
     UNKNOWN_DISTRIBUTION_TYPE,
     UNKNOWN_ADJUSTMENT_TYPE,
@@ -266,9 +310,17 @@ class ParseReport:
 class _KeptOut(Exception):
     """One row kept out of a parse (internal control flow, never escapes)."""
 
-    def __init__(self, reason: str, symbol: str = "", day: date | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        symbol: str = "",
+        day: date | None = None,
+        action_type: str | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason, self.key = reason, (symbol, day)
+        # the action identity, once known: a kept-out action still takes its action_seq slot
+        self.ident = (symbol, day, action_type) if action_type and day else None
 
 
 class _Tally:
@@ -310,6 +362,7 @@ class MassiveAdapter:
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         max_retries: int = DEFAULT_MAX_RETRIES,
+        max_pages: int = DEFAULT_MAX_PAGES,
         backoff_s: float = DEFAULT_BACKOFF_S,
         max_wait_s: float = DEFAULT_MAX_WAIT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
@@ -320,6 +373,8 @@ class MassiveAdapter:
             raise ValueError(f"rpm must be in 1..{FREE_PLAN_RPM} (the free plan), got {rpm}")
         if max_retries < 0 or backoff_s <= 0 or max_wait_s <= 0:
             raise ValueError("max_retries must be >= 0, backoff_s and max_wait_s > 0")
+        if max_pages <= 0:
+            raise ValueError(f"max_pages must be > 0, got {max_pages}")
         if max_history_days is not None and max_history_days <= 0:
             raise ValueError(f"max_history_days must be > 0 or None, got {max_history_days}")
         self.info = _info()
@@ -330,6 +385,7 @@ class MassiveAdapter:
         self.exchange_tz = ZoneInfo(exchange_tz)
         self.max_history_days = max_history_days
         self.max_retries = max_retries
+        self.max_pages = max_pages
         self.backoff_s = backoff_s
         self.max_wait_s = max_wait_s
         self._interval = _MINUTE_S / rpm
@@ -486,18 +542,19 @@ class MassiveAdapter:
         try:
             payload, body = request()
             result = self._result(symbol, kind, start, end, payload, body)
-            try:
-                self.parse_report(result)
-            except ValueError as exc:
-                message = f"Massive {kind} answer refused: {exc}"
-                failure = MassiveError(message)
+            self.parse_report(result)
         except MassiveError as exc:
             failure = exc
+        except ValueError as exc:  # parse_report: the payload is unusable as a whole
+            failure = MassiveError(f"Massive {kind} answer refused: {exc}")
+        except Exception as exc:  # noqa: BLE001 - any failure is logged as an error fetch
+            # the type only: an unexpected exception's text may hold a URL or payload data
+            failure = MassiveError(f"Massive {kind} fetch failed: {type(exc).__name__}")
         if failure is None:
             yield result
             return
         yield self._result(symbol, kind, start, end, ERROR_PAYLOAD, None)
-        failure.__context__ = None
+        failure.__context__ = failure.__cause__ = None
         raise failure
 
     def _result(
@@ -532,7 +589,11 @@ class MassiveAdapter:
         into one JSON object."""
         rows: list[Any] = []
         page: tuple[str, Mapping[str, str] | None] | None = (url, params)
+        seen: set[str] = set()
         while page is not None:
+            if len(seen) >= self.max_pages:
+                raise MassiveError(f"Massive list longer than max_pages ({self.max_pages})")
+            seen.add(page[0])
             _, body = self._get(*page)
             results = body.get("results")
             if results is not None and not isinstance(results, list):
@@ -547,6 +608,8 @@ class MassiveAdapter:
                 page = None
             elif not isinstance(nxt, str) or _origin(nxt) != self._origin:
                 raise MassiveError("Massive next_url points outside base_url; refused")
+            elif nxt in seen:
+                raise MassiveError("Massive next_url repeats a page already fetched; refused")
             else:
                 page = (nxt, None)
         merged: dict[str, Any] = {"status": "OK", "results": rows}
@@ -655,6 +718,9 @@ class MassiveAdapter:
             stamp = _number(row.get("t"), symbol, None)
             if stamp is None:
                 raise _KeptOut(MISSING_FIELD, symbol)
+            low, high = TIMESTAMP_RANGE
+            if not low.timestamp() * 1000 <= stamp < high.timestamp() * 1000:
+                raise _KeptOut(BAD_TIMESTAMP, symbol)
             day = datetime.fromtimestamp(stamp / 1000, UTC).astimezone(self.exchange_tz).date()
         close = _number(row.get("c"), symbol, day)
         if close is None:
@@ -684,14 +750,28 @@ class MassiveAdapter:
         objects.sort(key=_stable_order)
         seq: dict[tuple[str, date, str], int] = {}
         out = []
-        for row in objects:
+        for group in _by_vendor_id(objects):
+            row, conflicting = group[0], any(r != group[0] for r in group[1:])
             try:
                 action = self._action(row)
+                ident = (action["source_symbol"], action["valid_date"], action["action_type"])
             except _KeptOut as kept:
-                tally.add(kept.reason, kept.key)
+                action, ident = None, kept.ident
+                if not conflicting:
+                    tally.add(kept.reason, kept.key)
+            if ident is not None:  # one vendor action, one slot, kept or not
+                seq[ident] = seq.get(ident, -1) + 1
+            if conflicting:
+                for r in group:
+                    tally.add(CONFLICTING_DUPLICATE, _row_key(r))
                 continue
-            ident = (action["source_symbol"], action["valid_date"], action["action_type"])
-            seq[ident] = seq.get(ident, -1) + 1
+            for r in group[1:]:
+                tally.add(DUPLICATE_ROW, _row_key(r))
+            if action is None or ident is None:
+                continue
+            if seq[ident] > MAX_SEQ:
+                tally.add(SEQ_OVERFLOW, (ident[0], ident[1]))
+                continue
             out.append({**action, "action_seq": seq[ident]})
         return tally.report(pa.Table.from_pylist(out, schema=RAW_ACTION_SCHEMA))
 
@@ -699,7 +779,8 @@ class MassiveAdapter:
         symbol = row.get("ticker")
         if not isinstance(symbol, str) or not symbol:
             raise _KeptOut(MISSING_FIELD)
-        is_dividend, is_split = "ex_dividend_date" in row, "execution_date" in row
+        is_dividend = row.get("ex_dividend_date") is not None
+        is_split = row.get("execution_date") is not None
         if is_dividend and is_split:
             raise _KeptOut(AMBIGUOUS_ACTION, symbol, _date(row["ex_dividend_date"], symbol))
         if not (is_dividend or is_split):
@@ -719,12 +800,25 @@ class MassiveAdapter:
             action_type = DIVIDEND_TYPES.get(raw) if isinstance(raw, str) else None
             if action_type is None:
                 raise _KeptOut(UNKNOWN_DISTRIBUTION_TYPE, symbol, day)
-            amount = _number(row.get("cash_amount"), symbol, day)
+            try:
+                amount = _number(row.get("cash_amount"), symbol, day)
+            except _KeptOut as kept:
+                raise _KeptOut(kept.reason, symbol, day, action_type) from None
             if amount is None:
-                raise _KeptOut(NULL_AMOUNT, symbol, day)
-            currency = row.get("currency")
-            if not isinstance(currency, str) or not currency.strip():
-                raise _KeptOut(MISSING_FIELD, symbol, day)
+                raise _KeptOut(NULL_AMOUNT, symbol, day, action_type)
+            if amount <= 0:
+                raise _KeptOut(NON_POSITIVE_AMOUNT, symbol, day, action_type)
+            given = row.get("currency")
+            if not isinstance(given, str) or not given.strip():
+                raise _KeptOut(MISSING_FIELD, symbol, day, action_type)
+            given = given.strip()
+            currency = given.upper()
+            if (
+                _MINOR_UNIT_GIVEN.fullmatch(given)
+                or not _CURRENCY.fullmatch(currency)
+                or currency in MINOR_UNIT_CURRENCIES
+            ):
+                raise _KeptOut(BAD_CURRENCY, symbol, day, action_type)
             dates = {}
             for column, name in (
                 ("announce_date", "declaration_date"),
@@ -735,14 +829,14 @@ class MassiveAdapter:
                 try:
                     dates[column] = None if value in (None, "") else _date(value, symbol)
                 except _KeptOut:
-                    raise _KeptOut(MISSING_FIELD, symbol, day) from None
+                    raise _KeptOut(MISSING_FIELD, symbol, day, action_type) from None
             return {
                 **common,
                 **dates,
                 "action_type": action_type,
                 "source_action_type": raw,
                 "amount": amount,
-                "currency": currency.strip(),
+                "currency": currency,
             }
         raw = row.get("adjustment_type")
         action_type = SPLIT_TYPES.get(raw) if isinstance(raw, str) else None
@@ -750,14 +844,14 @@ class MassiveAdapter:
             raise _KeptOut(UNKNOWN_ADJUSTMENT_TYPE, symbol, day)
         ratios = []
         for name in ("split_from", "split_to"):
-            value = row.get(name)
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise _KeptOut(BAD_RATIO, symbol, day)
-            if not math.isfinite(value):
-                raise _KeptOut(NON_FINITE, symbol, day)
-            if value <= 0:
-                raise _KeptOut(BAD_RATIO, symbol, day)
-            ratios.append(float(value))
+            try:
+                ratio = _number(row.get(name), symbol, day)
+            except _KeptOut as kept:
+                reason = NON_FINITE if kept.reason == NON_FINITE else BAD_RATIO
+                raise _KeptOut(reason, symbol, day, action_type) from None
+            if ratio is None or ratio <= 0:
+                raise _KeptOut(BAD_RATIO, symbol, day, action_type)
+            ratios.append(ratio)
         return {
             **common,
             "action_type": action_type,
@@ -816,6 +910,36 @@ def _stable_order(row: dict[str, Any]) -> tuple:
     return (1, "", json.dumps(row, sort_keys=True, default=str))
 
 
+def _by_vendor_id(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Rows (already in stable order) grouped by vendor id; a row without an id is alone."""
+    groups: list[list[dict[str, Any]]] = []
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        ident = row.get("id")
+        if isinstance(ident, str | int) and not isinstance(ident, bool):
+            if str(ident) in by_id:
+                by_id[str(ident)].append(row)
+                continue
+            by_id[str(ident)] = [row]
+            groups.append(by_id[str(ident)])
+        else:
+            groups.append([row])
+    return groups
+
+
+def _row_key(row: dict[str, Any]) -> Key:
+    """Best-effort (symbol, ex-date) of an action row, for counting."""
+    symbol = row.get("ticker") if isinstance(row.get("ticker"), str) else ""
+    for name in ("ex_dividend_date", "execution_date"):
+        value = row.get(name)
+        if isinstance(value, str) and _ISO_DATE.fullmatch(value):
+            try:
+                return symbol, date.fromisoformat(value)
+            except ValueError:
+                break
+    return symbol, None
+
+
 def _retry_after(response: httpx.Response) -> float | None:
     raw = response.headers.get("Retry-After", "").strip()
     try:
@@ -830,9 +954,13 @@ def _number(value: Any, symbol: str, day: date | None) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _KeptOut(MISSING_FIELD, symbol, day)
-    if not math.isfinite(value):
+    try:
+        number = float(value)  # an integer beyond the float range overflows
+    except OverflowError:
+        raise _KeptOut(NON_FINITE, symbol, day) from None
+    if not math.isfinite(number):
         raise _KeptOut(NON_FINITE, symbol, day)
-    return float(value)
+    return number
 
 
 def _volume(value: Any, symbol: str, day: date | None) -> int | None:
@@ -840,16 +968,19 @@ def _volume(value: Any, symbol: str, day: date | None) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _KeptOut(BAD_VOLUME, symbol, day)
-    if not math.isfinite(value):
-        raise _KeptOut(NON_FINITE, symbol, day)
-    if value != int(value) or value < 0:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _KeptOut(NON_FINITE, symbol, day)
+        if not value.is_integer():
+            raise _KeptOut(BAD_VOLUME, symbol, day)
+    if not 0 <= value <= MAX_VOLUME:
         raise _KeptOut(BAD_VOLUME, symbol, day)
     return int(value)
 
 
 def _date(value: Any, symbol: str) -> date | None:
     """A ``YYYY-MM-DD`` date; anything else is a ``missing_field``."""
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not _ISO_DATE.fullmatch(value):
         raise _KeptOut(MISSING_FIELD, symbol)
     try:
         return date.fromisoformat(value)
@@ -886,6 +1017,7 @@ def _symbols(rows: list[Any]) -> ParseReport:
         if not isinstance(symbol, str) or not symbol.strip():
             tally.add(MISSING_FIELD, ("", None))
             continue
+        symbol = symbol.strip()  # the same in source_symbol and the ticker id_value
         try:
             listed = row.get("list_date")
             valid_date = None if listed in (None, "") else _date(listed, symbol)
@@ -896,11 +1028,11 @@ def _symbols(rows: list[Any]) -> ParseReport:
                     raise _KeptOut(MISSING_FIELD, symbol)
                 try:
                     stamp = datetime.fromisoformat(delisted.replace("Z", "+00:00"))
-                except ValueError:
+                    if stamp.tzinfo is not None:
+                        stamp = stamp.astimezone(UTC)
+                    valid_to = stamp.date() + timedelta(days=1)
+                except (ValueError, OverflowError):
                     raise _KeptOut(MISSING_FIELD, symbol) from None
-                if stamp.tzinfo is not None:
-                    stamp = stamp.astimezone(UTC)
-                valid_to = stamp.date() + timedelta(days=1)
         except _KeptOut as kept:
             tally.add(kept.reason, kept.key)
             continue
