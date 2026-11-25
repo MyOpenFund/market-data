@@ -1619,3 +1619,20 @@ def test_labels_of_an_answer_not_applied_never_land_on_the_kept_instrument(case)
     assert LABEL_ANSWER_NOT_APPLIED == "answer_not_applied"
     m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
     assert resolve(m, "massive:ABC", date(2012, 1, 3)) == x  # the published window kept
+
+
+def test_dated_observation_beats_a_stale_undated_one():
+    # an old archived symbols fetch (active then, undated) next to a newer one (delisted)
+    obs = observations(
+        ob("massive", "ABC", "composite_figi", CX),
+        ob("massive", "ABC", "composite_figi", CX, None, date(2024, 4, 16)),
+    )
+    result = build(
+        obs, spans=spans(("massive", "ABC", date(2024, 1, 2), date(2024, 9, 13))),
+        load_time=datetime(2024, 9, 16, tzinfo=UTC),
+    )  # fmt: skip
+    x = instrument_of(result.identifiers, CX)
+    m = symbol_mappings(result.identifiers)
+    assert resolve(m, "massive:ABC", date(2024, 3, 1)) == x
+    assert resolve(m, "massive:ABC", date(2024, 9, 2)) is None  # never spliced past the end
+    assert report(result.unresolved)[("massive", "ABC")]["reason"] == "uncovered_span"

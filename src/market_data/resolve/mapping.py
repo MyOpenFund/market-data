@@ -717,7 +717,12 @@ def _gap(windows: Iterable[tuple[date, date | None]], first: date, end: date | N
 
 
 def _merge(windows: Iterable[Window]) -> list[Window]:
-    """One composite's observation windows, overlapping or touching ones merged."""
+    """One composite's observation windows, overlapping or touching ones merged. An undated
+    observation (no start, no end: "seen", nothing more) never widens a dated one: next to a
+    window with an end it is a stale sighting (an archived answer from before the end)."""
+    windows = list(windows)
+    if any(end is not None for _, end in windows):
+        windows = [w for w in windows if w != (None, None)]
     out: list[Window] = []
     for start, end in sorted(windows, key=lambda w: w[0] or date.min):
         if out and (out[-1][1] is None or (start or date.min) <= out[-1][1]):

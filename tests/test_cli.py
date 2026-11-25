@@ -722,3 +722,29 @@ def test_map_takes_a_history_load_and_archived_massive_symbols(env, run, monkeyp
         values = set(store.read_asof("instrument_identifiers")["id_value"].to_pylist())
     assert "massive:AAA" in values  # the provider series mapped next to the history's
     assert any(v.startswith("private_history:") for v in values)
+
+
+def test_archive_observations_latest_fetch_wins_per_label():
+    from market_data.adapters.base import FetchResult
+    from market_data.adapters.massive import MassiveAdapter
+    from market_data.archive import MemoryArchive
+
+    def tickers(row):
+        return json.dumps({"status": "OK", "results": [row]}).encode()
+
+    base = {"ticker": "ABC", "market": "stocks", "composite_figi": "BBG000SYNX01"}
+    archive = MemoryArchive()
+    for at, row in (
+        (datetime(2024, 3, 1, tzinfo=UTC), {**base, "active": True}),
+        (datetime(2024, 5, 1, tzinfo=UTC), {**base, "active": False,
+                                             "delisted_utc": "2024-04-15T00:00:00Z"}),
+    ):  # fmt: skip
+        archive.put(
+            FetchResult("massive", "*", "symbols", None, None, at, "ok", tickers(row), "a/json")
+        )
+    obs = pipeline.archive_observations(archive, MassiveAdapter("k"))
+    rows = obs.to_pylist()
+    assert [(r["id_scheme"], r["valid_to"]) for r in rows] == [
+        ("ticker", date(2024, 4, 16)),
+        ("composite_figi", date(2024, 4, 16)),
+    ]

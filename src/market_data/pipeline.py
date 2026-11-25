@@ -489,16 +489,32 @@ def _with_source(table: pa.Table, code: str) -> pa.Table:
 
 def archive_observations(archive: RawArchive, adapter: Adapter) -> pa.Table | None:
     """Identifier observations of the source's archived ``symbols`` fetches
-    (``mapping.OBSERVATION_INPUT_SCHEMA``); None when it has none."""
+    (``mapping.OBSERVATION_INPUT_SCHEMA``); None when it has none. Per (source, symbol, scheme,
+    value) only the rows of the latest fetch holding it are kept: an older fetch's sighting
+    (an "active" listing archived before the delisting) never stands next to a newer one."""
     code = adapter.source_code
-    parts = []
-    for symbol in archive.symbols(code, "symbols"):
-        for result in archive.history(code, symbol, "symbols"):
-            if result.status in ROW_STATUSES:
-                parts.append(_with_source(adapter.parse(result), code))
-    if not parts:
+    schema = _mapping.OBSERVATION_INPUT_SCHEMA
+    entries = [
+        e
+        for symbol in archive.symbols(code, "symbols")
+        for e in archive.history_with_refs(code, symbol, "symbols")
+        if e.result.status in ROW_STATUSES
+    ]
+    if not entries:
         return None
-    return pa.concat_tables(parts).select(_mapping.OBSERVATION_INPUT_SCHEMA.names)
+    entries.sort(key=lambda e: (e.result.fetched_at.astimezone(UTC), e.archive_ref))
+    newest: dict[tuple, tuple[int, list[dict[str, Any]]]] = {}
+    for i, entry in enumerate(entries):
+        rows = _with_source(adapter.parse(entry.result), code)
+        for r in rows.select(schema.names).to_pylist():
+            key = (r["source_code"], r["source_symbol"], r["id_scheme"], r["id_value"])
+            seen = newest.get(key)
+            if seen is None or seen[0] < i:
+                newest[key] = (i, [r])
+            else:
+                seen[1].append(r)
+    kept = sorted(newest.values(), key=lambda v: v[0])
+    return pa.Table.from_pylist([r for _, rows in kept for r in rows], schema=schema)
 
 
 def archive_spans(archive: RawArchive, adapter: Adapter) -> pa.Table:
