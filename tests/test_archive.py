@@ -1,3 +1,5 @@
+import json
+import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +39,10 @@ def test_put_is_immutable(tmp_path):
     assert ref == ref.replace("\\", "/") and not ref.startswith("/")
     assert ref.startswith("synth/AAA/prices/20260105T100000123456Z-")
     assert path.read_bytes() == b"x,1\n"
+    side = path.with_suffix(".json")
+    side_before = (side.read_bytes(), side.stat().st_mtime_ns)
+    arc.put(make())
+    assert (side.read_bytes(), side.stat().st_mtime_ns) == side_before
 
 
 def test_two_fetches_same_second_do_not_collide(tmp_path):
@@ -112,3 +118,89 @@ def test_no_temp_files_left(tmp_path):
     arc.put(make())
     assert not [p for p in (tmp_path / "arc").rglob("*") if p.name.endswith(".tmp")]
     assert isinstance(arc.root, Path)
+
+
+def test_conflicting_rewrite_refused(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    arc.put(make())
+    with pytest.raises(ValueError, match="conflict"):
+        arc.put(make(status="error"))
+    with pytest.raises(ValueError, match="conflict"):
+        arc.put(make(content_type="application/json"))
+    with pytest.raises(ValueError, match="conflict"):
+        arc.put(make(requested_from=date(2025, 1, 1)))
+
+
+def test_corrupted_existing_payload_refused_on_put(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    ref = arc.put(make())
+    (tmp_path / "arc" / ref).write_bytes(b"bad")
+    with pytest.raises(ValueError, match="conflict"):
+        arc.put(make())
+
+
+def test_concurrent_puts_same_refs(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    errors, refs = [], []
+
+    def work():
+        try:
+            refs.append([arc.put(make(payload=bytes([i]))) for i in range(5)])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors
+    assert all(r == refs[0] for r in refs)
+    files = [p for p in (tmp_path / "arc").rglob("*") if p.is_file()]
+    assert len(files) == 10
+
+
+def test_history_rejects_foreign_sidecar(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    ref = arc.put(make())
+    side = (tmp_path / "arc" / ref).with_suffix(".json")
+    meta = json.loads(side.read_text())
+    side.write_text(json.dumps({**meta, "source_symbol": "aaa"}))
+    assert list(arc.history("synth", "AAA", "prices")) == []
+    side.write_text(json.dumps({**meta, "source_code": "evil"}))
+    with pytest.raises(ValueError, match="identity"):
+        list(arc.history("synth", "AAA", "prices"))
+    side.write_text(json.dumps({**meta, "kind": "actions"}))
+    with pytest.raises(ValueError, match="identity"):
+        list(arc.history("synth", "AAA", "prices"))
+
+
+def test_missing_payload_is_corruption(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    ref = arc.put(make())
+    (tmp_path / "arc" / ref).unlink()
+    with pytest.raises(ValueError, match="corrupted"):
+        list(arc.history("synth", "AAA", "prices"))
+
+
+def test_crash_heal_orphan_payload(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    ref = arc.put(make())
+    (tmp_path / "arc" / ref).with_suffix(".json").unlink()  # crash between payload and sidecar
+    assert arc.put(make()) == ref
+    assert list(arc.history("synth", "AAA", "prices")) == [make()]
+
+
+def test_empty_names_rejected(tmp_path):
+    arc = RawArchive(tmp_path / "arc")
+    with pytest.raises(ValueError, match="empty"):
+        arc.put(make(symbol=""))
+    with pytest.raises(ValueError, match="empty"):
+        arc.put(make(source_code=""))
+    with pytest.raises(ValueError, match="empty"):
+        list(arc.history("synth", "", "prices"))
+
+
+def test_root_is_absolute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert RawArchive("rel").root.is_absolute()
