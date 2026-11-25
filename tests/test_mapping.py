@@ -507,7 +507,12 @@ def test_cik_linked_for_current_ticker_only():
         (live, "0000320193"),
         (moved, "0000000888"),  # its current ticker, not the closed one
     }
-    assert all(r["source_code"] == SEC_SOURCE and r["known_at"] == LATER for r in ciks)
+    # known only through restricted series: the link inherits their source (F4)
+    assert {r["instrument_id"]: r["source_code"] for r in ciks} == {
+        live: "private_history",
+        moved: "massive",
+    }
+    assert all(r["known_at"] == LATER for r in ciks)
     assert instrument_of(ids, CD) not in {r["instrument_id"] for r in ciks}  # dead: no link
     # input rows kept; the result conforms
     assert linked.num_rows == ids.num_rows + 2
@@ -570,10 +575,14 @@ def test_spans_from_fetch_log_and_dates():
     )  # fmt: skip
     got = {(r["source_symbol"]): (r["first_date"], r["last_date"])
            for r in spans_from_fetch_log(log).to_pylist()}  # fmt: skip
-    assert got == {
-        "A": (date(2001, 1, 2), date(2011, 1, 3)),
-        "B": (date(2005, 1, 3), date(2024, 6, 1)),
-    }
+    # B returned nothing: requested_to is never a span end, so no span at all
+    assert got == {"A": (date(2001, 1, 2), date(2011, 1, 3))}
+    snaps = pa.table(
+        {"source_code": ["s"], "source_symbol": ["B"], "valid_date": [date(2008, 9, 30)]}
+    )
+    got = {r["source_symbol"]: (r["first_date"], r["last_date"])
+           for r in spans_from_fetch_log(log, snapshots=snaps).to_pylist()}  # fmt: skip
+    assert got["B"] == (date(2005, 1, 3), date(2008, 9, 30))
     dated = pa.table(
         {
             "source_code": ["s", "s"],
@@ -593,9 +602,7 @@ def test_end_to_end_file_adapter_resolves_in_the_store(tmp_path):
     load = datetime(2020, 4, 3, 9, 0, tzinfo=UTC)
     fh = FileHistory(src, salt=SALT, max_non_session_share=0.5)
     loaded = fh.build_all(load)
-    sp = combine_spans(
-        spans_from_fetch_log(loaded.fetch_log), spans_from_dates(loaded.index_snapshots)
-    )
+    sp = spans_from_fetch_log(loaded.fetch_log, snapshots=loaded.index_snapshots)
     obs = loaded.observations.select(OBSERVATION_INPUT_SCHEMA.names)
     result = build_mapping(obs, None, load_time=load, spans=sp)
     ids = conform(INSTRUMENT_IDENTIFIERS, result.identifiers, now=load)
@@ -692,7 +699,7 @@ def test_composite_observation_never_lands_on_another_instrument():
     assert x != y
     assert {r["instrument_id"] for r in rows_of(first.identifiers, id_value=CX)} == {x}
     assert first.labels_left_out.to_pylist() == [
-        {"source_code": "massive", "source_symbol": "HWX", "reason": "composite_not_mapped",
+        {"source_code": "massive", "source_symbol": "HWX", "reason": "manual_override",
          "rows": 1}
     ]  # fmt: skip
     published = first.identifiers
@@ -863,3 +870,187 @@ def test_link_issuers_needs_as_of_and_is_idempotent():
     assert live == {"0000000999"}
     with pytest.raises(ValueError, match="after the published cik row"):
         link_issuers(c, sec, load_time=l4, as_of=END)
+
+
+# --- fix round 2: claims across runs, staleness from data, present-time answers ----------------
+
+
+def test_openfigi_claims_span_runs_and_manual_targets():
+    # run 1 maps OLDT to CX from OpenFIGI; run 2 sees NEWT answered CX alone
+    one = build(
+        None,
+        openfigi_one([("tiingo", "OLDT")]),
+        spans=spans(("tiingo", "OLDT", date(2005, 1, 3), END)),
+    )
+    assert mapping_rows(one, "tiingo:OLDT")
+    two = build(
+        None,
+        openfigi_one([("tiingo", "NEWT")]),
+        spans=spans(("tiingo", "NEWT", date(2012, 1, 3), END)),
+        existing=one.identifiers,
+        load_time=LATER,
+    )
+    assert report(two.ambiguous)[("tiingo", "NEWT")]["reason"] == "openfigi_shared"
+    assert not mapping_rows(two, "tiingo:NEWT")
+    # a manual target claims its composite too
+    man = manual_table(
+        {"source_code": "tiingo", "source_symbol": "OLDT", "composite_figi": CX,
+         "valid_date": date(2005, 1, 3), "valid_to": date(2010, 1, 4)}
+    )  # fmt: skip
+    sp = spans(
+        ("tiingo", "OLDT", date(2005, 1, 3), date(2010, 1, 3)),
+        ("tiingo", "NEWT", date(2005, 1, 3), END),
+    )
+    result = build(None, openfigi_one([("tiingo", "NEWT")]), spans=sp, manual=man)
+    assert report(result.ambiguous)[("tiingo", "NEWT")]["reason"] == "openfigi_shared"
+    assert mapping_rows(result, "tiingo:OLDT") and not mapping_rows(result, "tiingo:NEWT")
+
+
+def test_staleness_comes_from_data_never_the_export_date():
+    log = pa.table(
+        {
+            "source_code": ["private_history"],
+            "source_symbol": ["t_dead"],
+            "requested_from": [date(2001, 1, 2)],
+            "requested_to": [END],  # the export date
+            "returned_from": pa.array([None], pa.date32()),
+            "returned_to": pa.array([None], pa.date32()),
+        }
+    )
+    obs = observations(ob("private_history", "t_dead", "ticker", "ZZZ", END))
+    figi = openfigi_one([("private_history", "t_dead")])
+    # no prices, no snapshots: no span, never mapped from the export date
+    result = build(obs, figi, spans=spans_from_fetch_log(log))
+    assert report(result.unresolved)[("private_history", "t_dead")]["reason"] == "no_span"
+    # snapshots ending 2008: the OpenFIGI answer (today's holder of the ticker) is stale
+    snaps = pa.table(
+        {
+            "source_code": ["private_history"] * 2,
+            "source_symbol": ["t_dead"] * 2,
+            "valid_date": [date(2001, 1, 31), date(2008, 9, 30)],
+        }
+    )
+    result = build(obs, figi, spans=spans_from_fetch_log(log, snapshots=snaps))
+    assert report(result.ambiguous)[("private_history", "t_dead")]["reason"] == "openfigi_stale"
+    assert result.identifiers.num_rows == 0
+    # an export-dated composite observation without a span is not mapped either
+    alone = observations(ob("private_history", "t_x", "composite_figi", CX, END))
+    assert report(build(alone).unresolved)[("private_history", "t_x")]["reason"] == "no_span"
+
+
+def test_undated_composite_observation_is_a_present_time_answer():
+    sp = spans(("massive", "OLD", date(2001, 1, 2), date(2008, 9, 15)))
+    obs = observations(ob("massive", "OLD", "composite_figi", CX))
+    assert report(build(obs, spans=sp).ambiguous)[("massive", "OLD")]["reason"] == "openfigi_stale"
+    shared = observations(
+        ob("massive", "A1", "composite_figi", CY), ob("massive", "A2", "composite_figi", CY)
+    )
+    sp = spans(("massive", "A1", date(2010, 1, 4), END), ("massive", "A2", date(2010, 1, 4), END))
+    got = report(build(shared, spans=sp).ambiguous)
+    assert {k: r["reason"] for k, r in got.items()} == {
+        ("massive", "A1"): "openfigi_shared",
+        ("massive", "A2"): "openfigi_shared",
+    }
+    # a dated observation is not present-time
+    dated = observations(ob("massive", "OLD", "composite_figi", CX, date(2001, 1, 2)))
+    sp = spans(("massive", "OLD", date(2001, 1, 2), date(2008, 9, 15)))
+    assert mapping_rows(build(dated, spans=sp), "massive:OLD")
+
+
+def test_openfigi_rows_not_repeated_and_changed_answer_not_applied():
+    sp = spans(("tiingo", "LIVE", date(2005, 1, 3), END))
+    one = build(None, openfigi_one([("tiingo", "LIVE")]), spans=sp, restricted=frozenset())
+    derived = {
+        r["id_scheme"] for r in one.identifiers.to_pylist() if r["source_code"] == "openfigi"
+    }
+    assert derived == {"composite_figi", "figi", "ticker"}
+    two = build(
+        None, openfigi_one([("tiingo", "LIVE")]), spans=sp, existing=one.identifiers,
+        load_time=LATER, restricted=frozenset(),
+    )  # fmt: skip
+    assert "openfigi" not in two.identifiers["source_code"].to_pylist()  # nothing new to say
+    published = pa.concat_tables([one.identifiers, two.identifiers])
+    three = build(
+        None, openfigi_one([("tiingo", "LIVE")], composite=CY), spans=sp, existing=published,
+        load_time=LATER + timedelta(days=1), restricted=frozenset(),
+    )  # fmt: skip
+    assert report(three.ambiguous)[("tiingo", "LIVE")]["reason"] == "openfigi_changed"
+    assert three.minted == () and CY not in three.identifiers["id_value"].to_pylist()
+    m = symbol_mappings(pa.concat_tables([published, three.identifiers]))
+    assert resolve(m, "tiingo:LIVE", date(2020, 1, 2)) == instrument_of(one.identifiers, CX)
+
+
+def test_manual_override_drops_the_series_observed_labels():
+    obs = observations(
+        ob("private_history", "t_x", "composite_figi", CX, END),
+        ob("private_history", "t_x", "share_class_figi", "BBG001SHRX01", END),
+        ob("private_history", "t_x", "ticker", "XXX", END),
+    )
+    sp = spans(("private_history", "t_x", date(2005, 1, 3), END))
+    man = manual_table(
+        {"source_code": "private_history", "source_symbol": "t_x", "composite_figi": CY,
+         "valid_date": date(2005, 1, 3)}
+    )  # fmt: skip
+    result = build(obs, spans=sp, manual=man)
+    y = instrument_of(result.identifiers, CY)
+    schemes = {r["id_scheme"] for r in result.identifiers.to_pylist() if r["instrument_id"] == y}
+    assert schemes == {"source_symbol", "composite_figi"}
+    assert result.labels_left_out.to_pylist() == [
+        {"source_code": "private_history", "source_symbol": "t_x", "reason": "manual_override",
+         "rows": 3}
+    ]  # fmt: skip
+
+
+def test_cik_source_follows_the_instrument_series():
+    obs, sp, sec = issuer_inputs()
+    ids = build(obs, spans=sp).identifiers
+    linked = link_issuers(ids, sec, load_time=LATER, as_of=END)
+    registry = discover_sources()
+    public = filter_sources(
+        linked,
+        allowed_restricted=frozenset(),
+        restricted=restricted_codes(registry),
+        strict=True,
+        registered=frozenset(registry),
+    )
+    assert not rows_of(public, id_scheme="cik")  # private- or restricted-only: no public link
+    # with an open series, the link is published under "sec"
+    from open_data_store.sources import SourceInfo
+
+    opened = {**registry, "massive": SourceInfo("massive", "x", "", "", "open")}
+    linked = link_issuers(ids, sec, load_time=LATER, as_of=END, sources=opened)
+    moved = instrument_of(ids, CX)
+    assert {r["source_code"] for r in rows_of(linked, id_scheme="cik", instrument_id=moved)} == {
+        SEC_SOURCE
+    }
+
+
+def test_one_composite_twice_on_a_symbol_keeps_the_gap():
+    sp = spans(("massive", "ABC", date(2005, 1, 3), END))
+    gap = observations(
+        ob("massive", "ABC", "composite_figi", CX, date(2005, 1, 3), date(2010, 7, 1)),
+        ob("massive", "ABC", "composite_figi", CX, date(2015, 1, 2)),
+    )
+    result = build(gap, spans=sp)
+    x = instrument_of(result.identifiers, CX)
+    rows = mapping_rows(result, "massive:ABC")
+    assert [(r["instrument_id"], r["valid_date"], r["valid_to"]) for r in rows] == [
+        (x, date(2005, 1, 3), date(2010, 7, 1)),
+        (x, date(2015, 1, 2), END + timedelta(days=1)),
+    ]
+    assert report(result.unresolved)[("massive", "ABC")]["reason"] == "uncovered_span"
+    aba = pa.concat_tables(
+        [
+            gap,
+            observations(
+                ob("massive", "ABC", "composite_figi", CY, date(2010, 7, 1), date(2015, 1, 2))
+            ),
+        ]
+    )
+    result = build(aba, spans=sp)
+    m = symbol_mappings(result.identifiers)
+    x, y = instrument_of(result.identifiers, CX), instrument_of(result.identifiers, CY)
+    assert [
+        resolve(m, "massive:ABC", d) for d in (date(2008, 1, 2), date(2012, 1, 3), date(2020, 1, 2))
+    ] == [x, y, x]
+    assert result.unresolved.num_rows == 0 and result.ambiguous.num_rows == 0
