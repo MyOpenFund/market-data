@@ -501,3 +501,35 @@ def test_server_profile_source_leaving_an_input_empty_says_so(busy_store):
             **kw,
         )
     assert info.value.inputs == ("BBB",)
+
+
+def test_server_profile_symbol_reused_by_another_instrument(tmp_path):
+    """tiingo:XYZ names I3 until 2025-06-04, then I2: a request for I2 gets I2's rows only."""
+    cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
+    for c in MARKET_CONTRACTS:
+        approve_contract(cfg, c, "test")
+    days = SESS["session_date"].to_pylist()
+    i3 = "mof:" + "3" * 32
+    switch = date(2025, 6, 4)
+    prices = [_price("XYZ", d, 10.0 + i) for i, d in enumerate(days)]
+    ids = [
+        _ident(i3, "source_symbol", "tiingo:XYZ", "tiingo", valid_to=switch),
+        _ident(I2, "source_symbol", "tiingo:XYZ", "tiingo", valid=switch),
+        _ident(I2, "ticker", "BBB", "openfigi"),
+    ]
+    for contract, rows in ((PRICES, prices), (INSTRUMENT_IDENTIFIERS, ids)):
+        write_batch(
+            contract,
+            pa.Table.from_pylist(rows, schema=contract.schema),
+            landing_root=cfg.landing,
+            run_id="t",
+            producer="test",
+        )
+    assert publish_pending(cfg).exit_code == 0
+    later = [d for d in days if d >= switch]
+    with Store.open(cfg) as store:
+        kw = dict(profile="server", store=store, as_of=AS_OF, allowed_restricted={"tiingo"})
+        for extra in ({}, {"source": "tiingo"}, {"adjust": "total_return"}):
+            out = api.prices(["BBB"], START, END, **kw, **extra)
+            assert set(out["instrument_id"].to_pylist()) == {I2}, extra
+            assert out["session_date"].to_pylist() == later, extra

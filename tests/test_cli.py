@@ -649,3 +649,46 @@ def test_history_artifacts_are_saved_before_batches(env, run, monkeypatch):
     (load_run,) = [p for p in (env["reports"] / "runs").iterdir() if p.name.endswith("history")]
     assert (load_run / "observations.parquet").is_file()
     assert (load_run / "spans.parquet").is_file()
+
+
+# --- re-review: usage errors, successful artifacts, record wording --------------------------------
+
+
+def test_usage_error_leaves_no_record(env, run, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "make_adapter", lambda source: fake_tiingo())
+    argv = ("fetch", "--write", "--source", "tiingo", "--kind", "actions", "--date", "2025-06-02")
+    assert run(*argv, "--symbols", "AAA") == EXIT_ERROR
+    assert "usage:" in capsys.readouterr().err
+    assert not env["reports"].exists() and not env["archive"].exists()
+    assert run("report", "--index", "IDX1", "--allowed-restricted", "nosuch") == EXIT_ERROR
+    assert "['nosuch']" in capsys.readouterr().err
+    assert not env["reports"].exists()
+
+
+def test_saved_artifacts_skip_failed_runs(env, run, monkeypatch):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    (good,) = pipeline.saved_artifacts(env["reports"], "load-history", "observations.parquet")
+
+    def broken(*a, **kw):
+        raise OSError("landing unavailable")
+
+    monkeypatch.setattr(pipeline, "_write", broken)
+    assert run(*HISTORY_ARGS, "--write") == EXIT_ERROR
+    assert len(list((env["reports"] / "runs").iterdir())) == 2
+    assert pipeline.saved_artifacts(env["reports"], "load-history", "observations.parquet") == [
+        good
+    ]
+
+
+def test_record_wording(env, run, monkeypatch, capsys):
+    def broken(reports, result):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline, "save_piece", broken)
+    monkeypatch.setattr(cli, "make_adapter", lambda source: fake_tiingo())
+    argv = ("fetch", "--write", "--source", "tiingo", "--date", "2025-06-02", "--symbols", "AAA")
+    assert run(*argv) == EXIT_ERROR
+    assert "fetch: archive written but run record not saved: OSError" in capsys.readouterr().err
+    assert run("load-history", "--write", "--dir", "{root}/missing") == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "load-history: error report written, but run record not saved: OSError" in err

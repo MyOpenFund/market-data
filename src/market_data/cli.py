@@ -26,11 +26,14 @@ Commands:
   ``.md``, with the store's coverage of the index (defaults: the store recipes'); without
   ``--index`` the report is degraded (``coverage_not_run``).
 
-Each command prints one summary line (counts, never a label) and exits 0 (``ok``), 1
+A usage error (arguments, missing paths, an adapter not allowed, an unregistered source code)
+is refused before any work: exit 2, a message on stderr, no run record and no report.
+Otherwise each command prints one summary line (counts, never a label) and exits 0 (``ok``), 1
 (``degraded``; 0 with ``--allow-degraded``) or 2 (``error``). An exception is caught: its type and
 message go to stderr, and an ``error`` report naming its type only is written to the reports
 directory (dry run included) before the exit. A successful ``--write`` whose run record cannot
-be saved exits 2 ("batches landed but run record not saved").
+be saved exits 2 ("batches landed but run record not saved", "archive written ..." for a
+fetch).
 """
 
 from __future__ import annotations
@@ -64,10 +67,15 @@ _LISTED = 20  # planned requests printed by a fetch dry run
 PROVIDER_SOURCES = ("massive", "tiingo")
 
 
+class UsageError(ValueError):
+    """A command refused before any work (arguments, paths, allowed adapters): exit 2, no run
+    record and no report."""
+
+
 def make_adapter(source: str) -> Adapter:
     """The installed adapter of ``source``, which ``MOF_MARKET_ADAPTERS`` must allow."""
     if source not in allowed_adapters():
-        raise ValueError(f"adapter {source!r} is not allowed: add it to MOF_MARKET_ADAPTERS")
+        raise UsageError(f"adapter {source!r} is not allowed: add it to MOF_MARKET_ADAPTERS")
     return load_adapters([source])[source]
 
 
@@ -86,7 +94,7 @@ def _path(flag: Path | None, env: str) -> Path | None:
 
 def _require(path: Path | None, what: str, env: str) -> Path:
     if path is None:
-        raise ValueError(f"no {what}: pass --{what.split()[0]} or set {env}")
+        raise UsageError(f"no {what}: pass --{what.split()[0]} or set {env}")
     return path
 
 
@@ -101,7 +109,10 @@ def _archive(args: argparse.Namespace) -> RawArchive:
 def _write_needs(args: argparse.Namespace) -> tuple[Path, Path]:
     """(landing, reports) for a ``--write``."""
     reports = _require(_reports(args), "reports directory", REPORTS_ENV)
-    return pipeline.landing_root(getattr(args, "landing", None)), reports
+    try:
+        return pipeline.landing_root(getattr(args, "landing", None)), reports
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
 
 
 def _store_identifiers() -> pa.Table:
@@ -158,16 +169,24 @@ def _load_history(args: argparse.Namespace, run_id: str, started: datetime) -> p
 def _range(args: argparse.Namespace) -> tuple[date | None, date | None]:
     if args.date is not None:
         if args.date_from is not None or args.date_to is not None:
-            raise ValueError("pass --date or --from/--to, not both")
+            raise UsageError("pass --date or --from/--to, not both")
         return args.date, args.date
     if (args.date_from is None) != (args.date_to is None):
-        raise ValueError("pass both --from and --to (or --date)")
+        raise UsageError("pass both --from and --to (or --date)")
     return args.date_from, args.date_to
 
 
-def _fetch_plan(args: argparse.Namespace) -> int:
+def _plan(args: argparse.Namespace) -> pipeline.FetchPlan:
+    """The fetch plan; an argument the adapter would refuse is a usage error."""
     start, end = _range(args)
-    plan = pipeline.plan_fetch(args.source, args.kind, args.symbols, start, end)
+    try:
+        return pipeline.plan_fetch(args.source, args.kind, args.symbols, start, end)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+
+
+def _fetch_plan(args: argparse.Namespace) -> int:
+    plan = _plan(args)
     for r in plan.requests[:_LISTED]:
         span = "" if r.requested_from is None else f" {r.requested_from}..{r.requested_to}"
         print(f"  would request {r.kind} {r.source_symbol}{span}")
@@ -179,6 +198,7 @@ def _fetch_plan(args: argparse.Namespace) -> int:
 
 def _fetch(args: argparse.Namespace, run_id: str, started: datetime) -> pipeline.StepResult:
     _require(_reports(args), "reports directory", REPORTS_ENV)
+    _plan(args)  # refuse bad arguments before any request or record
     start, end = _range(args)
     archive = _archive(args)
     adapter = make_adapter(args.source)
@@ -295,10 +315,14 @@ def _coverage(args: argparse.Namespace):
 
     as_of = args.as_of or datetime.now(UTC)
     if as_of.tzinfo is None or as_of.utcoffset() is None:
-        raise ValueError("--as-of must carry a UTC offset, e.g. 2026-11-20T21:00:00+00:00")
+        raise UsageError("--as-of must carry a UTC offset, e.g. 2026-11-20T21:00:00+00:00")
+    registry = sources.discover_sources()
     allowed = args.allowed_restricted
     if allowed is None:  # the operator's own store: every registered restricted source
-        allowed = sorted(sources.restricted_codes(sources.discover_sources()))
+        allowed = sorted(sources.restricted_codes(registry))
+    unknown = sorted(set(allowed) - set(registry))
+    if unknown:  # source codes, not labels: safe to name
+        raise UsageError(f"--allowed-restricted names unregistered source code(s) {unknown}")
     with Store.open(StoreConfig.from_env()) as store:
         return pipeline.store_coverage(
             store,
@@ -355,19 +379,25 @@ def _record(step: str, args: argparse.Namespace, result: pipeline.StepResult) ->
         if error:
             print(f"{step}: no error report written ({REPORTS_ENV} not set)", file=sys.stderr)
         return True
-    try:
-        if error:
+    report_written = False
+    if error:
+        try:
             write_report(result.summary, reports)
-        if args.write and step != "report":
-            pipeline.save_piece(reports, result)
-    except Exception as exc:  # noqa: BLE001 - said on stderr, and the exit code says it too
-        if error:
+            report_written = True
+        except Exception as exc:  # noqa: BLE001 - an error run exits 2 whatever happens here
             print(f"{step}: error report not written ({type(exc).__name__})", file=sys.stderr)
+    if not (args.write and step != "report"):
+        return True
+    try:
+        pipeline.save_piece(reports, result)
+    except Exception as exc:  # noqa: BLE001 - said on stderr, and the exit code says it too
+        name = type(exc).__name__
+        if error:
+            said = "error report written" if report_written else "no error report"
+            print(f"{step}: {said}, but run record not saved: {name}", file=sys.stderr)
             return True
-        print(
-            f"{step}: batches landed but run record not saved: {type(exc).__name__}",
-            file=sys.stderr,
-        )
+        done = "archive written" if step == "fetch" else "batches landed"
+        print(f"{step}: {done} but run record not saved: {name}", file=sys.stderr)
         return False
     return True
 
@@ -386,6 +416,9 @@ def _run(step: str, args: argparse.Namespace) -> int:
         if step == "fetch" and not args.write:
             return _fetch_plan(args)
         result = _BODIES[step](args, run_id, started)
+    except UsageError as exc:
+        print(f"{step}: usage: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     except Exception as exc:  # noqa: BLE001 - doctrine: every failure ends in an error report
         print(f"{step}: {type(exc).__name__}: {exc}", file=sys.stderr)
         summary = pipeline.summarize_safely(run_id, started_at=started, error=exc)
@@ -446,7 +479,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--index", help="index code whose store coverage the report runs")
     p.add_argument("--as-of", type=datetime.fromisoformat, help="coverage as known then")
     p.add_argument("--precedence", nargs="*", default=[], help="price source precedence")
-    p.add_argument("--snapshot-precedence", nargs="*", default=[])
+    p.add_argument(
+        "--snapshot-precedence",
+        nargs="*",
+        default=[],
+        help="index-snapshot source precedence for membership (separate from prices')",
+    )
     p.add_argument(
         "--allowed-restricted",
         nargs="*",

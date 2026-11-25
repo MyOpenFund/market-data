@@ -249,12 +249,17 @@ def save_piece(reports: Path | str, result: StepResult) -> Path:
 
 
 def saved_artifacts(reports: Path | str, step: str, name: str) -> list[Path]:
-    """Artifact ``name`` of the newest run of ``step`` that kept one (empty when none)."""
+    """Artifact ``name`` of the newest successful run of ``step`` that kept one (empty when
+    none). Successful: its run record (``summary.json``) exists and holds no error, so the
+    artifacts of a run whose batches failed to land are never picked."""
     base = Path(reports) / RUNS_DIR
     if not base.is_dir():
         return []
     for run in sorted(base.glob(f"*-{step}"), reverse=True):
-        if (run / name).is_file():
+        record = run / SUMMARY_FILE
+        if not (run / name).is_file() or not record.is_file():
+            continue
+        if json.loads(record.read_text(encoding="utf-8"))["summary"]["error"] is None:
             return [run / name]
     return []
 

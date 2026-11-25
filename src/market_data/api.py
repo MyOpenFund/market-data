@@ -46,7 +46,10 @@ instruments), ``RestrictedSourceError`` (a restricted or unregistered source not
 server: an input ``source=`` has no price for over the range), and a plain ``ApiError`` when two
 sources (or two series of one source) give one instrument different rows on one session
 (server, without ``source=``; only the caller's inputs are named). The server profile resolves
-only the requested instruments' series: other instruments never make a request fail.
+only the requested instruments' series and returns only the requested instruments (a symbol
+reused by another instrument on other dates contributes its rows of the requested windows
+only); an unrelated instrument fails a request only through a series it shares with a requested
+one, and the message still names the caller's inputs only.
 """
 
 from __future__ import annotations
@@ -440,17 +443,23 @@ def _server(
     prices_in = _of_series(inputs.prices, set().union(*series.values()))
     actions_in = _of_series(inputs.actions, set().union(*series.values()))
     precedence = (source,) if source else ()
+    wanted = pa.array(sorted(set(named.values())), pa.string())
+
+    def requested(table: pa.Table) -> pa.Table:
+        # a series reused by another instrument on other dates resolves to it there: keep
+        # only the requested instruments
+        return table.filter(pc.is_in(table["instrument_id"], value_set=wanted))
 
     def resolved_for(tokens: set[str]) -> tuple[pa.Table, pa.Table | None]:
         rp = resolve_prices(
             _of_series(prices_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
         )
         if adjust == "raw":
-            return rp, None
+            return requested(rp), None
         ra = resolve_actions(
             _of_series(actions_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
         )
-        return rp, ra
+        return requested(rp), requested(ra)
 
     try:
         resolved, actions = resolved_for(set().union(*series.values()))
