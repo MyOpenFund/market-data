@@ -834,9 +834,16 @@ def store_coverage(
             passed=False,
         )
     unresolved = unresolved_members(inputs.snapshots, inputs.identifiers, **kw)
-    resolved = resolve_prices(
-        inputs.prices, inputs.identifiers, as_of=as_of, precedence=tuple(precedence)
-    )
+    try:
+        resolved = resolve_prices(
+            inputs.prices, inputs.identifiers, as_of=as_of, precedence=tuple(precedence)
+        )
+    except ValueError:
+        # the recipe's message quotes series (tokens, symbols): never shown on stderr
+        raise ValueError(
+            "several price sources (or conflicting series of one source) for one instrument "
+            "and session: pass --precedence (or make that source's mapping windows disjoint)"
+        ) from None
     covered = fetch_coverage(inputs.fetch_log, inputs.identifiers, as_of=as_of, sessions=cal)
     return coverage(
         intervals,

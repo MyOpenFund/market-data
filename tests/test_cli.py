@@ -857,3 +857,18 @@ def test_unusable_cash_degrades_the_load_and_the_build(env, run, capsys):
     )
     assert result.summary.unusable_cash == {"tiingo": {"split_day_cash_without_basis": 1}}
     assert "unusable_cash_actions" in result.reasons and result.outcome == "degraded"
+
+
+def test_report_precedence_error_never_quotes_a_series(env, run, monkeypatch, capsys):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+
+    def clash(*a, **kw):
+        raise ValueError("2 sources for one instrument and date: ['private_history:t_secret']")
+
+    monkeypatch.setattr(pipeline, "resolve_prices", clash)
+    capsys.readouterr()
+    assert run("report", "--index", "IDX1") == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "pass --precedence" in err and "t_secret" not in err
