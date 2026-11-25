@@ -1,6 +1,6 @@
 # market-data
 
-Producer that fetches market data (prices, corporate actions, identifiers) through pluggable
+Producer (work in progress) that fetches market data (prices, corporate actions, identifiers) through pluggable
 source adapters and writes it into [open-data-store](https://github.com/MyOpenFund/open-data-store).
 
 ## Principles

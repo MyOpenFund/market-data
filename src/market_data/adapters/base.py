@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from importlib.metadata import entry_points
 from typing import Literal, Protocol, runtime_checkable
 
 import pyarrow as pa
-from open_data_store.sources import SourceInfo
+from open_data_store.contracts.standard.market import FETCH_STATUSES
+from open_data_store.sources import SourceInfo, discover_sources
 
 GROUP = "market_data.adapters"
 ADAPTER_ENV = "MOF_MARKET_ADAPTERS"
@@ -36,7 +37,8 @@ RAW_PRICE_SCHEMA = pa.schema(
     ]
 )
 
-# valid_date is the ex-date.
+# valid_date is the ex-date. action_seq is the order within one payload; the builder (B3) assigns
+# the final cross-fetch action_seq.
 RAW_ACTION_SCHEMA = pa.schema(
     [
         pa.field("source_code", pa.string(), nullable=False),
@@ -57,6 +59,22 @@ RAW_ACTION_SCHEMA = pa.schema(
         pa.field("spinoff_symbol", pa.string()),
     ]
 )
+
+# Identifier observations (kind "symbols"): INSTRUMENT_IDENTIFIERS minus instrument_id and the
+# bitemporal columns.
+RAW_SYMBOL_SCHEMA = pa.schema(
+    [
+        pa.field("source_symbol", pa.string(), nullable=False),
+        pa.field("id_scheme", pa.string(), nullable=False),
+        pa.field("id_value", pa.string(), nullable=False),
+        pa.field("valid_date", pa.date32()),
+        pa.field("valid_to", pa.date32()),
+        pa.field("name", pa.string()),
+    ]
+)
+
+FETCH_KINDS = ("prices", "actions", "symbols")
+WHOLE_MARKET_SYMBOL = "*"
 
 
 class Secret:
@@ -82,14 +100,23 @@ class Secret:
 @dataclass(frozen=True)
 class FetchResult:
     source_code: str
+    # "*" for a whole-market fetch (e.g. a grouped daily of every US stock).
     source_symbol: str
     kind: Literal["prices", "actions", "symbols"]
     requested_from: date | None
     requested_to: date | None
     fetched_at: datetime
     status: str
-    payload: bytes
+    payload: bytes = field(repr=False)
     content_type: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in FETCH_KINDS:
+            raise ValueError(f"fetch kind must be one of {FETCH_KINDS}, got {self.kind!r}")
+        if self.status not in FETCH_STATUSES:
+            raise ValueError(f"fetch status must be one of {FETCH_STATUSES}, got {self.status!r}")
+        if self.fetched_at.tzinfo is None or self.fetched_at.utcoffset() is None:
+            raise ValueError("fetched_at must be timezone-aware")
 
 
 @runtime_checkable
@@ -102,7 +129,9 @@ class Adapter(Protocol):
     ) -> Iterator[FetchResult]: ...
 
     def parse(self, result: FetchResult) -> pa.Table:
-        """Rows in RAW_PRICE_SCHEMA or RAW_ACTION_SCHEMA (by ``result.kind``), without known_at."""
+        """Rows without known_at, by ``result.kind``: RAW_PRICE_SCHEMA ("prices"),
+        RAW_ACTION_SCHEMA ("actions") or RAW_SYMBOL_SCHEMA ("symbols": identifier observations
+        shaped like INSTRUMENT_IDENTIFIERS minus instrument_id and the bitemporal columns)."""
         ...
 
 
@@ -115,17 +144,31 @@ def allowed_adapters(env: Mapping[str, str] | None = None) -> list[str]:
 def load_adapters(allow: Sequence[str]) -> dict[str, Adapter]:
     """Instantiate the installed adapters whose source code is in ``allow``.
 
-    An adapter not in ``allow`` is not even imported.
+    An adapter not in ``allow`` is not even imported. Fails loudly: an allowed name without an
+    entry point, a duplicated entry-point name, an object that is not an Adapter, a code mismatch
+    or an unregistered source is a ValueError (no silent fallback).
     """
     allowed = set(allow)
+    eps = [ep for ep in entry_points(group=GROUP) if ep.name in allowed]
+    names = [ep.name for ep in eps]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"adapter entry point declared more than once: {dup}")
+    missing = sorted(allowed - set(names))
+    if missing:
+        raise ValueError(f"no adapter installed for allowed source(s): {missing}")
+    registry = {s.code for s in discover_sources().values()}
     out: dict[str, Adapter] = {}
-    for ep in entry_points(group=GROUP):
-        if ep.name not in allowed:
-            continue
+    for ep in eps:
         adapter = ep.load()()
-        if adapter.source_code != ep.name:
+        if not isinstance(adapter, Adapter):
+            raise ValueError(f"adapter entry point {ep.name!r} does not return an Adapter")
+        if adapter.source_code != ep.name or adapter.info.code != adapter.source_code:
             raise ValueError(
-                f"adapter entry point {ep.name!r} returned an adapter for {adapter.source_code!r}"
+                f"adapter entry point {ep.name!r} returned an adapter for "
+                f"{adapter.source_code!r} (info code {adapter.info.code!r})"
             )
+        if adapter.source_code not in registry:
+            raise ValueError(f"source {adapter.source_code!r} is not in the source registry")
         out[ep.name] = adapter
     return out

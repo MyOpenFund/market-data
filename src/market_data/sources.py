@@ -22,10 +22,12 @@ def sources() -> list[SourceInfo]:
         SourceInfo(
             code="tiingo",
             # TODO: verify the terms URL and the redistribution terms before the first fetch.
-            licence="Tiingo terms of service; personal use, no redistribution (to verify)",
+            licence="Tiingo terms of service; personal use, no redistribution",
             terms_url="https://www.tiingo.com/about/terms",
             attribution="",
             access="restricted",
+            no_public_display=True,
+            no_ml_training=True,
         ),
         SourceInfo(
             code="private_history",
@@ -33,6 +35,8 @@ def sources() -> list[SourceInfo]:
             terms_url="",
             attribution="",
             access="restricted",
+            no_public_display=True,
+            no_ml_training=True,
         ),
         SourceInfo(
             code="openfigi",
