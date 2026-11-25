@@ -1,7 +1,7 @@
 member_id,name,figi,composite_figi,share_class_figi,isin,country,exchange_code,security_type,price_currency,status,delisting_date,delisting_reason,last_ticker
-AAA UN Equity,Alpha Fake Corp,BBG000FAKE01,BBG000FAKC01,BBG001FAKS01,XS0000000AA1,US,UN,Common Stock,USD,active,,,AAA
+AAA UN Equity,Alpha Fake Corp,BBG000FAKE01,BBG000FAKC01,BBG001FAKS01,XS0000000AA7,US,UN,Common Stock,USD,active,,,AAA
 BBB UW Equity,Beta Fake Inc,BBG000FAKE02,BBG000FAKC02,,,US,UW,Common Stock,USD,delisted,2020-02-14,bankruptcy,BBBQ
-CCC LN Equity,Gamma Fake plc,BBG000FAKE03,BBG000FAKC03,BBG001FAKS03,XS0000000CC3,GB,LN,Common Stock,GBp,active,,,CCC
+CCC LN Equity,Gamma Fake plc,BBG000FAKE03,BBG000FAKC03,BBG001FAKS03,XS0000000CC9,GB,LN,Common Stock,GBp,active,,,CCC
 DDD UQ Equity,Delta Fake Holdings,BBG000FAKE04,BBG000FAKC04,BBG001FAKS04,,US,,Common Stock,USD,active,,,DDD
 EEE ZZ Equity,Epsilon Fake SA,,,,,ZZ,ZZ,Common Stock,EUR,active,,,
 FFF UN Equity,Phi Fake Co,BBG000FAKE06,BBG000FAKC06,,,US,UN,Common Stock,USD,active,,,FFF

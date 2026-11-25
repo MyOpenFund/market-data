@@ -22,9 +22,11 @@ from market_data.adapters.base import RAW_SYMBOL_SCHEMA
 from market_data.adapters.file import (
     DEFAULT_EXCHANGE_MICS,
     DROP_AFTER_EXPORT,
+    DROP_DUPLICATE_ROW,
     DROP_NON_SESSION,
     DROP_UNKNOWN_ACTION_TYPE,
     DROP_UNMAPPED_EXCHANGE,
+    MAX_NON_SESSION_SHARE,
     FileHistory,
     HistoryFileError,
 )
@@ -73,6 +75,8 @@ def parquet_export(tmp_path: Path, *, timestamps: bool = False) -> Path:
 
 def history(path: Path, **kw) -> FileHistory:
     kw.setdefault("salt", SALT)
+    # the fixture has one holiday row among few prices; the tripwire has its own tests
+    kw.setdefault("max_non_session_share", 0.5)
     return FileHistory(path, **kw)
 
 
@@ -117,7 +121,7 @@ def test_missing_salt_refused(tmp_path, monkeypatch):
 def test_salt_from_env_and_never_shown(tmp_path, monkeypatch):
     secret = "env-salt-value-abcdefghijklmnop"
     monkeypatch.setenv(SALT_ENV, secret)
-    fh = FileHistory(csv_export(tmp_path))
+    fh = FileHistory(csv_export(tmp_path), max_non_session_share=0.5)
     assert secret not in repr(fh)
     tokens = set(fh.prices()["source_symbol"].to_pylist())
     assert token(SRC, "AAA UN Equity", secret.encode()) in tokens
@@ -248,17 +252,11 @@ def test_parquet_index_column_rejected(tmp_path):
     assert "prices_daily.parquet" in problems and "row-number" in problems
 
 
-@pytest.mark.parametrize("sentinel", ["-", "N/A", "NA", "#N/A"])
+@pytest.mark.parametrize("sentinel", ["-", "N/A", "NA", "#N/A", " n/a "])
 @pytest.mark.parametrize(
     ("old", "new", "column", "row"),
     [
         ("BBB UW Equity,2020-01-31,2.9,", "BBB UW Equity,2020-01-31,{s},", "close", 10),
-        (
-            "CCC LN Equity,2020-02-28,1490.0,250,GBp",
-            "CCC LN Equity,2020-02-28,1490.0,250,{s}",
-            "currency",
-            13,
-        ),
         ("DDD UQ Equity,2020-01-31,40.0,700", "DDD UQ Equity,2020-01-31,40.0,{s}", "volume", 15),
         ("FFF UN Equity,2020-02-03", "FFF UN Equity,{s}", "date", 20),
     ],
@@ -270,7 +268,8 @@ def test_dash_and_na_rejected(tmp_path, sentinel, old, new, column, row):
     problems = fh.validate()
     hit = [p for p in problems if "prices_daily.csv" in p and f"column {column!r}" in p]
     assert hit, problems
-    assert f"row {row}" in hit[0] and repr(sentinel) in hit[0]
+    assert f"data row {row} (file line {row + 1})" in hit[0]
+    assert repr(sentinel.strip()) in hit[0]
     with pytest.raises(HistoryFileError):
         fh.prices()
 
@@ -380,7 +379,7 @@ def test_tokens_hide_labels(tmp_path):
         fh.snapshots(),
         fh.fetch_log(LOAD),
     ]
-    labels = set(MEMBERS) | set(MEMBERS.values()) | {"BBBQ", "BBG000FAKC01", "XS0000000AA1"}
+    labels = set(MEMBERS) | set(MEMBERS.values()) | {"BBBQ", "BBG000FAKC01", "XS0000000AA7"}
     roots = {m.split()[0] for m in MEMBERS}
     for table in tables:
         values = _strings(table)
@@ -406,7 +405,7 @@ def test_identifiers_known_at_is_load_time(fh):
     assert rows[(a, "export_name")]["id_value"] == "Alpha Fake Corp"
     assert rows[(a, "composite_figi")]["id_value"] == "BBG000FAKC01"
     assert rows[(a, "share_class_figi")]["id_value"] == "BBG001FAKS01"
-    assert rows[(a, "isin")]["id_value"] == "XS0000000AA1"
+    assert rows[(a, "isin")]["id_value"] == "XS0000000AA7"
     assert rows[(tok("BBB UW Equity"), "ticker")]["id_value"] == "BBBQ"
     assert (tok("BBB UW Equity"), "isin") not in rows  # empty = unknown, no row
     assert (tok("EEE ZZ Equity"), "export_member_id") in rows  # labels for every member
@@ -731,3 +730,216 @@ def test_rebuild_is_identical(tmp_path):
     assert a.prices().equals(b.prices())
     assert a.actions().equals(b.actions())
     assert a.snapshots().equals(b.snapshots())
+
+
+# --- review fixes: no echo, text sentinels, formats, tripwire, minors ---------------------------
+
+
+@pytest.mark.parametrize(
+    "sentinel", ["-", "--", " n/a ", "NULL", "NaN", "#N/A", "#N/A Field Not Applicable"]
+)
+def test_text_sentinels_rejected(tmp_path, sentinel):
+    path = csv_export(tmp_path)
+    edit_csv(
+        path,
+        "prices_daily.csv",
+        "CCC LN Equity,2020-02-28,1490.0,250,GBp",
+        f"CCC LN Equity,2020-02-28,1490.0,250,{sentinel}",
+    )
+    problems = problems_of(history(path))
+    assert "prices_daily.csv: column 'currency'" in problems
+    assert "data row 13 (file line 14)" in problems
+    assert "Field Not Applicable" not in problems
+
+
+def test_na_is_a_value_in_text_columns(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "securities.csv", "Epsilon Fake SA,,,,,ZZ,ZZ,", "Epsilon Fake SA,,,,,NA,NA,")
+    fh = history(path)
+    assert fh.validate() == []
+    eee = tok("EEE ZZ Equity")
+    assert eee in set(fh.snapshots()["source_symbol"].to_pylist())
+    fh.prices()
+    assert fh.report.unmapped_exchanges["prices"] == {"LN": 3, "NA": 2}
+    assert fh.report.dropped["prices"][DROP_UNMAPPED_EXCHANGE] == 5
+
+
+def test_malformed_csv_line_never_echoed(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(
+        path,
+        "prices_daily.csv",
+        "BBB UW Equity,2020-01-31,2.9,60000,USD,,,",
+        "BBB UW Equity,2020-01-31,2.9,60000,USD,,,,SECRET EXTRA",
+    )
+    problems = problems_of(history(path))
+    assert "prices_daily.csv: malformed line 11: 9 field(s) where the header has 8" in problems
+    assert "BBB" not in problems and "SECRET" not in problems
+
+
+def test_invalid_utf8_never_echoed(tmp_path):
+    path = csv_export(tmp_path)
+    data = (path / "prices_daily.csv").read_bytes()
+    data = data.replace(b"BBB UW Equity,2020-01-31", b"BBB\xff\xfeSECRET UW Equity,2020-01-31")
+    (path / "prices_daily.csv").write_bytes(data)
+    problems = problems_of(history(path))
+    assert "column 'member_id' is not valid UTF-8 at data row 10 (file line 11)" in problems
+    assert "SECRET" not in problems and "BBB" not in problems
+
+
+def test_unparsable_number_never_echoed(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(
+        path,
+        "prices_daily.csv",
+        "BBB UW Equity,2020-01-31,2.9,",
+        "BBB UW Equity,2020-01-31,SECRETX,",
+    )
+    problems = problems_of(history(path))
+    assert "column 'close' cannot be read as a number at data row 10 (file line 11)" in problems
+    assert "SECRETX" not in problems
+
+
+def test_unparsable_parquet_number_never_echoed(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pq.read_table(path / "total_return_index.parquet")
+    values = [str(v) for v in table["tr_index"].to_pylist()]
+    values[2] = "SECRETX"
+    i = table.schema.get_field_index("tr_index")
+    table = table.set_column(i, "tr_index", pa.array(values))
+    pq.write_table(table, path / "total_return_index.parquet")
+    problems = problems_of(history(path))
+    assert "column 'tr_index' cannot be read as a number at row 3" in problems
+    assert "SECRETX" not in problems
+
+
+@pytest.mark.parametrize(
+    ("column", "old", "new"),
+    [
+        ("isin", "XS0000000AA7", "XS0000000AA1"),  # bad check digit
+        ("isin", "XS0000000AA7", "xs0000000AA7"),
+        ("figi", "BBG000FAKE01", "BBG000FAKE0"),
+        ("composite_figi", "BBG000FAKC01", "BBX000FAKC01"),
+        ("share_class_figi", "BBG001FAKS01", "BBG001fakS01"),
+    ],
+)
+def test_identifier_formats_checked_without_echo(tmp_path, column, old, new):
+    path = csv_export(tmp_path)
+    edit_csv(path, "securities.csv", old, new)
+    problems = problems_of(history(path))
+    assert f"securities.csv: column {column!r} holds an invalid" in problems
+    assert "data row 1 (file line 2)" in problems
+    assert new not in problems
+
+
+def test_dates_timezone_must_be_exchange(tmp_path):
+    path = csv_export(tmp_path)
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["dates_timezone"] = "America/New_York"
+    rewrite(path, "manifest.json", json.dumps(manifest))
+    assert "dates_timezone must be 'exchange'" in problems_of(history(path))
+    manifest["dates_timezone"] = "Exchange"
+    rewrite(path, "manifest.json", json.dumps(manifest))
+    assert history(path).manifest.dates_timezone == "exchange"
+
+
+def test_non_session_tripwire(tmp_path):
+    fh = history(csv_export(tmp_path), max_non_session_share=MAX_NON_SESSION_SHARE)
+    with pytest.raises(HistoryFileError, match=r"prices: 1 row\(s\) .* for 15 loaded"):
+        fh.prices()
+    with pytest.raises(HistoryFileError, match="vendor_total_return: 1 row"):
+        fh.vendor_total_return()
+    assert history(csv_export(tmp_path / "b"), max_non_session_share=1 / 15).prices().num_rows
+    with pytest.raises(ValueError, match="max_non_session_share"):
+        history(csv_export(tmp_path / "c"), max_non_session_share=2)
+
+
+def test_trailing_comma_and_semicolon_named(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(
+        path, "total_return_index.csv", "member_id,date,tr_index,\nAAA UN Equity,2020-01-31,1,\n"
+    )
+    rewrite(
+        path, "index_snapshots.csv", "date;index;member_id;weight\n2020-01-31;IDX1;AAA UN Equity;\n"
+    )
+    problems = problems_of(history(path))
+    assert "total_return_index.csv: the header ends with a trailing comma" in problems
+    assert "index_snapshots.csv: the file is semicolon-separated" in problems
+
+
+def test_part_files_in_natural_order(tmp_path):
+    path = csv_export(tmp_path)
+    lines = (path / "corporate_actions.csv").read_text().splitlines()
+    header, rows = lines[0], lines[1:]
+    first = [r for r in rows if ",0.10," in r]
+    second = [r for r in rows if ",0.05," in r]
+    rest = [r for r in rows if r not in first + second]
+    (path / "corporate_actions.csv").unlink()
+    rewrite(path, "corporate_actions_part2.csv", "\n".join([header, *rest, *first]) + "\n")
+    rewrite(path, "corporate_actions_part10.csv", "\n".join([header, *second]) + "\n")
+    rows = history(path).actions().to_pylist()
+    ddd = sorted(
+        (r["action_seq"], r["amount"])
+        for r in rows
+        if r["source_symbol"] == tok("DDD UQ Equity")
+        and r["action_type"] == "cash_dividend_regular"
+    )
+    assert ddd == [(0, 0.10), (1, 0.05)]  # part2 is read before part10
+
+
+def test_exact_duplicate_action_kept_once(tmp_path):
+    path = csv_export(tmp_path)
+    text = (path / "corporate_actions.csv").read_text()
+    dup = next(ln for ln in text.splitlines() if "Stock Split" in ln)
+    rewrite(path, "corporate_actions.csv", text + dup + "\n")
+    fh = history(path)
+    baseline = history(csv_export(tmp_path / "b")).actions()
+    assert fh.actions().equals(baseline)
+    assert fh.report.dropped["corporate_actions"][DROP_DUPLICATE_ROW] == 1
+
+
+def test_unlisted_spinoff_target_counted(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "corporate_actions.csv", ",1,1,FFF UN Equity", ",1,1,ZZZ UN Equity")
+    fh = history(path)
+    spin = [r for r in fh.actions().to_pylist() if r["action_type"] == "spin_off"]
+    assert spin[0]["spinoff_symbol"] == tok("ZZZ UN Equity")
+    assert fh.report.unlisted_spinoff_targets == 1
+
+
+def test_restatement_load_time_after_previous(tmp_path):
+    fh = history(csv_export(tmp_path))
+    previous = fh.snapshots()
+    later = previous.set_column(
+        previous.schema.get_field_index("known_at"),
+        "known_at",
+        pa.array([LOAD] * previous.num_rows, previous.schema.field("known_at").type),
+    )
+    with pytest.raises(ValueError, match="strictly after"):
+        fh.snapshots(later, load_time=LOAD)
+    assert fh.snapshots(later, load_time=LOAD + timedelta(seconds=1)).num_rows == 0
+
+
+def test_build_all(tmp_path):
+    fh = history(csv_export(tmp_path))
+    result = fh.build_all(LOAD)
+    now = LOAD + timedelta(minutes=1)
+    for contract, table in (
+        (PRICES, result.prices),
+        (CORPORATE_ACTIONS, result.corporate_actions),
+        (VENDOR_TOTAL_RETURN, result.vendor_total_return),
+        (INDEX_SNAPSHOTS, result.index_snapshots),
+        (FETCH_LOG, result.fetch_log),
+    ):
+        conform(contract, table, now=now)
+    assert result.observations.equals(fh.observations(LOAD))
+    assert result.report is fh.report
+    assert set(result.report.dropped) == {
+        "prices",
+        "corporate_actions",
+        "vendor_total_return",
+        "index_snapshots",
+    }
+    assert result.report.fetch_log["members"] == 6
+    with pytest.raises(ValueError, match="export_time"):
+        fh.build_all(EXPORT - timedelta(seconds=1))

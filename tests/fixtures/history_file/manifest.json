@@ -1,7 +1,7 @@
 {
   "export_time": "2020-04-02T18:00:00+00:00",
   "adjustment": "None",
-  "dates_timezone": "America/New_York",
+  "dates_timezone": "exchange",
   "dividends": "gross",
   "source_description": "Synthetic history-file export for tests (fake members, fake indices)",
   "fields": "close, volume, currency, open, high, low",

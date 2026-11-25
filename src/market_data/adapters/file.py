@@ -2,31 +2,44 @@
 
 The history-file format is the door for anyone with their own data, and the path for a private
 one-shot export. It is not a network adapter: it has no ``fetch``/``parse`` and does not implement
-the ``Adapter`` protocol, so it is not declared under the ``market_data.adapters`` entry point; a
-caller builds ``FileHistory(path)`` and publishes the tables it returns.
+the ``Adapter`` protocol, so it is not declared under the ``market_data.adapters`` entry point.
+Entry point: ``FileHistory(path).build_all(load_time)`` returns every table and the filled load
+report (``LoadResult``); the caller publishes the tables.
 
 Format (a directory)
     ``manifest.json`` (an object) or ``manifest.csv`` (header ``key,value``), required keys
     ``export_time`` (ISO 8601 with offset), ``adjustment`` (must be ``none``: prices raw,
-    unadjusted; anything else refuses the whole load), ``dates_timezone``, ``dividends``
-    (``gross`` or ``net``), ``source_description``; optional ``fields``, ``notes``.
-    Then ``securities`` (required), ``prices_daily``, ``index_snapshots`` (at least one of them),
-    ``corporate_actions`` and ``total_return_index`` (optional), each as Parquet (preferred) or
-    CSV (UTF-8, comma, header), possibly split into parts (``prices_daily_part001.parquet``, any
-    ``<name>*.parquet|csv``, read in file-name order; one format per table). Columns in
-    ``FILE_COLUMNS``; dates ``YYYY-MM-DD``; ``.`` decimal; empty = unknown.
+    unadjusted; anything else refuses the whole load), ``dates_timezone`` (must be
+    ``exchange``: every date is the local trading date of the member's exchange, the only
+    convention supported), ``dividends`` (``gross`` or ``net``), ``source_description``;
+    optional ``fields``, ``notes``. Then ``securities`` (required), ``prices_daily``,
+    ``index_snapshots`` (at least one of them), ``corporate_actions`` and
+    ``total_return_index`` (optional), each as Parquet (preferred) or CSV (UTF-8, comma,
+    header), possibly split into parts (``prices_daily_part001.parquet``, any
+    ``<name>*.parquet|csv``, read in natural file-name order: part2 before part10; one format per
+    table). Columns in ``FILE_COLUMNS``; dates ``YYYY-MM-DD``; ``.`` decimal; empty = unknown.
 
 Strict input (``validate()`` lists every problem; each table method raises ``HistoryFileError``
-while there is one): a tab-separated file or an unnamed row-number column is refused (re-export as
-comma CSV or Parquet without the row number); ``-``, ``N/A``, ``NA``, ``#N/A`` in any cell and
-NaN or infinite numbers are refused with the file, column and first row; missing required files,
-keys, columns or values, CSV and Parquet parts mixed for one table, duplicate keys, member ids
-absent from ``securities``, a fractional volume, a timezone-aware or non-midnight timestamp as a
-date, and an ``action_type`` column outside ``ACTION_TYPES`` or disagreeing with the mapped
-``source_action_type`` are refused. Problems never quote a member id or a name.
-Tolerated and listed in ``report.ignored`` (they cannot change the meaning of known columns):
-files that are not part of the format, columns of a known file outside ``FILE_COLUMNS`` (not
-read), unknown manifest keys.
+while there is one). Refused:
+    - a tab- or semicolon-separated file, an unnamed row-number column, a header ending with a
+      trailing comma (re-export as comma CSV or Parquet); a malformed CSV line (field count);
+      invalid UTF-8;
+    - "unknown" placeholders, compared after trim + casefold: in numeric and date columns
+      ``NUMERIC_SENTINELS`` (``-``, ``n/a``, ``na``, ``#n/a``); in text columns
+      ``TEXT_SENTINELS`` (``-``, ``--``, ``n/a``, ``null``, ``nan``) or any ``#n/a...`` prefix,
+      but not ``na`` (Amsterdam's exchange code, Namibia);
+    - NaN or infinite numbers; a fractional volume; a timezone-aware or non-midnight timestamp as
+      a date; an ISIN not matching ``^[A-Z]{2}[A-Z0-9]{9}[0-9]$`` with a valid check digit; a
+      FIGI (``figi``, ``composite_figi``, ``share_class_figi``) not matching
+      ``^BBG[0-9A-Z]{9}$``;
+    - missing required files, manifest keys, columns or values; CSV and Parquet parts mixed for
+      one table; duplicate keys; member ids absent from ``securities``; an ``action_type``
+      column outside ``ACTION_TYPES`` or disagreeing with the mapped ``source_action_type``.
+Messages name the file, the column and the row ("data row N (file line N+1)" for CSV), never a
+cell's content (pyarrow's own messages, which quote rows, are never shown); only the matched
+placeholder itself is quoted. Tolerated and listed in ``report.ignored`` (they cannot change
+the meaning of known columns): files that are not part of the format, columns of a known file
+outside ``FILE_COLUMNS`` (not read), unknown manifest keys.
 
 Token salt: ``MOF_MARKET_TOKEN_SALT`` (or ``salt=``), at least ``MIN_SALT_BYTES`` (16) bytes.
 
@@ -38,12 +51,14 @@ Look-ahead guard (spec §9.3)
 ``known_at`` (spec §7.3)
     Prices and vendor total return: the session close in UTC of the row's date on the member's
     exchange calendar (``published`` / ``session_close``). A date that is not a session is
-    dropped (``non_session``); a session closing after ``export_time`` is dropped
-    (``after_export``: a partial bar, as the builder's intraday drop). Snapshots (no calendar
-    needed): snapshot date 23:59:59.999999 UTC
-    (``published`` / ``snapshot_date``), capped at ``export_time`` (then ``collected`` /
-    ``fetch_time``). Actions: the provider builder's rule (``market_data._calendars``), capped at
-    ``export_time``. Observations and fetch log: ``load_time`` (``collected``).
+    dropped (``non_session``); when those drops exceed ``max_non_session_share`` (default
+    0.5 %) of the loaded rows the load is refused (tripwire for dates that are not
+    exchange-local). A session closing after ``export_time`` is dropped (``after_export``: a
+    partial bar, as the builder's intraday drop). Snapshots (no calendar needed): snapshot date
+    23:59:59.999999 UTC (``published`` / ``snapshot_date``), capped at ``export_time`` (then
+    ``collected`` / ``fetch_time``). Actions: the provider builder's rule
+    (``market_data._calendars``), capped at ``export_time``. Observations and fetch log:
+    ``load_time`` (``collected``).
 
 Exchange calendars
     A member's exchange code is ``securities.exchange_code``, else the second word of its
@@ -55,12 +70,19 @@ Exchange calendars
 
 Corporate actions: an explicit ``action_type`` wins, else ``source_action_type`` through
 ``action_types`` (case-insensitive); unknown labels are kept out and counted, never guessed.
+An exact duplicate row is kept once and counted (``duplicate_row``). Spin-off targets absent
+from ``securities`` get a token but no label; their number is reported.
 
-Restatement (``snapshots(previous_snapshots, load_time=)``): for an (index, date) filed again,
-published members now absent get ``is_member=false``, and new or changed members are re-emitted,
-all at ``load_time`` (``collected`` / ``load_time``); unchanged rows are not re-emitted.
+Restatement (``snapshots(previous_snapshots, load_time=)``): ``load_time`` must be strictly
+after every ``known_at`` already published; for an (index, date) filed again, published
+members now absent get ``is_member=false``, and new or changed members are re-emitted, all at
+``load_time`` (``collected`` / ``load_time``); unchanged rows are not re-emitted.
 
-Load report: ``FileHistory.report`` (counts only, no label) is filled as tables are built.
+Load report: ``FileHistory.report`` (``LoadReport``: counts, ignored names, never a label) is
+filled as tables are built.
+
+Memory: everything is held in memory. Measured on synthetic data, 20M price rows peak at about
+4.4 GB (raw + ``prices``); with a vendor total-return file of the same size, about 6.6 GB.
 """
 
 from __future__ import annotations
@@ -103,17 +125,23 @@ from market_data.tokens import MIN_SALT_BYTES, salt_from_env, token
 
 __all__ = [
     "DEFAULT_EXCHANGE_MICS",
+    "DATES_TIMEZONE",
     "DROP_AFTER_EXPORT",
+    "DROP_DUPLICATE_ROW",
     "DROP_NON_SESSION",
     "DROP_UNKNOWN_ACTION_TYPE",
     "DROP_UNMAPPED_EXCHANGE",
     "FILE_COLUMNS",
     "OBSERVATION_SCHEMA",
-    "SENTINELS",
+    "NUMERIC_SENTINELS",
+    "TEXT_SENTINELS",
+    "TEXT_SENTINEL_PREFIX",
     "FileHistory",
     "HistoryFileError",
     "Ignored",
     "LoadReport",
+    "LoadResult",
+    "MAX_NON_SESSION_SHARE",
     "Manifest",
     "default_action_types",
 ]
@@ -122,8 +150,17 @@ __all__ = [
 DEFAULT_EXCHANGE_MICS: Mapping[str, str] = MappingProxyType(
     {code: "XNYS" for code in ("UN", "UW", "UQ", "UA", "UP", "UF", "UR", "UV", "US")}
 )
-# Cell values that mean "unknown" in some exports; the format says empty, so they are refused.
-SENTINELS = ("-", "N/A", "NA", "#N/A")
+# Cell values that mean "unknown" in some exports; the format says empty, so they are refused
+# (compared after trim + casefold). In text columns "na" is a real value (Amsterdam's exchange
+# code, Namibia's country code), so it is not a text sentinel.
+NUMERIC_SENTINELS = ("-", "n/a", "na", "#n/a")
+TEXT_SENTINELS = ("-", "--", "n/a", "null", "nan")
+TEXT_SENTINEL_PREFIX = "#n/a"
+# Tripwire: price (or vendor TR) rows dropped as non-session above this share of the loaded rows
+# refuse the load (dates that are not exchange-local trading dates).
+MAX_NON_SESSION_SHARE = 0.005
+DATES_TIMEZONE = "exchange"
+DROP_DUPLICATE_ROW = "duplicate_row"
 DROP_NON_SESSION = "non_session"
 DROP_AFTER_EXPORT = "after_export"
 DROP_UNMAPPED_EXCHANGE = "unmapped_exchange"
@@ -140,6 +177,8 @@ _MANIFEST_REQUIRED = (
 )
 _MANIFEST_OPTIONAL = ("fields", "notes")
 _DIVIDENDS = ("gross", "net")
+_ISIN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
+_FIGI = re.compile(r"^BBG[0-9A-Z]{9}$")
 _ROW_NUMBER = re.compile(r"^(|Unnamed: ?\d+|__index_level_\d+__)$")
 _EOD = timedelta(days=1) - timedelta(microseconds=1)
 _TS = pa.timestamp("us", tz="UTC")
@@ -301,6 +340,8 @@ class LoadReport:
     unknown_action_types: dict[str, int] = field(default_factory=dict)
     ignored: Ignored = field(default_factory=Ignored)
     fetch_log: dict[str, int] = field(default_factory=dict)
+    # distinct spinoff_member_id values absent from securities (tokens computed, no labels)
+    unlisted_spinoff_targets: int = 0
 
 
 def _norm_type(label: str) -> str:
@@ -330,24 +371,141 @@ def _first(mask: pa.ChunkedArray | pa.Array) -> int | None:
     return pc.index(mask, True).as_py()
 
 
-def _sentinel_problems(fname: str, table: pa.Table) -> list[str]:
+def _where(fname: str, i: int) -> str:
+    """Position of the 0-based data row ``i`` of a file, for messages (never its content)."""
+    if fname.endswith(".csv"):
+        return f"data row {i + 1} (file line {i + 2})"
+    return f"row {i + 1}"
+
+
+def _chunks(col: pa.ChunkedArray | pa.Array) -> list[pa.Array]:
+    return col.chunks if isinstance(col, pa.ChunkedArray) else [col]
+
+
+def _text_map(col, fn: Callable[[pa.Array], pa.Array], typ: pa.DataType) -> pa.ChunkedArray:
+    """``fn`` over the plain-string values of a text column (dictionary-aware, per chunk)."""
     out = []
-    values = pa.array(SENTINELS, pa.string())
+    for c in _chunks(col):
+        if pa.types.is_dictionary(c.type):
+            out.append(pc.take(fn(pc.cast(c.dictionary, _S)), c.indices))
+        else:
+            out.append(fn(pc.cast(c, _S)))
+    return pa.chunked_array(out, typ)
+
+
+def _sentinel_mask(col, text: bool) -> pa.ChunkedArray:
+    """Cells that are an "unknown" placeholder, compared after trim + casefold: in text columns
+    ``TEXT_SENTINELS`` or a ``#n/a`` prefix (``na`` is a real code there); in numeric and date
+    columns ``NUMERIC_SENTINELS``."""
+
+    def fn(arr: pa.Array) -> pa.Array:
+        norm = pc.utf8_lower(pc.utf8_trim_whitespace(arr))
+        found = pc.is_in(norm, value_set=pa.array(TEXT_SENTINELS if text else NUMERIC_SENTINELS))
+        if text:
+            found = pc.or_(found, pc.starts_with(norm, TEXT_SENTINEL_PREFIX))
+        return found
+
+    return _text_map(col, fn, pa.bool_())
+
+
+def _sentinel_problems(fname: str, table: pa.Table, spec: _Spec) -> list[str]:
+    out = []
     for name in table.column_names:
         col = table[name]
         if not _is_text(col.type):
             continue
-        row = _first(pc.is_in(col, value_set=values))
+        row = _first(_sentinel_mask(col, spec.columns[name] == _S))
         if row is not None:
+            cell = str(col[row].as_py()).strip()
+            shown = cell if len(cell) <= 4 else cell[:4] + "..."  # a sentinel, never a label
             out.append(
-                f"{fname}: column {name!r} holds {col[row].as_py()!r} at row {row + 1}: empty "
-                f"means unknown; never {', '.join(SENTINELS)} (re-export with empty cells)"
+                f"{fname}: column {name!r} holds {shown!r} at {_where(fname, row)}: empty means "
+                "unknown (re-export with empty cells)"
             )
+    return out
+
+
+def _parses(value: str, target: pa.DataType) -> bool:
+    try:
+        if target == _D:
+            date.fromisoformat(value.strip())
+        elif target == _I:
+            f = float(value)
+            return f == int(f)
+        else:
+            float(value)
+    except (ValueError, OverflowError):
+        return False
+    return True
+
+
+def _first_unparsable(col, target: pa.DataType) -> int | None:
+    """First row of a text column that does not parse as ``target`` (error path only)."""
+    for i, v in enumerate(pc.cast(col, _S).to_pylist()):
+        if v is not None and not _parses(v, target):
+            return i
+    return None
+
+
+def _first_bad_utf8(col: pa.ChunkedArray) -> int | None:
+    for i, v in enumerate(col.to_pylist()):
+        if v is None:
+            continue
+        try:
+            v.decode("utf-8")
+        except UnicodeDecodeError:
+            return i
+    return None
+
+
+_TYPE_NAMES = {_D: "a date (YYYY-MM-DD)", _F: "a number", _I: "a whole number", _S: "text"}
+
+
+def _isin_ok(v: str) -> bool:
+    if not _ISIN.match(v):
+        return False
+    digits = "".join(str(int(ch, 36)) for ch in v)
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch) * (2 if i % 2 else 1)
+        total += n - 9 if n > 9 else n
+    return total % 10 == 0
+
+
+def _figi_ok(v: str) -> bool:
+    return bool(_FIGI.match(v))
+
+
+_FORMATS: Mapping[str, tuple[Callable[[str], bool], str]] = {
+    "isin": (_isin_ok, "ISIN (2 letters, 9 letters or digits, a valid check digit)"),
+    "figi": (_figi_ok, "FIGI (BBG + 9 letters or digits)"),
+    "composite_figi": (_figi_ok, "FIGI (BBG + 9 letters or digits)"),
+    "share_class_figi": (_figi_ok, "FIGI (BBG + 9 letters or digits)"),
+}
+
+
+def _format_problems(fname: str, table: pa.Table) -> list[str]:
+    out = []
+    for name, (ok, expected) in _FORMATS.items():
+        if name not in table.column_names:
+            continue
+        for i, v in enumerate(table[name].to_pylist()):
+            if v is not None and not ok(v):
+                out.append(
+                    f"{fname}: column {name!r} holds an invalid {expected} at {_where(fname, i)}"
+                )
+                break
     return out
 
 
 def _header_problems(fname: str, names: list[str], spec: _Spec) -> list[str]:
     out = []
+    if len(names) > 1 and names[-1] == "":
+        out.append(
+            f"{fname}: the header ends with a trailing comma (an empty column name): re-export "
+            "without it"
+        )
+        names = names[:-1]
     numbered = [n for n in names if _ROW_NUMBER.match(n.strip())]
     if numbered:
         out.append(
@@ -371,23 +529,84 @@ def _csv_header(path: Path) -> tuple[list[str], list[str]]:
         return [], [f"{path.name}: empty file (a header line is required)"]
     names = next(csv.reader(io.StringIO(line)))
     if "\t" in line:
-        fields = line.split("\t")
-        numbered = bool(_ROW_NUMBER.match(fields[0].strip()))
+        numbered = bool(_ROW_NUMBER.match(line.split("\t")[0].strip()))
         return [], [
             f"{path.name}: the file is tab-separated (despite its name): re-export as "
             "comma-separated CSV or Parquet"
             + (", without the leading row-number column" if numbered else "")
             + "; a row-number column is refused too"
         ]
+    if ";" in line and len(names) == 1:
+        return [], [
+            f"{path.name}: the file is semicolon-separated: re-export as comma-separated CSV "
+            "(with '.' decimals) or Parquet"
+        ]
     return names, []
 
 
 def _known_columns(fname: str, names: list[str], spec: _Spec, ignored: Ignored) -> list[str]:
     """The spec columns among ``names``; the others are listed in ``ignored`` and not read."""
-    unknown = [n for n in names if n not in spec.columns]
+    unknown = [n for n in names if n not in spec.columns and n != ""]
     if unknown:
         ignored.columns[fname] = unknown
     return [n for n in names if n in spec.columns]
+
+
+def _diagnose_csv(path: Path, names: list[str], spec: _Spec) -> list[str]:
+    """Why a CSV file failed to convert, by position only (error path: pyarrow's own message
+    quotes the offending row or value, so it is never shown)."""
+    bad: list[tuple[int | None, int, int]] = []
+
+    def handler(row) -> str:
+        if not bad:
+            bad.append((row.number, row.expected_columns, row.actual_columns))
+        return "skip"
+
+    try:
+        raw = pv.read_csv(
+            path,
+            read_options=pv.ReadOptions(use_threads=False),
+            parse_options=pv.ParseOptions(invalid_row_handler=handler),
+            convert_options=pv.ConvertOptions(
+                column_types={n: pa.binary() for n in names},
+                include_columns=names,
+                null_values=[""],
+                strings_can_be_null=True,
+            ),
+        )
+    except pa.ArrowInvalid:
+        return [f"{path.name}: cannot be parsed as comma-separated CSV (check quoting)"]
+    if bad:
+        line, expected, actual = bad[0]
+        at = f"line {line}" if line is not None else "a line"
+        return [
+            f"{path.name}: malformed {at}: {actual} field(s) where the header has {expected} "
+            "(check separators, quoting and trailing commas)"
+        ]
+    out, strings = [], {}
+    for n in names:
+        try:
+            strings[n] = pc.cast(raw[n], _S)
+        except pa.ArrowInvalid:
+            row = _first_bad_utf8(raw[n])
+            at = _where(path.name, row) if row is not None else "some row"
+            out.append(f"{path.name}: column {n!r} is not valid UTF-8 at {at}")
+    if out:
+        return out
+    out = _sentinel_problems(path.name, pa.table(strings), spec)
+    if out:
+        return out
+    for n in names:
+        target = spec.columns[n]
+        if target == _S:
+            continue
+        row = _first_unparsable(strings[n], target)
+        if row is not None:
+            out.append(
+                f"{path.name}: column {n!r} cannot be read as {_TYPE_NAMES[target]} at "
+                f"{_where(path.name, row)}"
+            )
+    return out or [f"{path.name}: cannot be read as comma-separated CSV"]
 
 
 def _read_csv(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | None, list[str]]:
@@ -399,27 +618,24 @@ def _read_csv(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | Non
     if problems:
         return None, problems
     names = known
-
-    def options(types: Mapping[str, pa.DataType]) -> pv.ConvertOptions:
-        return pv.ConvertOptions(
-            column_types=types,
-            null_values=[""],
-            strings_can_be_null=True,
-            quoted_strings_can_be_null=True,
-            include_columns=names,
-        )
-
     read_types = {}
     for n in names:
         t = spec.columns[n]
         # integers read as float first: a "1234.0" volume is accepted, a fractional one refused
         read_types[n] = _MEMBER if n in spec.dictionary else (_F if t == _I else t)
     try:
-        table = pv.read_csv(path, convert_options=options(read_types))
-    except pa.ArrowInvalid as exc:
-        strings = pv.read_csv(path, convert_options=options({n: _S for n in names}))
-        found = _sentinel_problems(path.name, strings)
-        return None, found or [f"{path.name}: cannot be read: {exc}"]
+        table = pv.read_csv(
+            path,
+            convert_options=pv.ConvertOptions(
+                column_types=read_types,
+                null_values=[""],
+                strings_can_be_null=True,
+                quoted_strings_can_be_null=True,
+                include_columns=names,
+            ),
+        )
+    except pa.ArrowInvalid:
+        return None, _diagnose_csv(path, names, spec)
     return table, []
 
 
@@ -427,17 +643,33 @@ def _to_date(col: pa.ChunkedArray) -> pa.ChunkedArray:
     t = col.type
     if pa.types.is_timestamp(t):
         if t.tz is not None:
-            raise ValueError("dates must be plain dates (YYYY-MM-DD), not timezone-aware times")
+            raise ValueError("timezone-aware times are not dates")
         floor = pc.floor_temporal(col, unit="day")
         if not pc.all(pc.fill_null(pc.equal(floor, col), True)).as_py():
-            raise ValueError("dates must be plain dates (YYYY-MM-DD), found a time of day")
+            raise ValueError("a time of day is not a date")
         return pc.cast(col, _D, safe=False)
     return pc.cast(col, _D)
 
 
+def _empty_to_null(col) -> pa.ChunkedArray:
+    """An empty string is an empty cell (Parquet writers often keep ""); dictionary-aware."""
+    out = []
+    for c in _chunks(col):
+        if pa.types.is_dictionary(c.type):
+            values = pc.cast(c.dictionary, _S)
+            empty = pc.take(pc.equal(values, ""), c.indices)
+            indices = pc.if_else(empty, pa.scalar(None, c.indices.type), c.indices)
+            out.append(pa.DictionaryArray.from_arrays(indices, values))
+        else:
+            c = pc.cast(c, _S)
+            out.append(pc.if_else(pc.equal(c, ""), pa.scalar(None, _S), c))
+    return pa.chunked_array(out, out[0].type) if out else pa.chunked_array([], _S)
+
+
 def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | None, list[str]]:
-    """Cast every column to its spec type; check sentinels, NaN and required values."""
-    problems = _sentinel_problems(fname, table)
+    """Cast every column to its spec type; check sentinels, NaN, formats and required values.
+    Messages give the file, column and row, never a cell's content."""
+    problems = _sentinel_problems(fname, table, spec)
     if problems:
         return None, problems
     cols = {}
@@ -447,30 +679,40 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
             if target == _D:
                 col = _to_date(col)
             elif target == _S:
-                col = pc.cast(col, _S)
-                # an empty string is an empty cell (Parquet writers often keep "")
-                col = pc.if_else(pc.equal(col, ""), pa.scalar(None, _S), col)
+                if not _is_text(col.type):
+                    col = pc.cast(col, _S)
+                col = _empty_to_null(col)
             else:
                 col = pc.cast(col, target)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError, ValueError) as exc:
-            problems.append(f"{fname}: column {name!r} cannot be read as {target}: {exc}")
+            # only _to_date's own ValueError text is shown; pyarrow's may quote a cell
+            reason = str(exc) if type(exc) is ValueError else ""
+            row = _first_unparsable(col, target) if _is_text(col.type) else None
+            at = f" at {_where(fname, row)}" if row is not None else ""
+            problems.append(
+                f"{fname}: column {name!r} cannot be read as {_TYPE_NAMES[target]}{at}"
+                + (f" ({reason})" if reason else "")
+            )
             continue
         if pa.types.is_floating(col.type):
             row = _first(pc.invert(pc.is_finite(col)))
             if row is not None:
                 problems.append(
-                    f"{fname}: column {name!r} holds NaN or an infinite number at row {row + 1}"
+                    f"{fname}: column {name!r} holds NaN or an infinite number at "
+                    f"{_where(fname, row)}"
                 )
-        if name in spec.dictionary:
-            col = pc.cast(col, _MEMBER) if not pa.types.is_dictionary(col.type) else col
+        if name in spec.dictionary and col.type != _MEMBER:
+            col = pc.cast(col, _MEMBER)
         cols[name] = col
     for name in spec.non_null:
         if name in cols and cols[name].null_count:
             row = _first(pc.is_null(cols[name]))
             problems.append(
                 f"{fname}: required column {name!r} is empty in {cols[name].null_count} row(s), "
-                f"first at row {row + 1}"
+                f"first at {_where(fname, row)}"
             )
+    if not problems:
+        problems = _format_problems(fname, pa.table(cols))
     if problems:
         return None, problems
     return pa.table(cols), []
@@ -478,14 +720,19 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
 
 def _read_parquet(path: Path, spec: _Spec, ignored: Ignored) -> tuple[pa.Table | None, list[str]]:
     try:
-        names = pq.read_schema(path).names
-    except (pa.ArrowInvalid, OSError) as exc:
-        return None, [f"{path.name}: cannot be read as Parquet: {exc}"]
+        schema = pq.read_schema(path)
+    except (pa.ArrowInvalid, OSError):
+        return None, [f"{path.name}: cannot be read as Parquet (not Parquet, or corrupted)"]
+    names = schema.names
     known = _known_columns(path.name, names, spec, ignored)
     problems = _header_problems(path.name, names, spec)
     if problems:
         return None, problems
-    return pq.read_table(path, columns=known), []
+    dictionary = [c for c in spec.dictionary if c in known and _is_text(schema.field(c).type)]
+    try:
+        return pq.read_table(path, columns=known, read_dictionary=dictionary), []
+    except (pa.ArrowInvalid, OSError):
+        return None, [f"{path.name}: cannot be read as Parquet (corrupted, or invalid UTF-8 text)"]
 
 
 def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, list[str]]:
@@ -511,10 +758,13 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
                 if len(row) != 2:
                     return None, [f"{path.name}: each line must be 'key,value'"]
                 if row[0].strip() in raw:
-                    return None, [f"{path.name}: key {row[0].strip()!r} given twice"]
+                    return None, [f"{path.name}: a key is given twice"]
                 raw[row[0].strip()] = row[1]
-    except (ValueError, UnicodeDecodeError) as exc:
-        return None, [f"{path.name}: cannot be read: {exc}"]
+    except UnicodeDecodeError as exc:
+        return None, [f"{path.name}: not valid UTF-8 (byte offset {exc.start})"]
+    except ValueError as exc:  # JSON syntax: position only
+        where = f" (line {exc.lineno}, column {exc.colno})" if hasattr(exc, "lineno") else ""
+        return None, [f"{path.name}: cannot be read{where}"]
     problems = []
     ignored.manifest_keys = sorted(set(raw) - {*_MANIFEST_REQUIRED, *_MANIFEST_OPTIONAL})
     values: dict[str, str] = {}
@@ -537,8 +787,13 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
                 problems.append(f"{path.name}: export_time needs a UTC offset (e.g. +00:00)")
     if "adjustment" in values and values["adjustment"].casefold() != "none":
         problems.append(
-            f"{path.name}: adjustment must be 'none' (raw, unadjusted prices), got "
-            f"{values['adjustment']!r}: the whole load is refused"
+            f"{path.name}: adjustment must be 'none' (raw, unadjusted prices): the whole load "
+            "is refused"
+        )
+    if "dates_timezone" in values and values["dates_timezone"].casefold() != DATES_TIMEZONE:
+        problems.append(
+            f"{path.name}: dates_timezone must be {DATES_TIMEZONE!r} (dates are each exchange's "
+            "local trading dates): no other convention is supported"
         )
     if "dividends" in values and values["dividends"].casefold() not in _DIVIDENDS:
         problems.append(f"{path.name}: dividends must be 'gross' or 'net'")
@@ -548,7 +803,7 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
         Manifest(
             export_time=export_time,
             adjustment=values["adjustment"].casefold(),
-            dates_timezone=values["dates_timezone"],
+            dates_timezone=values["dates_timezone"].casefold(),
             dividends=values["dividends"].casefold(),
             source_description=values["source_description"],
             fields=values.get("fields"),
@@ -558,10 +813,17 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
     )
 
 
+def _natural(path: Path) -> list:
+    """Natural order of part files: part2 before part10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.name)]
+
+
 def _discover(directory: Path, ignored: Ignored) -> tuple[dict[str, list[Path]], list[str]]:
     files: dict[str, list[Path]] = {}
     problems = []
-    data = sorted(p for p in directory.iterdir() if p.suffix in (".csv", ".parquet"))
+    data = sorted(
+        (p for p in directory.iterdir() if p.suffix in (".csv", ".parquet")), key=_natural
+    )
     claimed: set[Path] = set()
     for name in _SPECS:
         parts = [p for p in data if p.stem.startswith(name)]
@@ -609,8 +871,10 @@ def _read_table(
     if spec.key and table.num_rows:
         keyed = table.select(list(spec.key))
         for c in spec.dictionary:
-            if c in spec.key:
-                keyed = keyed.set_column(keyed.schema.get_field_index(c), c, pc.cast(keyed[c], _S))
+            if c in spec.key:  # group on unified integer codes, not on 20M strings
+                keyed = keyed.set_column(
+                    keyed.schema.get_field_index(c), c, _member_index(keyed[c])[0]
+                )
         counts = keyed.group_by(list(spec.key)).aggregate([([], "count_all")])
         n = pc.sum(pc.greater(counts["count_all"], 1)).as_py() or 0
         if n:
@@ -624,6 +888,12 @@ def _read_table(
 def _const(value: Any, n: int, typ: pa.DataType) -> pa.Array:
     if value is None:
         return pa.nulls(n, typ)
+    if (
+        typ == _S and n * len(value.encode()) < 2**31
+    ):  # built from buffers: a 20M-row constant column in a fraction of a second
+        raw = value.encode()
+        offsets = np.arange(n + 1, dtype=np.int32) * len(raw)
+        return pa.Array.from_buffers(_S, n, [None, pa.py_buffer(offsets), pa.py_buffer(raw * n)])
     return pc.cast(
         pa.DictionaryArray.from_arrays(pa.array(np.zeros(n, np.int32)), pa.array([value], typ)),
         typ,
@@ -647,6 +917,20 @@ def _count(mask) -> int:
 
 
 @dataclass(frozen=True)
+class LoadResult:
+    """Every table of one load (contract schemas; observations in ``OBSERVATION_SCHEMA``) and
+    the filled load report."""
+
+    prices: pa.Table
+    corporate_actions: pa.Table
+    vendor_total_return: pa.Table
+    index_snapshots: pa.Table
+    observations: pa.Table
+    fetch_log: pa.Table
+    report: LoadReport
+
+
+@dataclass(frozen=True)
 class _Member:
     token: str
     exchange_code: str
@@ -660,7 +944,11 @@ class FileHistory:
     ``MIN_SALT_BYTES`` bytes: ``ValueError``). ``exchange_mics``: exchange code -> calendar MIC.
     ``action_types``: ``source_action_type`` (case-insensitive) -> ``action_type`` (default: the
     package data file ``file_action_types.json``). ``next_session_margin``: the actions calendar
-    margin (as the provider builder's)."""
+    margin (as the provider builder's). ``max_non_session_share``: the non-session tripwire
+    (default ``MAX_NON_SESSION_SHARE``, 0.5 %).
+
+    Entry point: ``build_all(load_time)`` validates, builds every table and returns them with the
+    filled ``LoadReport``; the per-table methods are its parts."""
 
     def __init__(
         self,
@@ -671,6 +959,7 @@ class FileHistory:
         exchange_mics: Mapping[str, str] = DEFAULT_EXCHANGE_MICS,
         action_types: Mapping[str, str] | None = None,
         next_session_margin: timedelta = NEXT_SESSION_MARGIN,
+        max_non_session_share: float = MAX_NON_SESSION_SHARE,
     ) -> None:
         self._salt = salt_from_env() if salt is None else bytes(salt)
         if len(self._salt) < MIN_SALT_BYTES:
@@ -685,6 +974,9 @@ class FileHistory:
         self.exchange_mics = {k.strip().upper(): v for k, v in exchange_mics.items()}
         self.action_types = {_norm_type(k): v for k, v in types.items()}
         self.next_session_margin = next_session_margin
+        if not 0 <= max_non_session_share <= 1:
+            raise ValueError("max_non_session_share must be within [0, 1]")
+        self.max_non_session_share = max_non_session_share
         self.report = LoadReport()
         self._problems: list[str] | None = None
         self._manifest: Manifest | None = None
@@ -743,13 +1035,13 @@ class FileHistory:
             mapped = self.action_types.get(_norm_type(s))
             if a not in ACTION_TYPES:
                 out.append(
-                    f"corporate_actions: row {i + 1}: action_type {a!r} is not one of "
-                    f"{ACTION_TYPES}"
+                    f"corporate_actions: row {i + 1} (over all parts): action_type is not one "
+                    f"of {ACTION_TYPES}"
                 )
             elif mapped is not None and mapped != a:
                 out.append(
-                    f"corporate_actions: row {i + 1}: action_type {a!r} disagrees with "
-                    f"source_action_type {s!r} (mapped to {mapped!r})"
+                    f"corporate_actions: row {i + 1} (over all parts): action_type disagrees "
+                    f"with its source_action_type, which maps to {mapped!r}"
                 )
         return out
 
@@ -838,12 +1130,23 @@ class FileHistory:
         mapped, n_unmapped = self._unmapped(table, idx, members)
         known = self._session_closes(raw, idx, members)
         after = pc.greater(known, pa.scalar(export, _TS))
+        non_session = _count(pc.and_(mapped, pc.is_null(known)))
         self.report.dropped[table] = {
             DROP_UNMAPPED_EXCHANGE: n_unmapped,
-            DROP_NON_SESSION: _count(pc.and_(mapped, pc.is_null(known))),
+            DROP_NON_SESSION: non_session,
             DROP_AFTER_EXPORT: _count(after),
         }
         keep = pc.fill_null(pc.invert(after), False)  # null known (unmapped, non-session) out
+        loaded = _count(keep)
+        if non_session > self.max_non_session_share * loaded:
+            raise HistoryFileError(
+                [
+                    f"{table}: {non_session} row(s) on dates that are not sessions of their "
+                    f"exchange for {loaded} loaded row(s), above max_non_session_share "
+                    f"{self.max_non_session_share:.2%}: are the dates exchange-local trading "
+                    "dates? (raise max_non_session_share only after checking)"
+                ]
+            )
         idx_k = pc.filter(idx, keep)
         # sort by (token, date) through integer ranks of the tokens
         tokens = [m.token for m in members]
@@ -978,6 +1281,12 @@ class FileHistory:
         pair = ["index_code", "valid_date"]
         key = ["index_code", "source_symbol", "valid_date"]
         prev = previous.filter(pc.equal(previous["source_code"], self.source_code))
+        newest = pc.max(prev["known_at"]).as_py() if prev.num_rows else None
+        if newest is not None and load_time <= newest:
+            raise ValueError(
+                "load_time must be strictly after every known_at of previous_snapshots "
+                f"(latest {newest.isoformat()})"
+            )
         prev = latest(prev.select(INDEX_SNAPSHOTS.schema.names), ["source_code", *key])
         prev = prev.select([*key, "snapshot_size", "weight", "is_member"]).rename_columns(
             [*key, "p_size", "p_weight", "p_member"]
@@ -1075,7 +1384,22 @@ class FileHistory:
         unknown: dict[str, int] = {}
         unmapped: dict[str, int] = {}
         kept: list[tuple[dict[str, Any], _Member, str]] = []
+        seen: set[tuple] = set()
+        duplicates = 0
+        self.report.unlisted_spinoff_targets = len(
+            {
+                r["spinoff_member_id"]
+                for r in rows
+                if r.get("spinoff_member_id") is not None
+                and r["spinoff_member_id"] not in self._members
+            }
+        )
         for r in rows:
+            whole = tuple(r.items())
+            if whole in seen:  # an exact duplicate row: kept once, counted
+                duplicates += 1
+                continue
+            seen.add(whole)
             member = self._members[r["member_id"]]
             action_type = r.get("action_type") or self.action_types.get(
                 _norm_type(r["source_action_type"])
@@ -1091,6 +1415,7 @@ class FileHistory:
         self.report.dropped["corporate_actions"] = {
             DROP_UNKNOWN_ACTION_TYPE: sum(unknown.values()),
             DROP_UNMAPPED_EXCHANGE: sum(unmapped.values()),
+            DROP_DUPLICATE_ROW: duplicates,
         }
         by_mic: dict[str, list[date]] = {}
         for r, member, _ in kept:
@@ -1141,6 +1466,31 @@ class FileHistory:
             key=lambda r: (r["source_symbol"], r["valid_date"], r["action_type"], r["action_seq"])
         )
         return pa.Table.from_pylist(out, schema=CORPORATE_ACTIONS.schema)
+
+    # -- entry point ---------------------------------------------------------------------------
+
+    def build_all(
+        self, load_time: datetime, *, previous_snapshots: pa.Table | None = None
+    ) -> LoadResult:
+        """The entry point: validate (``HistoryFileError`` listing every problem), then build
+        every table at ``load_time`` (observations, fetch log, and a restatement against
+        ``previous_snapshots`` when given) with the filled ``LoadReport``."""
+        self._load()
+        self._check_load_time(load_time)
+        snapshots = (
+            self.snapshots()
+            if previous_snapshots is None
+            else self.snapshots(previous_snapshots, load_time=load_time)
+        )
+        return LoadResult(
+            prices=self.prices(),
+            corporate_actions=self.actions(),
+            vendor_total_return=self.vendor_total_return(),
+            index_snapshots=snapshots,
+            observations=self.observations(load_time),
+            fetch_log=self.fetch_log(load_time),
+            report=self.report,
+        )
 
     # -- labels and fetch log ------------------------------------------------------------------
 
