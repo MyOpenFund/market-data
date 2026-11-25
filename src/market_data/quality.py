@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
@@ -64,6 +64,7 @@ from market_data.adapters.base import WHOLE_MARKET_SYMBOL
 
 __all__ = [
     "CHECKS",
+    "CORROBORATING_STATUSES",
     "DEFAULT_DIVERGENCE_THRESHOLD",
     "DEFAULT_JUMP_THRESHOLD",
     "JUMP_EXCUSING_ACTIONS",
@@ -89,6 +90,10 @@ QUALITY_FLAGS_SCHEMA = pa.schema(
         ("detail", pa.string()),
     ]
 )
+
+# Statuses of a symbol-level fetch that, past the end of the symbol's last window, corroborate
+# that end (the source was asked and had nothing): ``fetch_coverage`` rule 6.
+CORROBORATING_STATUSES = ("ok", "empty")
 
 _EPOCH = date(1970, 1, 1)
 # Composite (symbol, day) keys: code * _SHIFT + day + _OFFSET, day in int32 range.
@@ -551,6 +556,53 @@ def _merged_runs(log: pa.Table, start, end, s_days: np.ndarray | None) -> pa.Tab
     )
 
 
+def _last_returned(log: pa.Table) -> dict[tuple[str, str], date | None]:
+    """Per (source_code, source_symbol): the latest ``returned_to`` of its rows (None when no
+    row returned anything)."""
+    out: dict[tuple[str, str], date | None] = {}
+    for code, symbol, day in zip(
+        log["source_code"].to_pylist(),
+        log["source_symbol"].to_pylist(),
+        log["returned_to"].to_pylist(),
+        strict=True,
+    ):
+        seen = out.get((code, symbol))
+        out[(code, symbol)] = day if seen is None else (seen if day is None else max(seen, day))
+    return out
+
+
+def _extend_last_window(
+    part: pa.Table,
+    hi: pa.ChunkedArray,
+    last_start: Mapping[str, date],
+    last_returned: Mapping[tuple[str, str], date | None],
+) -> pa.Array:
+    """``hi`` with the symbol-level rows of a token's last (closed) window extended to the
+    fetch's end when the fetch says nothing came after the window (status in
+    ``CORROBORATING_STATUSES``) and no row of the symbol returned data after the window's end:
+    the source was asked and had nothing, which corroborates the end (a delisting)."""
+    out = hi.to_pylist()
+    rows = zip(
+        part["token"].to_pylist(),
+        part["source_code"].to_pylist(),
+        part["source_symbol"].to_pylist(),
+        part["status"].to_pylist(),
+        part["f_to"].to_pylist(),
+        part["w_from"].to_pylist(),
+        part["w_to"].to_pylist(),
+        strict=True,
+    )
+    for i, (token, code, symbol, status, f_to, w_from, w_to) in enumerate(rows):
+        if w_to is None or f_to <= w_to or status not in CORROBORATING_STATUSES:
+            continue
+        if w_from != last_start[token]:
+            continue  # a later window of the symbol names whoever came next
+        data_to = last_returned.get((code, symbol))
+        if data_to is None or data_to <= w_to:
+            out[i] = f_to
+    return pa.array(out, pa.date32())
+
+
 def fetch_coverage(
     fetch_log: pa.Table,
     identifiers: pa.Table,
@@ -582,6 +634,12 @@ def fetch_coverage(
        a fetch-log row touches that symbol (its own row, or a ``"*"`` row of its source);
        untouched ones are skipped (count them with ``ambiguous_mappings``).
     5. A ``"*"`` (whole-market) row covers every mapped instrument of its source over its range.
+    6. A symbol-level ``ok``/``empty`` row reaching past the end of the symbol's last (closed)
+       window covers that window's instrument through the row's ``requested_to`` when no row
+       of the symbol returned data after the window's end (``returned_to``): the source was
+       asked and had nothing, which corroborates the end (a history export's delisted member:
+       its last price ends the window, the export date ends the request). ``"*"`` rows are
+       unchanged (clipped to every window).
 
     Ranges of one (source_code, source_symbol, status) are merged first; with ``sessions`` (pass
     the coverage recipe's own), ranges with no session between them merge too (daily grouped
@@ -593,6 +651,7 @@ def fetch_coverage(
     s_days = _session_days(sessions)
     known = fetch_log["known_at"]
     log = fetch_log.filter(pc.less_equal(known, pa.scalar(as_of.astimezone(UTC), known.type)))
+    last_returned = _last_returned(log)
     log = log.filter(pa.array(~_superseded(log, s_days)))
     start, end, usable = _bounds(log)
     end = np.minimum(end, (as_of.astimezone(UTC).date() - _EPOCH).days)
@@ -621,15 +680,22 @@ def fetch_coverage(
             f"{min(len(touched), MAX_LISTED)}: {touched[:MAX_LISTED]}"
         )
     parts = [
-        own.join(windows, "token", join_type="inner"),
-        runs.filter(whole).join(windows, "source_code", "w_source", join_type="inner"),
+        (own.join(windows, "token", join_type="inner"), True),
+        (runs.filter(whole).join(windows, "source_code", "w_source", join_type="inner"), False),
     ]
+    last_start: dict[str, date] = {}
+    for token, start_day in zip(
+        windows["token"].to_pylist(), windows["w_from"].to_pylist(), strict=True
+    ):
+        last_start[token] = max(last_start.get(token, start_day), start_day)
     out = []
-    for part in parts:
+    for part, symbol_level in parts:
         if not part.num_rows:
             continue
         lo = pc.max_element_wise(part["f_from"], part["w_from"])
         hi = pc.min_element_wise(part["f_to"], part["w_to"])  # null w_to (open) is skipped
+        if symbol_level:
+            hi = _extend_last_window(part, hi, last_start, last_returned)
         table = pa.table(
             [part["instrument_id"], lo, hi, part["status"]], schema=FETCH_COVERAGE_SCHEMA
         )

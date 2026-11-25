@@ -711,3 +711,50 @@ def test_null_range_failure_superseded_by_a_later_null_range_success():
         [("*", None, None, "error", utc(2024, 1, 6)), ("*", D, D, "ok", utc(2024, 1, 7))],
     ):
         assert unsuperseded_failures(fetch_log(rows)).num_rows == 1
+
+
+def returned(log: pa.Table, *ends) -> pa.Table:
+    """The fetch log with returned_to set row by row."""
+    i = log.schema.get_field_index("returned_to")
+    return log.set_column(i, log.schema.field(i), pa.array(list(ends), pa.date32()))
+
+
+def test_symbol_fetch_after_the_last_window_corroborates_the_end():
+    # DEAD maps to A until the 4th (its last price); the fetch asked up to the 12th
+    ids = identifiers([(INST_A, f"{SRC}:DEAD", date(2024, 1, 1), date(2024, 1, 5))])
+    row = ("DEAD", date(2024, 1, 1), date(2024, 1, 12))
+    for status in ("ok", "empty"):
+        log = returned(fetch_log([(*row, status, utc(2024, 1, 13))]), date(2024, 1, 4))
+        assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+            (INST_A, date(2024, 1, 1), date(2024, 1, 12), status)
+        ]
+    # data returned after the window's end (someone else's): clipped as before
+    log = returned(fetch_log([(*row, "ok", utc(2024, 1, 13))]), date(2024, 1, 8))
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+        (INST_A, date(2024, 1, 1), date(2024, 1, 4), "ok")
+    ]
+    # a failed fetch extends nothing
+    log = returned(fetch_log([(*row, "error", utc(2024, 1, 13))]), date(2024, 1, 4))
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+        (INST_A, date(2024, 1, 1), date(2024, 1, 4), "error")
+    ]
+    # only the last window's instrument gets the extension
+    two = identifiers(
+        [
+            (INST_A, f"{SRC}:DEAD", date(2024, 1, 1), date(2024, 1, 3)),
+            (INST_C, f"{SRC}:DEAD", date(2024, 1, 3), date(2024, 1, 5)),
+        ]
+    )
+    log = returned(fetch_log([(*row, "ok", utc(2024, 1, 13))]), date(2024, 1, 4))
+    assert cov_rows(fetch_coverage(log, two, as_of=AS_OF)) == [
+        (INST_A, date(2024, 1, 1), date(2024, 1, 2), "ok"),
+        (INST_C, date(2024, 1, 3), date(2024, 1, 12), "ok"),
+    ]
+    # a whole-market row is unchanged: clipped to the window
+    log = returned(
+        fetch_log([("*", date(2024, 1, 1), date(2024, 1, 12), "ok", utc(2024, 1, 13))]),
+        date(2024, 1, 12),
+    )
+    assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
+        (INST_A, date(2024, 1, 1), date(2024, 1, 4), "ok")
+    ]

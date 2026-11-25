@@ -778,3 +778,37 @@ def test_restated_load_keeps_the_spans_of_the_full_snapshot_table(env, run):
     assert run("map", "--write") in (EXIT_OK, EXIT_DEGRADED)
     assert publish_pending(env["cfg"]).exit_code == 0
     assert open_windows(env["cfg"]) == before
+
+
+def test_history_delisting_is_corroborated_by_its_fetch_log(env, run):
+    from open_data_store.market.coverage import delisting_exits
+    from open_data_store.market.membership import membership_intervals
+
+    from market_data.quality import fetch_coverage
+
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    allowed = frozenset({"private_history"})
+    as_of = datetime.now(UTC)  # the history's fetch log is known at its load
+    with Store.open(env["cfg"]) as store:
+        result = pipeline.store_coverage(
+            store, index_code="IDX1", as_of=as_of, allowed_restricted=allowed
+        )
+        m = load_market_inputs(store, as_of=as_of, allowed_restricted=allowed)
+    bbb = {
+        r["instrument_id"]
+        for r in m.identifiers.to_pylist()
+        if r["id_scheme"] == "export_member_id" and r["id_value"] == "BBB UW Equity"
+    }.pop()
+    # BBB, dead on 2020-02-14, is still a member until the 2020-02-29 snapshot
+    tail = [r for r in result.per_member.to_pylist() if r["instrument_id"] == bbb]
+    assert {r["reason"] for r in tail if r["session_date"] > date(2020, 2, 14)} == {"delisted"}
+    iv = membership_intervals(m.snapshots, m.identifiers, index_code="IDX1", as_of=as_of)
+    rp = resolve_prices(m.prices, m.identifiers, as_of=as_of, precedence=())
+    cal = sessions("XNYS", date(2020, 1, 2), date(2020, 4, 9))
+    covered = fetch_coverage(m.fetch_log, m.identifiers, as_of=as_of, sessions=cal)
+    exits = delisting_exits(iv, rp, cal, fetch_coverage=covered)
+    assert (bbb, date(2020, 2, 14)) in {
+        (r["instrument_id"], r["exit_date"]) for r in exits.to_pylist()
+    }
