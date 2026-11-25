@@ -23,7 +23,10 @@ Endpoints (documented, verified on the free plan 2026-11-25), all under ``base_u
     FetchResult each, requested range ``[start, end]`` (future ex-dates are legitimate).
 ``symbols``, whole market
     ``GET /v3/reference/tickers?market=stocks&active=true`` then ``active=false``,
-    ``limit=1000``: one FetchResult each.
+    ``limit=1000``: one FetchResult each, its payload naming its list under
+    ``SYMBOLS_LIST_KEY`` (``{"market": "stocks", "active": "true"}``), read back by
+    ``symbols_list``: a newer fetch of one list replaces an older one of the same list only
+    (``pipeline.archive_observations``), never the other list's.
 
 Lists are atomic (ruling 68): every list (per-symbol aggregates, dividends, splits, tickers)
 follows ``next_url`` exactly as Massive gives it and is yielded as ONE FetchResult only once all
@@ -184,6 +187,7 @@ __all__ = [
     "SEQ_OVERFLOW",
     "SOURCE_CODE",
     "SPLIT_TYPES",
+    "SYMBOLS_LIST_KEY",
     "TICKERS_LIMIT",
     "TIMESTAMP_RANGE",
     "UNKNOWN_ADJUSTMENT_TYPE",
@@ -208,6 +212,8 @@ DEFAULT_MAX_HISTORY_DAYS = 730  # the free plan's 2-year window
 AGGS_LIMIT = 50000  # documented maximum of the aggregates endpoint
 LIST_LIMIT = 5000  # documented maximum of /stocks/v1/dividends and /stocks/v1/splits
 TICKERS_LIMIT = 1000  # documented maximum of /v3/reference/tickers
+# Our key (not Massive's) in a symbols payload: the request parameters naming the list fetched.
+SYMBOLS_LIST_KEY = "mof_list"
 DEFAULT_MIC = "XNYS"
 DEFAULT_EXCHANGE_TZ = "America/New_York"
 CURRENCY = "USD"
@@ -548,9 +554,14 @@ class MassiveAdapter:
     def _fetch_symbols(self) -> Iterator[FetchResult]:
         url = self.base_url + "/v3/reference/tickers"
         for active in ("true", "false"):
-            params = {"market": "stocks", "active": active, "limit": str(TICKERS_LIMIT)}
+            which = {"market": "stocks", "active": active}  # the list (SYMBOLS_LIST_KEY)
+            params = {**which, "limit": str(TICKERS_LIMIT)}
             yield from self._emit(
-                WHOLE_MARKET_SYMBOL, "symbols", None, None, lambda p=params: self._list(url, p)
+                WHOLE_MARKET_SYMBOL,
+                "symbols",
+                None,
+                None,
+                lambda p=params, w=which: self._list(url, p, note=w),
             )
 
     def _emit(
@@ -607,10 +618,15 @@ class MassiveAdapter:
         )
 
     def _list(
-        self, url: str, params: Mapping[str, str], *, aggs: bool = False
+        self,
+        url: str,
+        params: Mapping[str, str],
+        *,
+        aggs: bool = False,
+        note: Mapping[str, str] | None = None,
     ) -> tuple[bytes, Mapping[str, Any]]:
         """Every page of a list, following ``next_url`` as given (never on another host), merged
-        into one JSON object."""
+        into one JSON object; ``note``, when given, is kept in it under ``SYMBOLS_LIST_KEY``."""
         rows: list[Any] = []
         page: tuple[str, Mapping[str, str] | None] | None = (url, params)
         seen: set[str] = set()
@@ -639,6 +655,8 @@ class MassiveAdapter:
         merged: dict[str, Any] = {"status": "OK", "results": rows}
         if aggs:
             merged["adjusted"] = False
+        if note is not None:
+            merged[SYMBOLS_LIST_KEY] = dict(note)
         return json.dumps(merged, sort_keys=True).encode(), merged
 
     def _wait_turn(self) -> None:
@@ -686,6 +704,22 @@ class MassiveAdapter:
 
     def parse(self, result: FetchResult) -> pa.Table:
         return self.parse_report(result).table
+
+    def symbols_list(self, result: FetchResult) -> str | None:
+        """The list a ``symbols`` fetch belongs to (``Adapter`` optional method): its
+        ``SYMBOLS_LIST_KEY`` request parameters as canonical JSON, e.g. the active or the
+        inactive tickers; None for another kind, an unreadable payload or a fetch archived
+        without them (before they were kept)."""
+        if result.kind != "symbols":
+            return None
+        try:
+            body = _body(result.payload)
+        except MassiveError:
+            return None
+        note = body.get(SYMBOLS_LIST_KEY)
+        if not isinstance(note, dict) or not note:
+            return None
+        return json.dumps(note, sort_keys=True)
 
     def parse_report(self, result: FetchResult) -> ParseReport:
         """Rows and kept-out rows of one fetch; ``ValueError`` only for a payload unusable as a

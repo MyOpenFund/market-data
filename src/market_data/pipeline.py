@@ -499,9 +499,17 @@ def _with_source(table: pa.Table, code: str) -> pa.Table:
 
 def archive_observations(archive: RawArchive, adapter: Adapter) -> pa.Table | None:
     """Identifier observations of the source's archived ``symbols`` fetches
-    (``mapping.OBSERVATION_INPUT_SCHEMA``); None when it has none. Per (source, symbol, scheme,
-    value) only the rows of the latest fetch holding it are kept: an older fetch's sighting
-    (an "active" listing archived before the delisting) never stands next to a newer one."""
+    (``mapping.OBSERVATION_INPUT_SCHEMA``); None when it has none.
+
+    A source may fetch several lists (Massive: the active and the inactive tickers); the
+    adapter's optional ``symbols_list(result)`` names a fetch's list (absent, or None for a
+    fetch: one list, which then counts as the same list as any other). A fetch is *current*
+    when no newer fetch of its list was archived. Per (source, symbol, scheme, value), the rows
+    of the latest fetch holding it are kept, plus those of every current fetch holding it: an
+    older fetch of one list (an "active" sighting archived before the delisting) never stands
+    next to a newer fetch of that list, while the other list's sighting stays (a recycled
+    ticker: the active holder's open label next to the dead holder's dated one), whichever list
+    was archived first."""
     code = adapter.source_code
     schema = _mapping.OBSERVATION_INPUT_SCHEMA
     entries = [
@@ -513,18 +521,28 @@ def archive_observations(archive: RawArchive, adapter: Adapter) -> pa.Table | No
     if not entries:
         return None
     entries.sort(key=lambda e: (e.result.fetched_at.astimezone(UTC), e.archive_ref))
-    newest: dict[tuple, tuple[int, list[dict[str, Any]]]] = {}
-    for i, entry in enumerate(entries):
-        rows = _with_source(adapter.parse(entry.result), code)
-        for r in rows.select(schema.names).to_pylist():
-            key = (r["source_code"], r["source_symbol"], r["id_scheme"], r["id_value"])
-            seen = newest.get(key)
-            if seen is None or seen[0] < i:
-                newest[key] = (i, [r])
-            else:
-                seen[1].append(r)
-    kept = sorted(newest.values(), key=lambda v: v[0])
-    return pa.Table.from_pylist([r for _, rows in kept for r in rows], schema=schema)
+    which = getattr(adapter, "symbols_list", None)
+    lists = [which(e.result) if callable(which) else None for e in entries]
+    newer: set[str | None] = set()
+    current = [False] * len(entries)
+    for i in range(len(entries) - 1, -1, -1):  # newest first
+        # an unnamed list is every list: any newer fetch replaces it, it replaces any older one
+        current[i] = not newer if lists[i] is None else not ({None, lists[i]} & newer)
+        newer.add(lists[i])
+    fetched = [_with_source(adapter.parse(e.result), code) for e in entries]
+    rows = [t.select(schema.names).to_pylist() for t in fetched]
+    latest_holder: dict[tuple, int] = {}
+    for i, part in enumerate(rows):
+        for r in part:
+            latest_holder[(r["source_code"], r["source_symbol"], r["id_scheme"], r["id_value"])] = i
+    kept = [
+        r
+        for i, part in enumerate(rows)
+        for r in part
+        if current[i]
+        or latest_holder[(r["source_code"], r["source_symbol"], r["id_scheme"], r["id_value"])] == i
+    ]
+    return pa.Table.from_pylist(kept, schema=schema)
 
 
 def archive_spans(archive: RawArchive, adapter: Adapter) -> pa.Table:

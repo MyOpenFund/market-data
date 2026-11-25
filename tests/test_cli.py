@@ -750,6 +750,185 @@ def test_archive_observations_latest_fetch_wins_per_label():
     ]
 
 
+# A recycled ticker: FFF's old holder died in 2024 (inactive list), a new company listed under
+# FFF in 2025 (active list). Both lists come from one symbols fetch.
+FFF_NEW = {"ticker": "FFF", "market": "stocks", "active": True, "name": "Synthetic New Phi",
+           "composite_figi": "BBG000SYNF02", "list_date": "2025-01-02"}  # fmt: skip
+FFF_OLD = {"ticker": "FFF", "market": "stocks", "active": False, "name": "Synthetic Old Phi",
+           "composite_figi": "BBG000SYNF01", "list_date": "2010-01-04",
+           "delisted_utc": "2024-06-28T00:00:00Z"}  # fmt: skip
+
+
+def massive_symbols_fetch() -> list:
+    """The symbols fetch of a (fake-transport) Massive adapter: active list, then inactive."""
+    import httpx
+
+    from market_data.adapters.massive import MassiveAdapter
+
+    def answer(request):
+        row = FFF_NEW if request.url.params["active"] == "true" else FFF_OLD
+        return httpx.Response(200, json={"status": "OK", "results": [row]})
+
+    tick = iter(range(10**6))
+    with MassiveAdapter(
+        "synthetic-massive-key",
+        transport=httpx.MockTransport(answer),
+        sleep=lambda s: None,
+        clock=lambda: next(tick) * 100.0,
+    ) as adapter:
+        return list(adapter.fetch("symbols", [], None, None))
+
+
+def in_order(results: list, inactive_first: bool) -> list:
+    """The two list fetches with their fetched_at swapped when ``inactive_first``."""
+    from dataclasses import replace
+
+    active, inactive = results
+    if not inactive_first:
+        return [active, inactive]
+    return [replace(inactive, fetched_at=active.fetched_at),
+            replace(active, fetched_at=inactive.fetched_at)]  # fmt: skip
+
+
+def ticker_rows(obs: pa.Table) -> list[tuple]:
+    return sorted(
+        (r["source_symbol"], r["id_value"], r["valid_date"], r["valid_to"])
+        for r in obs.to_pylist()
+        if r["id_scheme"] in ("ticker", "composite_figi")
+    )
+
+
+def test_archive_observations_keep_both_lists_of_one_fetch():
+    from market_data.adapters.massive import MassiveAdapter
+    from market_data.archive import MemoryArchive
+
+    results = massive_symbols_fetch()
+    assert results[0].fetched_at < results[1].fetched_at
+    found = []
+    for inactive_first in (False, True):
+        archive = MemoryArchive()
+        for r in in_order(results, inactive_first):
+            archive.put(r)
+        found.append(ticker_rows(pipeline.archive_observations(archive, MassiveAdapter("k"))))
+    # the active holder keeps its open ticker label, the dead one its dated label
+    assert found[0] == [
+        ("FFF", "BBG000SYNF01", date(2010, 1, 4), date(2024, 6, 29)),
+        ("FFF", "BBG000SYNF02", date(2025, 1, 2), None),
+        ("FFF", "FFF", date(2010, 1, 4), date(2024, 6, 29)),
+        ("FFF", "FFF", date(2025, 1, 2), None),
+    ]
+    assert found[1] == found[0]  # whichever list was archived first
+
+
+def test_archive_observations_newer_fetch_of_a_list_replaces_the_older():
+    """I6 still holds per list: FFF's old holder listed active, then the next night's lists
+    say it died (inactive) and the active list no longer has it."""
+    from dataclasses import replace
+
+    from market_data.adapters.massive import MassiveAdapter
+    from market_data.archive import MemoryArchive
+
+    active, inactive = massive_symbols_fetch()
+    old_active = json.dumps({"status": "OK", "results": [{**FFF_OLD, "active": True,
+                                                          "delisted_utc": None}]})  # fmt: skip
+    body = json.loads(active.payload)
+    archive = MemoryArchive()
+    archive.put(
+        replace(
+            active,
+            fetched_at=datetime(2024, 3, 1, tzinfo=UTC),
+            payload=json.dumps({**body, "results": json.loads(old_active)["results"]}).encode(),
+        )
+    )
+    archive.put(replace(active, payload=json.dumps({**body, "results": []}).encode(),
+                        status="empty"))  # fmt: skip
+    archive.put(inactive)
+    rows = ticker_rows(pipeline.archive_observations(archive, MassiveAdapter("k")))
+    assert rows == [
+        ("FFF", "BBG000SYNF01", date(2010, 1, 4), date(2024, 6, 29)),
+        ("FFF", "FFF", date(2010, 1, 4), date(2024, 6, 29)),
+    ]
+
+
+def test_archive_observations_unnamed_list_fetch_is_replaced_by_any_newer_fetch():
+    """A symbols fetch archived before the payload named its list (or by an adapter without
+    ``symbols_list``) is replaced by any newer fetch, and replaces any older one."""
+    from dataclasses import replace
+
+    from market_data.adapters.massive import MassiveAdapter
+    from market_data.archive import MemoryArchive
+
+    active, inactive = massive_symbols_fetch()
+    legacy = json.dumps({"status": "OK", "results": [{**FFF_OLD, "active": True,
+                                                      "delisted_utc": None}]})  # fmt: skip
+    for at in (datetime(2024, 3, 1, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC)):
+        archive = MemoryArchive()
+        archive.put(replace(active, fetched_at=at, payload=legacy.encode()))
+        archive.put(active)
+        archive.put(inactive)
+        rows = ticker_rows(pipeline.archive_observations(archive, MassiveAdapter("k")))
+        if at.year == 2024:  # older: the named lists replace it
+            assert ("FFF", "FFF", date(2010, 1, 4), None) not in rows
+            assert len(rows) == 4
+        else:  # newer: it replaces both named lists, except a label only they hold
+            assert ("FFF", "FFF", date(2010, 1, 4), None) in rows
+            assert ("FFF", "BBG000SYNF02", date(2025, 1, 2), None) in rows
+
+
+@pytest.mark.parametrize("inactive_first", [False, True])
+def test_recycled_ticker_resolves_to_its_active_holder(env, run, monkeypatch, inactive_first):
+    from market_data.adapters.base import FetchResult
+
+    monkeypatch.setenv("MOF_MARKET_ADAPTERS", "massive")
+    archive = RawArchive(env["archive"])
+    for r in in_order(massive_symbols_fetch(), inactive_first):
+        archive.put(r)
+    days = (date(2025, 6, 2), date(2025, 6, 3))
+    for i, day in enumerate((date(2024, 6, 27), *days)):  # the old holder's last price first
+        stamp = int(datetime(day.year, day.month, day.day, 20, tzinfo=UTC).timestamp() * 1000)
+        bar = {"T": "FFF", "o": 30.0 + i, "h": 30.0 + i, "l": 30.0 + i, "c": 30.0 + i, "v": 900,
+               "t": stamp}  # fmt: skip
+        body = {"status": "OK", "adjusted": False, "results": [bar]}
+        archive.put(
+            FetchResult("massive", "*", "prices", day, day, NOW, "ok",
+                        json.dumps(body).encode(), "application/json")
+        )  # fmt: skip
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    assert run("build", "--write", "--source", "massive") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    with Store.open(env["cfg"]) as store:
+        ids = store.read_asof("instrument_identifiers").to_pylist()
+        holder = {
+            r["instrument_id"]
+            for r in ids
+            if r["id_scheme"] == "composite_figi" and r["id_value"] == "BBG000SYNF02"
+        }.pop()
+        dead = {
+            r["instrument_id"]
+            for r in ids
+            if r["id_scheme"] == "composite_figi" and r["id_value"] == "BBG000SYNF01"
+        }.pop()
+        labels = {
+            (r["instrument_id"], r["valid_to"])
+            for r in ids
+            if r["id_scheme"] == "ticker" and r["id_value"] == "FFF"
+        }
+        assert labels == {(holder, None), (dead, date(2024, 6, 29))}
+        out = api.prices(
+            ["FFF"],
+            days[0],
+            days[1],
+            profile="server",
+            store=store,
+            as_of=NOW,
+            source="massive",
+            allowed_restricted={"massive"},
+        )
+    assert set(out["instrument_id"].to_pylist()) == {holder}
+    assert out["close"].to_pylist() == [31.0, 32.0]
+
+
 def open_windows(cfg) -> list[tuple]:
     from open_data_store.market.asof import latest
 

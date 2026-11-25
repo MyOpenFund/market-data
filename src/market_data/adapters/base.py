@@ -134,7 +134,12 @@ class Adapter(Protocol):
     symbol fetch past the window means the name is gone (``quality.fetch_coverage`` rule 6).
     Absent: False, which a live provider must keep (Massive and Tiingo declare False): one
     ``empty`` answer for the next session (a halt, a late publication) or a renamed ticker is
-    no delisting. ``pipeline.corroborating_codes`` reads it."""
+    no delisting. ``pipeline.corroborating_codes`` reads it.
+
+    ``symbols_list(result) -> str | None``: for a source fetching several ``symbols`` lists
+    (Massive: active and inactive tickers), the list one fetch belongs to, read from what the
+    adapter archived in its payload; ``pipeline.archive_observations`` lets a newer fetch replace
+    an older one of the same list only. Absent, or None: one list."""
 
     source_code: str
     info: SourceInfo

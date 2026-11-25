@@ -433,6 +433,17 @@ def test_symbols_fetch_active_and_delisted_with_pagination():
         ("symbols", "*", "ok"),
     ]
     assert [r["ticker"] for r in json.loads(out[0].payload)["results"]] == ["AAA", "BBB"]
+    # each payload names its list (pipeline.archive_observations: a newer fetch replaces an
+    # older one of the same list only); parse ignores the key
+    a = make(Recorder())
+    assert [json.loads(a.symbols_list(r)) for r in out] == [
+        {"market": "stocks", "active": "true"},
+        {"market": "stocks", "active": "false"},
+    ]
+    assert a.parse(out[0])["source_symbol"].to_pylist()[0] == "AAA"
+    legacy = result("symbols", fixture("tickers_active.json"))  # archived before the key
+    assert a.symbols_list(legacy) is None
+    assert a.symbols_list(result("prices", {"results": []})) is None
 
 
 def test_fetch_arguments_validated():
