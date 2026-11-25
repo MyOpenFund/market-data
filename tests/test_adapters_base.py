@@ -63,7 +63,10 @@ def patch_entry_points(monkeypatch, eps):
 def test_every_shipped_adapter_is_registered_as_a_source():
     declared = tomllib.loads(PYPROJECT.read_text())["project"]["entry-points"]
     shipped = set(declared.get("market_data.adapters", {}))
+    assert shipped == {"massive"}
     assert shipped <= {s.code for s in sources()}
+    loaded = load_adapters(sorted(shipped))  # installed, loadable, code and registry consistent
+    assert set(loaded) == shipped
 
 
 def test_sources_registered_with_expected_access():

@@ -1,0 +1,11 @@
+{
+  "adjusted": false,
+  "queryCount": 2,
+  "resultsCount": 2,
+  "status": "OK",
+  "request_id": "synthetic-request-1",
+  "results": [
+    {"T": "AAA", "v": 120000, "vw": 10.41, "o": 10.0, "c": 10.5, "h": 10.8, "l": 9.9, "t": 1795208400000, "n": 900},
+    {"T": "BBB", "v": 5300.0, "vw": 19.7, "o": 20.0, "c": 19.5, "h": 20.2, "l": 19.1, "t": 1795208400000, "n": 40}
+  ]
+}

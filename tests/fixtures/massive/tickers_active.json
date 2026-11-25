@@ -1,0 +1,13 @@
+{
+  "status": "OK",
+  "request_id": "synthetic-request-7",
+  "count": 2,
+  "next_url": "https://api.massive.com/v3/reference/tickers?cursor=c3ludGhldGljLXRpY2tlcnM",
+  "results": [
+    {"ticker": "AAA", "name": "Synthetic Alpha Inc", "market": "stocks", "locale": "us", "active": true,
+     "composite_figi": "BBG000000AA1", "share_class_figi": "BBG000000AA2", "cik": "12345",
+     "list_date": "2001-02-03", "currency_name": "usd"},
+    {"ticker": "BBB", "name": "Synthetic Beta Corp", "market": "stocks", "locale": "us", "active": true,
+     "composite_figi": "BBG000000BB1", "cik": "0000067890"}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "status": "OK",
+  "request_id": "synthetic-request-4",
+  "next_url": "https://api.massive.com/stocks/v1/dividends?cursor=c3ludGhldGljLWN1cnNvcg",
+  "results": [
+    {"id": "d1", "ticker": "AAA", "cash_amount": 0.25, "split_adjusted_cash_amount": 0.125, "currency": "USD",
+     "declaration_date": "2026-11-05", "ex_dividend_date": "2026-11-20", "record_date": "2026-11-20",
+     "pay_date": "2026-12-01", "distribution_type": "recurring", "frequency": 4, "historical_adjustment_factor": 0.98},
+    {"id": "d2", "ticker": "BBB", "cash_amount": 1.0, "split_adjusted_cash_amount": 1.0, "currency": "USD",
+     "declaration_date": "2026-11-10", "ex_dividend_date": "2026-11-20", "distribution_type": "special", "frequency": 0},
+    {"id": "d3", "ticker": "BBB", "cash_amount": 0.1, "split_adjusted_cash_amount": 0.1, "currency": "USD",
+     "ex_dividend_date": "2026-11-20", "distribution_type": "supplemental"},
+    {"id": "d4", "ticker": "CCC", "cash_amount": 0.5, "currency": "USD",
+     "ex_dividend_date": "2026-11-23", "distribution_type": "unknown"}
+  ]
+}

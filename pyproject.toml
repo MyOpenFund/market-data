@@ -46,9 +46,10 @@ Organization = "https://github.com/MyOpenFund"
 market_data = "market_data.sources:sources"
 
 # Adapters shipped here are declared in the group "market_data.adapters", one entry per source
-# code, each a zero-argument callable returning an Adapter (none yet). Every one needs its source
-# registered in market_data.sources (tests/test_adapters_base.py enforces it).
+# code, each a zero-argument callable returning an Adapter. Every one needs its source registered
+# in market_data.sources (tests/test_adapters_base.py enforces it).
 [project.entry-points."market_data.adapters"]
+massive = "market_data.adapters.massive:adapter"
 
 [tool.hatch.metadata]
 # Needed for the git URL dependency above; remove with it.
