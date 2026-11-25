@@ -12,6 +12,18 @@ source adapters and writes it into [open-data-store](https://github.com/MyOpenFu
 - Only adapters you enable are loaded: set `MOF_MARKET_ADAPTERS` to a comma-separated list of
   source codes.
 
+## Identifier mapping
+
+Provider symbols are mapped to opaque instruments (`mof:<uuid>`) by `market_data.resolve.mapping`,
+one instrument per composite FIGI. Two optional settings, both environment variables:
+
+- `OPENFIGI_API_KEY`: your OpenFIGI key. Without it the resolver stays within the keyless quota
+  (25 requests a minute, 10 jobs per request); with it, 250 a minute and 100 jobs. Never logged.
+- `MOF_MARKET_MANUAL_MAPPING`: path to a reviewed CSV (`source_code`, `source_symbol`,
+  `instrument_id` or `composite_figi`, `valid_date`, `valid_to`, `link_reason`) that overrides
+  the automatic mapping for the series it names. Keep it on a private path: it is never
+  published.
+
 ## Writing an adapter in your own package
 
 Implement the `market_data.adapters.Adapter` protocol (`source_code`, `info`, `fetch`, `parse`),

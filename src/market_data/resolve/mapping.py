@@ -9,38 +9,52 @@ Rules
     - One instrument per composite FIGI. Its ``instrument_id`` is opaque, ``"mof:" +
       uuid4().hex`` (random); ids already published (``existing``, found through their
       ``composite_figi`` rows) are reused, never re-minted: determinism across runs comes from
-      passing ``existing``. New ids are listed in ``MappingResult.minted``.
-    - A series' candidate composite FIGIs come from its ``composite_figi`` observations, else
-      from its OpenFIGI results (observations win: OpenFIGI results of a series that has a
-      composite observation are ignored).
-    - One candidate: the mapping row covers the series' span, ``valid_date`` = span start,
-      ``valid_to`` = span end + 1 day (half-open). The observation's own dates are ignored
-      there (a history-file label is dated at the export, its span comes from the fetch log).
-      Without a span, the observation's window is used; with no start at all the series is
-      unresolved (``no_span``).
-    - Several candidates (a recycled ticker): each gets its observation window, a missing
-      start or end taken from the span, clipped to the span. Disjoint windows give one mapping
-      row per instrument; overlapping windows (or an undated candidate, e.g. OpenFIGI results
-      only) make the series ``ambiguous``: not mapped. Candidates entirely outside the span are
-      dropped; none left: unresolved (``outside_span``). No candidate: unresolved
-      (``no_composite_figi``). Both reports carry [source_code, source_symbol, reason,
-      candidates] and never a label; write them to private reports only.
+      passing ``existing``. New ids are listed in ``MappingResult.minted``. ``load_time`` must
+      be after every ``known_at`` of ``existing`` (a later run supersedes an earlier one).
+    - A series' candidate composite FIGIs come from its ``composite_figi`` observations (one
+      window per composite: the hull of its observation windows, so A -> B -> A on one symbol
+      overlaps and is ambiguous), else from its OpenFIGI results (observations win: OpenFIGI
+      results of a series that has a composite observation are ignored).
+    - Export-dated sources (``export_dated_sources``, default ``private_history``: a
+      history-file label is dated at the export) with one candidate: the mapping row covers the
+      series' span, ``valid_date`` = span start, ``valid_to`` = span end + 1 day (half-open).
+    - Every other series: each candidate maps over its own observation window (a missing start
+      or end taken from the span), clipped to the span; a closed observation window is honoured.
+      Disjoint windows give one mapping row per instrument (a recycled ticker); part of the
+      span covered by none is reported ``unresolved`` (``uncovered_span``) while the covered
+      parts are mapped. Overlapping windows, or several undated candidates, make the series
+      ``ambiguous`` (``several_composite_figis``): not mapped. Without a span the observation
+      window is used; with no start at all: ``unresolved`` (``no_span``). Candidates entirely
+      outside the span are dropped; none left: ``outside_span``. No candidate:
+      ``no_composite_figi``.
+    - A composite known only from OpenFIGI (a present-time answer, undated) is not mapped
+      (``ambiguous``) when another series of the same source claims it (``openfigi_shared``)
+      or when the series' span ended more than ``max_openfigi_age_days`` (default 30) before
+      the load date (``openfigi_stale``: the symbol may name someone else now).
+    - Reports carry [source_code, source_symbol, reason, candidates] and never a label; write
+      them to private reports only.
     - Mapping rows carry the series' ``source_code`` (``id_value`` =
       ``"<source_code>:<symbol>"``). ``link_reason`` is null, except ``venue_change`` on the
-      rows of two or more symbols of one source mapped to one instrument (that covers a renamed
-      symbol too). Their windows may overlap (a venue change with duplicated history): the
-      store's ``resolve_prices`` keeps identical rows once and raises on different values, so
-      such overlaps must carry identical rows or be made disjoint with a manual row.
-    - Identifier observations (``OBSERVED_SCHEMES``) become rows of the instrument their
-      series maps to: all of them when it maps to one instrument (whatever their dates); on a
-      recycled symbol, the instrument whose window the observation overlaps (a
-      ``composite_figi`` row goes to its own instrument). They keep the observation's
-      ``source_code``: a label from the private export stays under the restricted
-      ``private_history`` source. An observation without a date takes its instrument's window
-      start. Observations of an unmapped series, or of a recycled symbol overlapping several
-      (or none) of its instruments' windows, are not emitted. OpenFIGI-derived rows
-      (``composite_figi``, ``figi``, ``share_class_figi`` open-ended; ``ticker`` over the
-      mapping window) carry source ``openfigi``.
+      rows of two or more symbols of one source mapped to one instrument in the same run: that
+      covers a plain rename too, and depends on the batch (a symbol added in a later run alone
+      is not relabelled). Their windows may overlap (a venue change with duplicated history):
+      the store's ``resolve_prices`` keeps identical rows once and raises when any value of the
+      overlapping rows differs (close, volume, currency...), so such overlaps must carry
+      identical rows or be made disjoint with a manual row.
+    - Identifier observations (``OBSERVED_SCHEMES``) keep the observation's ``source_code`` (a
+      label from the private export stays under the restricted ``private_history`` source). A
+      ``composite_figi`` observation is emitted only on its own instrument (the one that
+      composite names), never on another company's window; when that instrument has no window
+      in the series (a manual override, a candidate outside the span) it is left out. Other
+      labels: on an export-dated series that is one instrument, all of them whatever their
+      dates; otherwise on the one instrument whose window the label overlaps. Labels left out
+      (``composite_not_mapped``, ``outside_windows``, ``several_windows``) are counted in
+      ``MappingResult.labels_left_out``; labels of an unmapped series are not (the series is
+      reported). An observation without a date takes its instrument's window start.
+    - OpenFIGI-derived rows (``composite_figi``, ``figi``, ``share_class_figi``, ``ticker``)
+      are dated at the load date and open-ended (present-time answers: never a span start or
+      an exit date), under the series' own source when it is restricted (a private token's
+      FIGIs stay ``private_history``), else ``openfigi``.
     - Manual mapping (``load_manual_mapping``; a reviewed private CSV at
       ``MOF_MARKET_MANUAL_MAPPING``) wins for every series it names: that series gets only the
       manual rows (source ``manual``, ``link_reason`` as filed, default ``manual``), whatever
@@ -48,12 +62,13 @@ Rules
       (published or minted in this run) or a ``composite_figi`` (its instrument, minted when
       new, with a ``manual`` ``composite_figi`` row so the id is found next run). With
       ``manual=None`` the published manual rows (from ``existing``) keep winning, so a run
-      without the file never flips a reviewed mapping; with a manual table it is the full truth
-      and published manual rows it no longer holds are closed.
+      without the file never flips a reviewed mapping; with a manual table (even empty) it is
+      the full truth and published manual rows it no longer holds are closed.
     - Closing: a published mapping row (in ``existing``, read latest) of a series this run
       covers that the run does not emit again is re-emitted with ``valid_to = valid_date``, an
       empty window the store never applies, so an outdated mapping (a series now manual,
-      ambiguous or re-dated) cannot clash with the new one.
+      ambiguous or re-dated) cannot clash with the new one. A series without a span this run
+      keeps its published windows as they are (never rewritten open-ended).
     - ``known_at`` = ``load_time`` (``collected`` / ``load_time``) for every row (spec §7.3).
 
 Spans: ``spans_from_fetch_log`` (per series, earliest ``requested_from`` (else
@@ -64,10 +79,11 @@ member whose prices stop before its last snapshot stays mapped on that snapshot)
 
 Issuer link (spec §7.1, V0 call): ``link_issuers`` adds ``cik`` rows (source ``sec``) for
 instruments whose current ticker is in the SEC ``company_tickers.json`` map. Current: the
-instrument's latest mapping window ends within ``max_staleness_days`` of ``as_of`` (default
-the latest mapping end of the table), and its ticker is the latest ticker row still open at
-``as_of``. Dead names get none. A ticker claimed by two current instruments, or mapped to two
-CIKs, links nothing (never a guess).
+instrument's latest mapping window ends within ``max_staleness_days`` of ``as_of`` (required),
+and its ticker is the latest ticker row still open at ``as_of``. Dead names get none. A ticker
+claimed by two current instruments, or mapped to two CIKs, links nothing (never a guess).
+Re-runs are idempotent (an unchanged published cik row is not re-emitted; a changed one is
+closed and replaced).
 """
 
 from __future__ import annotations
@@ -77,26 +93,35 @@ import os
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from open_data_store.contracts.rules import conform
 from open_data_store.contracts.standard.market import INSTRUMENT_IDENTIFIERS, LINK_REASONS
 from open_data_store.market.asof import latest
-from open_data_store.sources import SOURCE_CODE_PATTERN
+from open_data_store.sources import SOURCE_CODE_PATTERN, restricted_codes
 
 from market_data.adapters.base import RAW_SYMBOL_SCHEMA
 
 __all__ = [
+    "AMBIGUOUS_OPENFIGI_SHARED",
+    "AMBIGUOUS_OPENFIGI_STALE",
     "AMBIGUOUS_SEVERAL_COMPOSITES",
     "CURRENT_MAX_STALENESS_DAYS",
+    "EXPORT_DATED_SOURCES",
+    "LABELS_LEFT_OUT_SCHEMA",
+    "LABEL_COMPOSITE_NOT_MAPPED",
+    "LABEL_OUTSIDE_WINDOWS",
+    "LABEL_SEVERAL_WINDOWS",
     "MANUAL_MAPPING_ENV",
     "MANUAL_SCHEMA",
     "MANUAL_SOURCE",
+    "MAX_OPENFIGI_AGE_DAYS",
     "OBSERVATION_INPUT_SCHEMA",
     "OBSERVED_SCHEMES",
     "OPENFIGI_SOURCE",
@@ -107,6 +132,7 @@ __all__ = [
     "UNRESOLVED_NO_COMPOSITE",
     "UNRESOLVED_NO_SPAN",
     "UNRESOLVED_OUTSIDE_SPAN",
+    "UNRESOLVED_UNCOVERED_SPAN",
     "MappingResult",
     "build_mapping",
     "combine_spans",
@@ -134,7 +160,19 @@ OBSERVED_SCHEMES = (
 UNRESOLVED_NO_COMPOSITE = "no_composite_figi"
 UNRESOLVED_NO_SPAN = "no_span"
 UNRESOLVED_OUTSIDE_SPAN = "outside_span"
+UNRESOLVED_UNCOVERED_SPAN = "uncovered_span"
 AMBIGUOUS_SEVERAL_COMPOSITES = "several_composite_figis"
+AMBIGUOUS_OPENFIGI_SHARED = "openfigi_shared"
+AMBIGUOUS_OPENFIGI_STALE = "openfigi_stale"
+LABEL_COMPOSITE_NOT_MAPPED = "composite_not_mapped"
+LABEL_OUTSIDE_WINDOWS = "outside_windows"
+LABEL_SEVERAL_WINDOWS = "several_windows"
+# Sources whose identifier observations are dated at an export, not at the dates they describe
+# (the history-file adapter's default source code): their spans, not their dates, bound them.
+EXPORT_DATED_SOURCES = ("private_history",)
+# An OpenFIGI answer describes the present: it maps a series only while the series' span ended
+# at most this many days before the load (a dead series' symbol may name someone else now).
+MAX_OPENFIGI_AGE_DAYS = 30
 # An instrument whose last mapped date is this many days before ``as_of`` still counts as
 # current for the issuer link (a weekend, a holiday week, a late fetch).
 CURRENT_MAX_STALENESS_DAYS = 7
@@ -150,6 +188,15 @@ SPAN_SCHEMA = pa.schema(
         pa.field("source_symbol", pa.string(), nullable=False),
         pa.field("first_date", pa.date32()),
         pa.field("last_date", pa.date32()),
+    ]
+)
+# Identifier observations left out of the output, counted per series and reason.
+LABELS_LEFT_OUT_SCHEMA = pa.schema(
+    [
+        pa.field("source_code", pa.string(), nullable=False),
+        pa.field("source_symbol", pa.string(), nullable=False),
+        pa.field("reason", pa.string(), nullable=False),
+        pa.field("rows", pa.int64(), nullable=False),
     ]
 )
 REPORT_SCHEMA = pa.schema(
@@ -187,7 +234,8 @@ class MappingResult:
     identifiers: pa.Table  # INSTRUMENT_IDENTIFIERS, conformed (empty schema'd table when none)
     unresolved: pa.Table  # REPORT_SCHEMA
     ambiguous: pa.Table  # REPORT_SCHEMA
-    minted: tuple[str, ...] = ()  # instrument ids created by this run
+    minted: tuple[str, ...]  # instrument ids created by this run
+    labels_left_out: pa.Table  # LABELS_LEFT_OUT_SCHEMA (counts, never a label)
 
 
 @dataclass(frozen=True)
@@ -195,7 +243,7 @@ class _Window:
     instrument_id: str
     start: date
     end: date | None  # exclusive; None = open
-    composite: str | None  # the candidate that made it (None for a manual instrument_id row)
+    composite: str | None  # the candidate that made it (None: manual instrument_id, published)
 
 
 # -- small helpers -----------------------------------------------------------------------------
@@ -579,50 +627,85 @@ def _figi_rows(figi_results: pa.Table | None) -> list[dict[str, Any]]:
 # -- the mapping -------------------------------------------------------------------------------
 
 
+def _gap(windows: Iterable[tuple[date, date | None]], first: date, end: date | None) -> bool:
+    """True when the disjoint ``windows`` leave part of [first, end) uncovered."""
+    cursor = first
+    for start, stop in sorted(windows):
+        if start > cursor:
+            return True
+        cursor = max(cursor, stop or date.max)
+    return cursor < (end or date.max)
+
+
 def _candidate_windows(
     candidates: Mapping[str, tuple[date | None, date | None]],
     span: tuple[date | None, date | None] | None,
-) -> tuple[str, dict[str, tuple[date, date | None]]]:
-    """("ok" | a report reason, {composite: [start, end)})."""
+    *,
+    span_rule: bool,
+) -> tuple[str, dict[str, tuple[date, date | None]], bool]:
+    """("ok" | a report reason, {composite: [start, end)}, part of the span left uncovered)."""
     first, last = span if span else (None, None)
     span_end = last + _DAY if last else None
-    if len(candidates) == 1:
+    if span_rule and len(candidates) == 1:
+        # export-dated labels: the span, not the label date, bounds the one candidate
         ((composite, (start, end)),) = candidates.items()
         if span:
             start, end = first or start, span_end if last else end
         if start is None:
-            return UNRESOLVED_NO_SPAN, {}
-        return "ok", {composite: (start, end)}
+            return UNRESOLVED_NO_SPAN, {}, False
+        return "ok", {composite: (start, end)}, False
     windows: dict[str, tuple[date, date | None]] = {}
     for composite, (start, end) in candidates.items():
         start = _max(start, first) if start else first
         end = (min(end, span_end) if span_end else end) if end else span_end
         if start is None:
-            return AMBIGUOUS_SEVERAL_COMPOSITES, {}
+            reason = AMBIGUOUS_SEVERAL_COMPOSITES if len(candidates) > 1 else UNRESOLVED_NO_SPAN
+            return reason, {}, False
         if end is not None and end <= start:
             continue  # the source never served this candidate's dates
         windows[composite] = (start, end)
     if not windows:
-        return UNRESOLVED_OUTSIDE_SPAN, {}
+        return UNRESOLVED_OUTSIDE_SPAN, {}, False
     items = list(windows.values())
     if any(_overlaps(a, b) for i, a in enumerate(items) for b in items[i + 1 :]):
-        return AMBIGUOUS_SEVERAL_COMPOSITES, {}
-    return "ok", windows
+        return AMBIGUOUS_SEVERAL_COMPOSITES, {}, False
+    return "ok", windows, bool(first) and _gap(items, first, span_end)
 
 
-def _instrument_for_observation(row: Mapping[str, Any], windows: list[_Window]) -> _Window | None:
+def _place_label(
+    row: Mapping[str, Any], windows: list[_Window], ids: _Ids, span_rule: bool
+) -> tuple[_Window | None, str | None]:
+    """The window a label belongs to, or why it belongs to none."""
     if row["id_scheme"] == "composite_figi":
-        own = [w for w in windows if w.composite == row["id_value"]]
-        if own:
-            return min(own, key=lambda w: w.start)
-    if len({w.instrument_id for w in windows}) == 1:
-        # a series that is one instrument: every label is its own, whatever its date (a
-        # history-file label is dated at the export, after a dead member's last price)
-        return min(windows, key=lambda w: w.start)
-    hits = [w for w in windows if _overlaps((row["valid_date"], row["valid_to"]), (w.start, w.end))]
-    if len({w.instrument_id for w in hits}) != 1:
-        return None
-    return min(hits, key=lambda w: w.start)
+        # a composite FIGI only ever names its own instrument: never another company's
+        inst = ids.by_composite.get(row["id_value"])
+        own = [w for w in windows if w.instrument_id == inst]
+        if not own:
+            return None, LABEL_COMPOSITE_NOT_MAPPED
+        return min(own, key=lambda w: w.start), None
+    if span_rule and len({w.instrument_id for w in windows}) == 1:
+        # an export-dated label of a one-instrument series is its own, whatever its date
+        return min(windows, key=lambda w: w.start), None
+    label = (row["valid_date"], row["valid_to"])
+    hits = [w for w in windows if _overlaps(label, (w.start, w.end))]
+    found = {w.instrument_id for w in hits}
+    if not found:
+        return None, LABEL_OUTSIDE_WINDOWS
+    if len(found) > 1:
+        return None, LABEL_SEVERAL_WINDOWS
+    return min(hits, key=lambda w: w.start), None
+
+
+def _published_windows(prior: list[dict[str, Any]], value: str, source_code: str) -> list[_Window]:
+    """The open published automatic mapping windows of one series."""
+    return [
+        _Window(r["instrument_id"], r["valid_date"], r["valid_to"], None)
+        for r in prior
+        if r["id_scheme"] == SYMBOL_SCHEME
+        and r["id_value"] == value
+        and r["source_code"] == source_code
+        and (r["valid_to"] is None or r["valid_to"] > r["valid_date"])
+    ]
 
 
 def build_mapping(
@@ -633,19 +716,40 @@ def build_mapping(
     load_time: datetime,
     spans: pa.Table | None = None,
     manual: pa.Table | None = None,
+    export_dated_sources: Collection[str] = EXPORT_DATED_SOURCES,
+    max_openfigi_age_days: int = MAX_OPENFIGI_AGE_DAYS,
+    restricted: frozenset[str] | None = None,
 ) -> MappingResult:
     """``INSTRUMENT_IDENTIFIERS`` rows (identifier observations and ``source_symbol`` mapping
-    rows) plus the unresolved and ambiguous series. See the module docstring for the rules.
+    rows) plus the unresolved and ambiguous series and the labels left out. See the module
+    docstring for the rules.
 
     ``observations``: ``OBSERVATION_INPUT_SCHEMA`` rows (extra columns ignored);
     ``figi_results``: ``openfigi.FIGI_RESULT_SCHEMA`` rows; ``existing``: the published
-    ``INSTRUMENT_IDENTIFIERS`` rows (read latest here); ``spans``: ``SPAN_SCHEMA``;
-    ``manual``: ``MANUAL_SCHEMA`` (``load_manual_mapping``)."""
+    ``INSTRUMENT_IDENTIFIERS`` rows (read latest here; ``load_time`` must be after every one of
+    their ``known_at``); ``spans``: ``SPAN_SCHEMA``; ``manual``: ``MANUAL_SCHEMA``
+    (``load_manual_mapping``); ``export_dated_sources``: sources whose labels are dated at an
+    export (the span rule); ``max_openfigi_age_days``: how long after a series' span ends an
+    OpenFIGI (present-time) answer may still map it; ``restricted``: restricted source codes
+    (default: the registry's)."""
     load = _check_load_time(load_time)
+    if max_openfigi_age_days < 0:
+        raise ValueError("max_openfigi_age_days must be >= 0")
+    load_date = load.astimezone(UTC).date()
+    restricted = restricted_codes() if restricted is None else frozenset(restricted)
+    export_dated = frozenset(export_dated_sources)
     obs = _observation_rows(observations)
     figi = _figi_rows(figi_results)
     span_of = _span_map(spans)
-    prior = latest(existing, _KEY).to_pylist() if existing is not None and existing.num_rows else []
+    prior: list[dict[str, Any]] = []
+    if existing is not None and existing.num_rows:
+        newest = pc.max(existing["known_at"]).as_py()
+        if newest is not None and load <= newest:
+            raise ValueError(
+                "load_time must be after every known_at of the existing identifiers "
+                "(a later run supersedes an earlier one)"
+            )
+        prior = latest(existing, _KEY).to_pylist()
     ids = _Ids(prior)
     manual_given = manual is not None
     manual_rows = _manual_rows(manual) if manual_given else _manual_from(prior)
@@ -664,6 +768,15 @@ def build_mapping(
     from_figi: dict[Series, set[str]] = defaultdict(set)
     for r in figi:
         from_figi[(r["source_code"], r["source_symbol"])].add(r["composite_figi"])
+    # who claims a composite, per source (observed composites, OpenFIGI-only answers)
+    claims: dict[tuple[str, str], set[Series]] = defaultdict(set)
+    for s, cands in observed.items():
+        for c in cands:
+            claims[(s[0], c)].add(s)
+    for s, cands in from_figi.items():
+        if s not in observed and s not in manual_series:
+            for c in cands:
+                claims[(s[0], c)].add(s)
 
     scope = (
         {(r["source_code"], r["source_symbol"]) for r in obs}
@@ -675,9 +788,18 @@ def build_mapping(
     ambiguous: list[tuple[Series, str, int]] = []
     windows_of: dict[Series, list[_Window]] = defaultdict(list)
     via_openfigi: set[Series] = set()
+    kept: set[str] = set()  # id_values whose published windows this run keeps as they are
     mapping: list[dict[str, Any]] = []
 
     for s in sorted(scope - manual_series):
+        value = f"{s[0]}:{s[1]}"
+        if s not in span_of:
+            published = _published_windows(prior, value, s[0])
+            if published:
+                # no span this run: never rewrite a published (bounded) window open-ended
+                windows_of[s] = published
+                kept.add(value)
+                continue
         if s in observed:
             candidates = observed[s]
         elif s in from_figi:
@@ -686,19 +808,33 @@ def build_mapping(
         else:
             unresolved.append((s, UNRESOLVED_NO_COMPOSITE, 0))
             continue
-        status, windows = _candidate_windows(candidates, span_of.get(s))
+        if s in via_openfigi and len(candidates) == 1:
+            (c,) = candidates
+            last = span_of.get(s, (None, None))[1]
+            if len(claims[(s[0], c)]) > 1:
+                ambiguous.append((s, AMBIGUOUS_OPENFIGI_SHARED, 1))
+                continue
+            if last is not None and (load_date - last).days > max_openfigi_age_days:
+                ambiguous.append((s, AMBIGUOUS_OPENFIGI_STALE, 1))
+                continue
+        status, windows, uncovered = _candidate_windows(
+            candidates, span_of.get(s), span_rule=s[0] in export_dated
+        )
         if status == AMBIGUOUS_SEVERAL_COMPOSITES:
             ambiguous.append((s, status, len(candidates)))
             continue
         if status != "ok":
             unresolved.append((s, status, len(candidates)))
             continue
+        if uncovered:
+            unresolved.append((s, UNRESOLVED_UNCOVERED_SPAN, len(candidates)))
         for composite, (start, end) in sorted(windows.items(), key=lambda kv: kv[1][0]):
             inst = ids.for_composite(composite)
             windows_of[s].append(_Window(inst, start, end, composite))
-            mapping.append(_row(inst, SYMBOL_SCHEME, f"{s[0]}:{s[1]}", start, end, s[0], load))
+            mapping.append(_row(inst, SYMBOL_SCHEME, value, start, end, s[0], load))
 
-    # two or more symbols of one source on one instrument: a venue change (or a rename)
+    # two or more symbols of one source on one instrument in this batch: a venue change (or a
+    # rename); a symbol added in a later run alone is not relabelled
     symbols_of: dict[tuple[str, str], set[str]] = defaultdict(set)
     for r in mapping:
         symbols_of[(r["source_code"], r["instrument_id"])].add(r["id_value"])
@@ -728,12 +864,16 @@ def build_mapping(
                  MANUAL_SOURCE, load, m["link_reason"] or "manual")
         )  # fmt: skip
 
+    left_out: dict[tuple[Series, str], int] = defaultdict(int)
     for r in obs:
-        windows = windows_of.get((r["source_code"], r["source_symbol"]))
+        s = (r["source_code"], r["source_symbol"])
+        windows = windows_of.get(s)
         if not windows:
-            continue
-        w = _instrument_for_observation(r, windows)
+            continue  # the series itself is reported unresolved or ambiguous
+        span_rule = s[0] in export_dated and s not in manual_series
+        w, why = _place_label(r, windows, ids, span_rule)
         if w is None:
+            left_out[(s, why)] += 1
             continue
         labels.append(
             _row(w.instrument_id, r["id_scheme"], r["id_value"], r["valid_date"] or w.start,
@@ -746,15 +886,12 @@ def build_mapping(
         (w,) = windows_of[s]
         if r["composite_figi"] != w.composite:
             continue
-        for scheme, end in (
-            ("composite_figi", None),
-            ("figi", None),
-            ("share_class_figi", None),
-            ("ticker", w.end),
-        ):
+        # present-time answers: dated at the load, under the series' source when restricted
+        source = s[0] if s[0] in restricted else OPENFIGI_SOURCE
+        for scheme in ("composite_figi", "figi", "share_class_figi", "ticker"):
             if r[scheme]:
                 labels.append(
-                    _row(w.instrument_id, scheme, r[scheme], w.start, end, OPENFIGI_SOURCE, load)
+                    _row(w.instrument_id, scheme, r[scheme], load_date, None, source, load)
                 )
 
     # close published mapping rows this run supersedes
@@ -765,6 +902,8 @@ def build_mapping(
             continue
         if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
             continue  # already closed
+        if r["id_value"] in kept and r["source_code"] != MANUAL_SOURCE:
+            continue
         if r["id_value"] in in_scope or (manual_given and r["source_code"] == MANUAL_SOURCE):
             mapping.append(
                 _row(r["instrument_id"], SYMBOL_SCHEME, r["id_value"], r["valid_date"],
@@ -776,6 +915,13 @@ def build_mapping(
         unresolved=_report(unresolved),
         ambiguous=_report(ambiguous),
         minted=tuple(ids.minted),
+        labels_left_out=pa.Table.from_pylist(
+            [
+                {"source_code": s[0], "source_symbol": s[1], "reason": why, "rows": n}
+                for (s, why), n in sorted(left_out.items())
+            ],
+            schema=LABELS_LEFT_OUT_SCHEMA,
+        ),
     )
 
 
@@ -791,41 +937,45 @@ def link_issuers(
     sec_tickers: pa.Table,
     *,
     load_time: datetime,
-    as_of: date | None = None,
+    as_of: date,
     max_staleness_days: int = CURRENT_MAX_STALENESS_DAYS,
 ) -> pa.Table:
     """``identifiers`` plus a ``cik`` row (source ``sec``) for each current instrument whose
     current ticker is in ``sec_tickers`` (the SEC ``company_tickers.json`` map: columns ``cik``,
-    ``ticker``; others ignored). See the module docstring for "current". Tickers compare
+    ``ticker``; others ignored). See the module docstring for "current" (``as_of`` is required:
+    the date the SEC map describes, normally the load date). Tickers compare
     case-insensitively with ``.`` and ``/`` read as ``-`` (``BRK.B`` = ``BRK-B``). The CIK is
     written as 10 digits; ``valid_date`` is the load date (the map is a present-time
-    observation), open-ended; ``known_at`` = ``load_time`` (``collected`` / ``load_time``)."""
+    observation), open-ended; ``known_at`` = ``load_time`` (``collected`` / ``load_time``).
+
+    Idempotent: an instrument whose published ``sec`` cik row (read latest) already holds the
+    CIK gets nothing new; one holding another CIK gets that row closed (re-emitted with
+    ``valid_to = valid_date``) and the new one. Feeding the output back in at the same
+    ``load_time`` adds nothing; closing a row published at this very ``load_time`` raises."""
     load = _check_load_time(load_time)
+    if not isinstance(as_of, date) or isinstance(as_of, datetime):
+        raise TypeError("as_of must be a date")
     if max_staleness_days < 0:
         raise ValueError("max_staleness_days must be >= 0")
     _require(sec_tickers, ("cik", "ticker"), "sec_tickers")
     rows = latest(identifiers, _KEY).to_pylist() if identifiers.num_rows else []
 
-    open_end = date.max
     last: dict[str, date] = {}  # instrument -> last mapped date (date.max while open)
     for r in rows:
         if r["id_scheme"] != SYMBOL_SCHEME:
             continue
         if r["valid_to"] is not None and r["valid_to"] <= r["valid_date"]:
             continue
-        end = open_end if r["valid_to"] is None else r["valid_to"] - _DAY
+        end = date.max if r["valid_to"] is None else r["valid_to"] - _DAY
         last[r["instrument_id"]] = max(last.get(r["instrument_id"], date.min), end)
-    if as_of is None:
-        finite = [d for d in last.values() if d != open_end]
-        as_of = max(finite) if finite else None
-    floor = as_of - timedelta(days=max_staleness_days) if as_of else None
-    current = {i for i, d in last.items() if floor is None or d >= floor}
+    floor = as_of - timedelta(days=max_staleness_days)
+    current = {i for i, d in last.items() if d >= floor}
 
     latest_ticker: dict[str, tuple[date, set[str]]] = {}
     for r in rows:
         if r["id_scheme"] != "ticker" or r["instrument_id"] not in current:
             continue
-        if as_of is not None and r["valid_to"] is not None and r["valid_to"] <= as_of:
+        if r["valid_to"] is not None and r["valid_to"] <= as_of:
             continue  # closed before as_of
         inst, value = r["instrument_id"], _norm_ticker(r["id_value"])
         start, values = latest_ticker.get(inst, (date.min, set()))
@@ -851,12 +1001,28 @@ def link_issuers(
             raise ValueError("sec_tickers holds a CIK that is not a number") from None
         ciks[_norm_ticker(ticker)].add(f"{number:010d}")
 
+    published: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r["id_scheme"] == "cik" and r["source_code"] == SEC_SOURCE:
+            if r["valid_to"] is None or r["valid_to"] > r["valid_date"]:
+                published[r["instrument_id"]].append(r)
+
     load_date = load.astimezone(UTC).date()
-    new = [
-        _row(next(iter(insts)), "cik", next(iter(ciks[t])), load_date, None, SEC_SOURCE, load)
-        for t, insts in sorted(claims.items())
-        if len(insts) == 1 and len(ciks.get(t, ())) == 1
-    ]
+    new: list[dict[str, Any]] = []
+    for t, insts in sorted(claims.items()):
+        if len(insts) != 1 or len(ciks.get(t, ())) != 1:
+            continue
+        inst, cik = next(iter(insts)), next(iter(ciks[t]))
+        old = published.get(inst, [])
+        if any(r["id_value"] == cik for r in old):
+            continue  # unchanged
+        for r in old:
+            if r["known_at"] >= load:
+                raise ValueError("load_time must be after the published cik row it would close")
+            new.append(
+                _row(inst, "cik", r["id_value"], r["valid_date"], r["valid_date"], SEC_SOURCE, load)
+            )
+        new.append(_row(inst, "cik", cik, load_date, None, SEC_SOURCE, load))
     base = identifiers.select(_SCHEMA.names).cast(_SCHEMA)
     table = pa.concat_tables([base, pa.Table.from_pylist(new, schema=_SCHEMA)])
     return conform(INSTRUMENT_IDENTIFIERS, table) if table.num_rows else table
