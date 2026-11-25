@@ -692,3 +692,33 @@ def test_record_wording(env, run, monkeypatch, capsys):
     assert run("load-history", "--write", "--dir", "{root}/missing") == EXIT_ERROR
     err = capsys.readouterr().err
     assert "load-history: error report written, but run record not saved: OSError" in err
+
+
+# --- final review fix wave -----------------------------------------------------------------------
+
+MASSIVE_FIXTURES = Path(__file__).parent / "fixtures" / "massive"
+
+
+def archive_massive(env, name: str, kind: str, *, day: date | None = None, at=NOW) -> None:
+    """Put one synthetic Massive fixture in the archive as a whole-market fetch."""
+    from market_data.adapters.base import FetchResult
+
+    payload = (MASSIVE_FIXTURES / name).read_bytes()
+    RawArchive(env["archive"]).put(
+        FetchResult("massive", "*", kind, day, day, at, "ok", payload, "application/json")
+    )
+
+
+def test_map_takes_a_history_load_and_archived_massive_symbols(env, run, monkeypatch, capsys):
+    monkeypatch.setenv("MOF_MARKET_ADAPTERS", "massive")
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    archive_massive(env, "tickers_active.json", "symbols")
+    archive_massive(env, "grouped_daily.json", "prices", day=date(2026, 11, 20))
+    capsys.readouterr()
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert "map: error" not in capsys.readouterr().out
+    assert publish_pending(env["cfg"]).exit_code == 0
+    with Store.open(env["cfg"]) as store:
+        values = set(store.read_asof("instrument_identifiers")["id_value"].to_pylist())
+    assert "massive:AAA" in values  # the provider series mapped next to the history's
+    assert any(v.startswith("private_history:") for v in values)

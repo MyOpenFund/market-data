@@ -553,10 +553,11 @@ def map_identifiers(
     ``OpenFigiClient`` to ask for the series ``openfigi_series`` selects (None: no request)."""
     if write and (landing is None or reports is None):
         raise ValueError("map --write needs a landing root and a reports directory")
+    # each input cast on its own: the history load's and the archive's schemas differ in
+    # nullability, which concat_tables refuses
+    schema = _mapping.OBSERVATION_INPUT_SCHEMA
     obs = (
-        pa.concat_tables(
-            [t.select(_mapping.OBSERVATION_INPUT_SCHEMA.names) for t in observations]
-        ).cast(_mapping.OBSERVATION_INPUT_SCHEMA)
+        pa.concat_tables([t.select(schema.names).cast(schema) for t in observations])
         if observations
         else None
     )
