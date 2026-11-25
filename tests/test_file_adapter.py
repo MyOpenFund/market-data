@@ -305,7 +305,8 @@ def test_required_columns_and_values(tmp_path):
     fh = history(path)
     problems = problems_of(fh)
     assert "prices_daily.csv" in problems and "'currency'" in problems and "'ccy'" not in problems
-    assert fh.report.ignored.columns == {"prices_daily.csv": ["ccy"]}
+    # a header with a problem: unknown names are only counted
+    assert fh.report.ignored.columns == {"prices_daily.csv": "1 unknown column(s)"}
     assert "securities.csv" in problems and "'name'" in problems and "row 2" in problems
 
 
@@ -1073,3 +1074,101 @@ def test_malformed_line_missing_field(tmp_path):
     problems = problems_of(history(path))
     assert "prices_daily.csv: malformed line 11: 7 field(s) where the header has 8" in problems
     assert "BBB" not in problems
+
+
+# --- review round 3 ------------------------------------------------------------------------------
+
+
+def test_wide_prices_file_puts_no_member_id_in_report(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(path, "prices_daily.csv", "date,AAA UN Equity,BBB UW Equity\n2020-01-31,1.0,2.0\n")
+    fh = history(path)
+    assert "missing required columns" in problems_of(fh)
+    assert fh.report.ignored.columns == {"prices_daily.csv": "2 unknown column(s)"}
+    assert "AAA" not in repr(fh.report)
+
+
+def test_wide_parquet_snapshots_file_puts_no_member_id_in_report(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pa.table({"date": [date(2020, 1, 31)], "aaa": [1.0], "BBB UW Equity": [1.0]})
+    pq.write_table(table, path / "index_snapshots.parquet")
+    fh = history(path)
+    assert fh.validate()
+    assert fh.report.ignored.columns == {"index_snapshots.parquet": "2 unknown column(s)"}
+
+
+def test_transposed_securities_file_puts_no_member_id_in_report(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(
+        path,
+        "securities.csv",
+        "member_id,AAA UN Equity,BBB UW Equity\nname,Alpha Fake Corp,Beta Fake Inc\n",
+    )
+    fh = history(path)
+    fh.validate()
+    assert fh.report.ignored.columns == {"securities.csv": "2 unknown column(s)"}
+    assert "AAA" not in repr(fh.report) and "Alpha" not in repr(fh.report)
+
+
+def test_sound_extra_column_names_still_listed(tmp_path):
+    path = csv_export(tmp_path)
+    lines = (path / "total_return_index.csv").read_text().splitlines()
+    lines = [lines[0] + ",Vendor_Field"] + [ln + ",1" for ln in lines[1:]]
+    rewrite(path, "total_return_index.csv", "\n".join(lines) + "\n")
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.report.ignored.columns == {"total_return_index.csv": ["Vendor_Field"]}
+
+
+def test_invalid_exchange_code_reported_as_invalid(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "securities.csv", "Epsilon Fake SA,,,,,ZZ,ZZ,", "Epsilon Fake SA,,,,,ZZ,,")
+    for name in (
+        "securities.csv",
+        "prices_daily.csv",
+        "index_snapshots.csv",
+        "corporate_actions.csv",
+    ):
+        text = (path / name).read_text().replace("EEE ZZ Equity", "EEE Secret-Word Equity")
+        rewrite(path, name, text)
+    fh = history(path)
+    assert fh.validate() == []
+    fh.prices()
+    assert fh.report.unmapped_exchanges["prices"] == {"<invalid>": 2, "LN": 3}
+    assert "SECRET" not in repr(fh.report).upper()
+
+
+def test_categorical_member_id_in_securities(tmp_path):
+    path = parquet_export(tmp_path)
+    table = pq.read_table(path / "securities.parquet")
+    i = table.schema.get_field_index("member_id")
+    table = table.set_column(i, "member_id", pc.dictionary_encode(table["member_id"]))
+    pq.write_table(table, path / "securities.parquet")
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.prices().equals(history(csv_export(tmp_path)).prices())
+
+
+def test_part_suffix_ascii_digits_only(tmp_path):
+    path = csv_export(tmp_path)
+    (path / "total_return_index.csv").rename(path / "total_return_index_part٣.csv")
+    fh = history(path)
+    assert fh.validate() == []
+    assert fh.report.ignored.files == ["total_return_index_part٣.csv"]
+    assert fh.vendor_total_return().num_rows == 0
+
+
+def test_exchange_mics_values_checked():
+    with pytest.raises(ValueError, match="XNOPE"):
+        FileHistory(FIXTURE, salt=SALT, exchange_mics={"UN": "XNOPE"})
+
+
+def test_row_number_message_names_the_position(tmp_path):
+    path = csv_export(tmp_path)
+    rewrite(
+        path,
+        "total_return_index.csv",
+        "member_id,Unnamed: 0,date,tr_index\nAAA UN Equity,0,2020-01-31,1\n",
+    )
+    problems = problems_of(history(path))
+    assert "total_return_index.csv: unnamed row-number column at position 2" in problems

@@ -44,7 +44,9 @@ Messages name the file, the column and the row ("data row N (file line N+1)" for
 cell's content (pyarrow's own messages, which quote rows, are never shown); only the matched
 placeholder itself is quoted. Tolerated and listed in ``report.ignored`` (they cannot change
 the meaning of known columns): files that are not part of the format, columns of a known file
-outside ``FILE_COLUMNS`` (not read), unknown manifest keys.
+outside ``FILE_COLUMNS`` (not read; listed by name only from a sound header whose unknown
+names all look like column names, ``[a-z][a-z0-9_]{0,62}``, else only counted, so a wide or
+transposed file never puts member ids in the report), unknown manifest keys.
 
 Token salt: ``MOF_MARKET_TOKEN_SALT`` (or ``salt=``), at least ``MIN_SALT_BYTES`` (16) bytes.
 
@@ -68,7 +70,9 @@ Look-ahead guard (spec §9.3)
 Exchange calendars
     A member's exchange code is ``securities.exchange_code``, else the second word of its
     ``member_id`` (``AAA UW Equity`` -> ``UW``); ``exchange_mics`` maps codes to calendar MICs
-    (default ``DEFAULT_EXCHANGE_MICS``: US codes -> XNYS). Prices, vendor total return and
+    (default ``DEFAULT_EXCHANGE_MICS``: US codes -> XNYS; every MIC must be an
+    ``exchange_calendars`` calendar, checked in the constructor). A code that is not
+    ``[A-Z0-9]{1,4}`` is reported as ``<invalid>``, never verbatim. Prices, vendor total return and
     actions of a member whose code is not mapped are kept out (``unmapped_exchange``) and
     counted per code. Snapshots, observations and the fetch log keep every member (a European
     composition loads before its prices; its fetch-log rows are ``empty``).
@@ -142,6 +146,7 @@ __all__ = [
     "TEXT_SENTINELS",
     "TEXT_SENTINEL_PREFIX",
     "FileHistory",
+    "INVALID_EXCHANGE_CODE",
     "HistoryFileError",
     "Ignored",
     "LoadReport",
@@ -184,6 +189,9 @@ _MANIFEST_OPTIONAL = ("fields", "notes")
 _DIVIDENDS = ("gross", "net")
 _ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")  # always fullmatch
 _FIGI = re.compile(r"BBG[0-9A-Z]{9}")
+_COLUMN_NAME = re.compile(r"[a-z][a-z0-9_]{0,62}")  # always fullmatch, after casefold
+_EXCHANGE_CODE = re.compile(r"[A-Z0-9]{1,4}")  # always fullmatch
+INVALID_EXCHANGE_CODE = "<invalid>"
 _ROW_NUMBER = re.compile(r"^(|Unnamed: ?\d+|__index_level_\d+__)$")
 _EOD = timedelta(days=1) - timedelta(microseconds=1)
 _TS = pa.timestamp("us", tz="UTC")
@@ -331,7 +339,8 @@ class Ignored:
     columns of a known file outside its spec (file name -> columns), unknown manifest keys."""
 
     files: list[str] = field(default_factory=list)
-    columns: dict[str, list[str]] = field(default_factory=dict)
+    # file -> ignored column names, or "N unknown column(s)" when they may not be names
+    columns: dict[str, list[str] | str] = field(default_factory=dict)
     manifest_keys: list[str] = field(default_factory=list)
 
 
@@ -567,10 +576,14 @@ def _columns(
             f"{fname}: no header line? none of the required columns {list(spec.required)} is in "
             "the first line"
         ]
+    problems = _header_problems(fname, names, spec)
     unknown = [n for n in names if n not in spec.columns and n != ""]
     if unknown:
-        ignored.columns[fname] = unknown
-    return [n for n in names if n in spec.columns], _header_problems(fname, names, spec)
+        # a wide or transposed file has member ids as header names: names are recorded only
+        # from a sound header and when every one looks like a column name; else only a count
+        named = not problems and all(_COLUMN_NAME.fullmatch(n.casefold()) for n in unknown)
+        ignored.columns[fname] = unknown if named else f"{len(unknown)} unknown column(s)"
+    return [n for n in names if n in spec.columns], problems
 
 
 def _diagnose_csv(path: Path, names: list[str], spec: _Spec) -> list[str]:
@@ -703,6 +716,8 @@ def _normalise(fname: str, table: pa.Table, spec: _Spec) -> tuple[pa.Table | Non
                 if not _is_text(col.type):
                     col = pc.cast(col, _S)
                 col = _empty_to_null(col)
+                if name not in spec.dictionary and pa.types.is_dictionary(col.type):
+                    col = pc.cast(col, _S)  # e.g. a categorical member_id in securities
             else:
                 col = pc.cast(col, target)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError, ValueError) as exc:
@@ -857,7 +872,7 @@ def _discover(directory: Path, ignored: Ignored) -> tuple[dict[str, list[Path]],
     )
     claimed: set[Path] = set()
     for name in _SPECS:
-        pattern = re.compile(rf"{re.escape(name)}(_part\d+)?\.(csv|parquet)")
+        pattern = re.compile(rf"{re.escape(name)}(_part[0-9]+)?\.(csv|parquet)")
         parts = [p for p in data if pattern.fullmatch(p.name)]
         claimed.update(parts)
         if {p.suffix for p in parts} == {".csv", ".parquet"}:
@@ -969,6 +984,15 @@ class _Member:
     mic: str | None
 
 
+def _check_mics(mics) -> None:
+    import exchange_calendars as xcals
+
+    known = set(xcals.get_calendar_names(include_aliases=True))
+    unknown = sorted({m for m in mics if m not in known})
+    if unknown:
+        raise ValueError(f"exchange_mics names unknown calendar MIC(s) {unknown}")
+
+
 _UNUSED = _Member(token="", exchange_code=NO_EXCHANGE_CODE, mic=None)
 
 
@@ -1007,6 +1031,7 @@ class FileHistory:
         self.directory = Path(directory)
         self.source_code = source_code
         self.exchange_mics = {k.strip().upper(): v for k, v in exchange_mics.items()}
+        _check_mics(self.exchange_mics.values())
         self.action_types = {_norm_type(k): v for k, v in types.items()}
         self.next_session_margin = next_session_margin
         if not 0 <= max_non_session_share <= 1:
@@ -1097,6 +1122,8 @@ class FileHistory:
             words = member_id.split()
             code = words[1] if len(words) >= 2 else NO_EXCHANGE_CODE
         code = code.strip().upper()
+        if code != NO_EXCHANGE_CODE and not _EXCHANGE_CODE.fullmatch(code):
+            code = INVALID_EXCHANGE_CODE  # never a raw word of a member id in the report
         return _Member(
             token(self.source_code, member_id, self._salt), code, self.exchange_mics.get(code)
         )
