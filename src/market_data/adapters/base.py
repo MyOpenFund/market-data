@@ -121,6 +121,11 @@ class FetchResult:
 
 @runtime_checkable
 class Adapter(Protocol):
+    """A source adapter. Optional attribute ``actions_fetch_kind`` (not part of the structural
+    check): the archived fetch kind whose payload also holds the corporate actions, for a source
+    with no separate actions request (Tiingo: ``"prices"``); ``build.build_actions`` reads those
+    fetches and parses each as kind ``actions``. Absent: ``"actions"``."""
+
     source_code: str
     info: SourceInfo
 

@@ -1,4 +1,5 @@
 import json
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -7,6 +8,7 @@ import httpx
 import pyarrow as pa
 import pytest
 
+from market_data.adapters._quota import QuotaState, default_state_dir
 from market_data.adapters.base import (
     RAW_ACTION_SCHEMA,
     RAW_PRICE_SCHEMA,
@@ -23,6 +25,7 @@ from market_data.adapters.tiingo import (
     BAD_VOLUME,
     BASE_URL,
     CONFLICTING_DUPLICATE,
+    DEFAULT_MIN_SPACING_S,
     DUPLICATE_ROW,
     ERROR_PAYLOAD,
     FREE_PLAN_PER_DAY,
@@ -34,6 +37,7 @@ from market_data.adapters.tiingo import (
     NON_POSITIVE_AMOUNT,
     NON_POSITIVE_CLOSE,
     NOT_AN_OBJECT,
+    STATE_DIR_ENV,
     VENDOR_ADJUSTED_SCHEMA,
     TiingoAdapter,
     TiingoError,
@@ -98,8 +102,15 @@ class Recorder:
         return [r.url.path for r in self.requests]
 
 
+@pytest.fixture(autouse=True)
+def _state_dir(tmp_path, monkeypatch):
+    """Never touch the real user cache: the default state dir points into tmp_path."""
+    monkeypatch.setenv(STATE_DIR_ENV, str(tmp_path / "env-state"))
+
+
 def make(recorder=None, clock=None, key=FAKE_KEY, **kw) -> TiingoAdapter:
     clock = clock or FakeClock()
+    kw.setdefault("state_dir", None)  # no persistence unless a test asks for it
     return TiingoAdapter(
         key,
         transport=httpx.MockTransport(recorder or Recorder()),
@@ -310,7 +321,16 @@ def test_deep_history_is_one_request():
 # --- rate limits and retries ---------------------------------------------------------------------
 
 
-def test_hourly_limit_spaces_requests_evenly():
+def test_a_few_symbols_are_fetched_in_seconds():
+    clk = FakeClock()
+    start = clk.now
+    out = list(make(always([]), clk).fetch("prices", ["A", "B", "C", "D", "E"], DAY, DAY))
+    assert len(out) == 5
+    assert clk.sleeps == [DEFAULT_MIN_SPACING_S] * 4 == [1.5] * 4  # never a burst
+    assert clk.now - start == 6.0
+
+
+def test_rolling_hour_budget_51st_request_waits():
     clk = FakeClock()
     sent: list[float] = []
 
@@ -318,17 +338,19 @@ def test_hourly_limit_spaces_requests_evenly():
         sent.append(clk.now)
         return httpx.Response(200, json=[])
 
-    rec = Recorder(answer=timed)
     names = [f"S{i:02d}" for i in range(FREE_PLAN_PER_HOUR + 1)]
-    out = list(make(rec, clk).fetch("prices", names, DAY, DAY))
-    assert len(out) == len(rec.requests) == 51
-    assert FREE_PLAN_PER_HOUR == 50
-    # one request every 3600 / 50 = 72 s: never more than 50 in any hour, never a burst
-    assert {round(b - a, 6) for a, b in zip(sent, sent[1:], strict=False)} == {72.0}
-    assert sent[50] - sent[0] >= 3600
+    out = list(make(Recorder(answer=timed), clk).fetch("prices", names, DAY, DAY))
+    assert len(out) == len(sent) == 51 and FREE_PLAN_PER_HOUR == 50
+    assert {round(b - a, 6) for a, b in zip(sent[:50], sent[1:50], strict=False)} == {1.5}
+    assert sent[50] == sent[0] + 3600  # the oldest of the last 50 has just left the hour
+    # no trailing hour ever holds more than per_hour requests
+    assert all(sum(t - 3600 < u <= t for u in sent) <= 50 for t in sent)
     clk = FakeClock()
-    list(make(always([]), clk, per_hour=10).fetch("prices", ["AAA", "BBB"], DAY, DAY))
-    assert clk.sleeps == [360.0]
+    list(make(always([]), clk, per_hour=2).fetch("prices", ["A", "B", "C"], DAY, DAY))
+    assert clk.sleeps == [1.5, 3598.5]
+    clk = FakeClock()
+    list(make(always([]), clk, min_spacing_s=0).fetch("prices", ["A", "B"], DAY, DAY))
+    assert clk.sleeps == []
 
 
 def test_limits_are_parameters_within_the_free_plan():
@@ -342,6 +364,8 @@ def test_limits_are_parameters_within_the_free_plan():
         {"max_retries": -1},
         {"backoff_s": 0},
         {"max_wait_s": 0},
+        {"min_spacing_s": -1},
+        {"min_spacing_s": float("nan")},
     ):
         with pytest.raises(ValueError):
             make(**bad)
@@ -378,7 +402,7 @@ def test_daily_cap_reached_by_retries_is_an_error_row_then_raised():
     assert len(rec.requests) == 2
 
 
-def test_unique_symbol_cap_per_adapter_instance():
+def test_unique_symbol_cap_per_month():
     rec = always([])
     a = make(rec, unique_symbols_per_month=2)
     list(a.fetch("prices", ["AAA", "BBB"], DAY, DAY))
@@ -386,8 +410,10 @@ def test_unique_symbol_cap_per_adapter_instance():
     with pytest.raises(TiingoQuotaError, match="unique_symbols_per_month"):
         a.fetch("prices", ["BBB", "CCC"], DAY, DAY)
     assert len(rec.requests) == 3
-    # another instance knows nothing of this one's symbols (documented: per process)
-    list(make(rec, unique_symbols_per_month=2).fetch("prices", ["CCC"], DAY, DAY))
+    # a new UTC month starts a new set
+    a._now = lambda: NOW + timedelta(days=31)
+    list(a.fetch("prices", ["CCC", "DDD"], DAY, DAY))
+    assert len(rec.requests) == 5
 
 
 def test_429_backs_off_no_retry_storm():
@@ -398,14 +424,16 @@ def test_429_backs_off_no_retry_storm():
     # no Retry-After: exponential backoff, never shorter than the 72 s spacing, then gives up
     clk = FakeClock()
     rec = Recorder([(429, {}, {})] * 10)
-    with pytest.raises(TiingoError, match="429"):
+    with pytest.raises(TiingoError, match="429") as exc:
         list(make(rec, clk, max_retries=3, backoff_s=60.0).fetch("prices", ["AAA"], DAY, DAY))
+    assert "hourly allocation is probably spent" in str(exc.value)
+    assert "about an hour" in str(exc.value)
     assert len(rec.requests) == 4
-    assert clk.sleeps == [72.0, 120.0, 240.0]
+    assert clk.sleeps == [60.0, 120.0, 240.0]
     # a wait beyond max_wait_s gives up at once (an exhausted hourly allocation)
     clk = FakeClock()
     rec = Recorder([(429, {"Retry-After": "3600"}, {})])
-    with pytest.raises(TiingoError, match="max_wait"):
+    with pytest.raises(TiingoError, match="max_wait.*about an hour"):
         list(make(rec, clk).fetch("prices", ["AAA"], DAY, DAY))
     assert clk.sleeps == [] and len(rec.requests) == 1
 
@@ -417,7 +445,7 @@ def test_transport_errors_and_5xx_are_retried_bounded():
     assert out.status == "ok" and len(rec.requests) == 3
     assert clk.sleeps == [100.0, 200.0]
     rec = Recorder(answer=lambda r: httpx.Response(503))
-    with pytest.raises(TiingoError, match="503; gave up after 2 retries"):
+    with pytest.raises(TiingoError, match="503; gave up after 2 retries$"):
         list(make(rec, max_retries=2).fetch("prices", ["AAA"], DAY, DAY))
     assert len(rec.requests) == 3
 
@@ -475,11 +503,12 @@ def test_unknown_ticker_is_not_found_and_the_fetch_goes_on():
     out = list(make(rec).fetch("prices", ["ZZZ", "AAA"], START, END))
     assert [(r.source_symbol, r.status) for r in out] == [("ZZZ", "not_found"), ("AAA", "ok")]
     assert out[0].payload == ERROR_PAYLOAD
-    # any other 404 (a wrong base_url) is an error
-    it = make(Recorder([(404, {}, b"<html>nope</html>")])).fetch("prices", ["AAA"], DAY, DAY)
-    assert next(it).status == "error"
-    with pytest.raises(TiingoError, match="404"):
-        next(it)
+    # any other 404 (a wrong base_url, a route not found) is an error
+    for body in (b"<html>nope</html>", {"detail": "Not found."}, {"detail": "ticker"}):
+        it = make(Recorder([(404, {}, body)])).fetch("prices", ["AAA"], DAY, DAY)
+        assert next(it).status == "error"
+        with pytest.raises(TiingoError, match="404"):
+            next(it)
 
 
 def test_any_exception_in_a_fetch_is_logged_as_error(monkeypatch):
@@ -853,3 +882,135 @@ def test_a_later_fetch_changing_history_is_a_collected_row(tmp_path):
 def test_vendor_adjusted_table_is_arrow():
     table = make().parse_vendor_adjusted(result(fixture()))
     assert isinstance(table, pa.Table) and table.num_rows == 4
+
+
+# --- quota state persisted across runs (ruling 71) ----------------------------------------------
+
+
+def test_state_survives_a_new_adapter_instance(tmp_path):
+    state, clk, rec = tmp_path / "state", FakeClock(), always([])
+    list(make(rec, clk, state_dir=state, per_hour=2).fetch("prices", ["AAA", "BBB"], DAY, DAY))
+    # a second run sees the first run's two requests in the trailing hour, and its symbols
+    later = make(rec, clk, state_dir=state, per_hour=2, unique_symbols_per_month=3)
+    clk.sleeps.clear()
+    list(later.fetch("prices", ["CCC"], DAY, DAY))
+    assert clk.sleeps == [3600 - 1.5]
+    with pytest.raises(TiingoQuotaError, match="unique_symbols_per_month"):
+        later.fetch("prices", ["DDD"], DAY, DAY)
+    with pytest.raises(TiingoQuotaError, match="per_day"):
+        make(rec, clk, state_dir=state, per_day=3).fetch("prices", ["AAA"], DAY, DAY)
+    body = json.loads((state / "tiingo-quota.json").read_text())
+    assert body["symbols"] == ["AAA", "BBB", "CCC"] and len(body["requests"]) == 3
+    assert body["month"] == "2026-12"
+
+
+def test_state_file_never_holds_the_key(tmp_path):
+    state = tmp_path / "state"
+    list(make(always(fixture()), state_dir=state).fetch("prices", ["AAA"], START, END))
+    files = [p for p in state.rglob("*") if p.is_file()]
+    assert [p.name for p in files] == ["tiingo-quota.json"]  # no temp file left behind
+    assert all(FAKE_KEY.encode() not in p.read_bytes() for p in files)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"not json",
+        b"\xff\xfe",
+        b"[]",
+        b'{"version": 2, "requests": [], "month": "2026-12", "symbols": []}',
+        b'{"version": 1, "requests": ["x"], "month": "2026-12", "symbols": []}',
+        b'{"version": 1, "requests": [1e400], "month": "2026-12", "symbols": []}',
+        b'{"version": 1, "requests": [], "month": 5, "symbols": []}',
+        b'{"version": 1, "requests": [], "month": "2026-12", "symbols": [1]}',
+    ],
+)
+def test_corrupt_state_file_is_ignored_without_warning(tmp_path, content):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "tiingo-quota.json").write_bytes(content)
+    clk = FakeClock()
+    out = list(make(always([]), clk, state_dir=state).fetch("prices", ["AAA", "BBB"], DAY, DAY))
+    assert len(out) == 2 and clk.sleeps == [1.5]  # an empty budget (pytest -W error: no warning)
+    body = json.loads((state / "tiingo-quota.json").read_text())  # rewritten whole
+    assert body["version"] == 1 and body["symbols"] == ["AAA", "BBB"]
+
+
+def test_unwritable_state_dir_is_best_effort(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")  # a file where the directory should be
+    out = list(make(always([]), state_dir=blocker / "state").fetch("prices", ["AAA"], DAY, DAY))
+    assert [r.status for r in out] == ["empty"]
+
+
+def test_old_requests_leave_the_state(tmp_path):
+    state, clk = tmp_path / "state", FakeClock()
+    list(make(always([]), clk, state_dir=state).fetch("prices", ["AAA"], DAY, DAY))
+    clk.now += 86400 + 1
+    list(make(always([]), clk, state_dir=state).fetch("prices", ["AAA"], DAY, DAY))
+    assert len(json.loads((state / "tiingo-quota.json").read_text())["requests"]) == 1
+
+
+def test_state_dir_from_the_environment(tmp_path, monkeypatch):
+    target = tmp_path / "env-dir"
+    monkeypatch.setenv(STATE_DIR_ENV, str(target))
+    clk = FakeClock()
+    a = TiingoAdapter(FAKE_KEY, transport=httpx.MockTransport(always([])), clock=clk.clock,
+                      sleep=clk.sleep, now=lambda: NOW)  # fmt: skip
+    list(a.fetch("prices", ["AAA"], DAY, DAY))
+    assert (target / "tiingo-quota.json").is_file()
+    for off in ("off", "OFF"):
+        monkeypatch.setenv(STATE_DIR_ENV, off)
+        assert default_state_dir() is None
+    assert make(state_dir="off")._quota.path is None
+
+
+def test_default_state_dir_is_the_user_cache(monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
+    env = {"XDG_CACHE_HOME": "/xdg"}
+    assert default_state_dir(env) == Path("/xdg/myopenfund/market-data")
+    home = Path.home()
+    assert default_state_dir({}) == home / ".cache" / "myopenfund" / "market-data"
+    assert default_state_dir({"XDG_CACHE_HOME": "relative"}) == default_state_dir({})
+    monkeypatch.setattr("sys.platform", "darwin")
+    assert default_state_dir({}) == home / "Library" / "Caches" / "myopenfund" / "market-data"
+    assert default_state_dir({STATE_DIR_ENV: " /x "}) == Path("/x")
+
+
+def test_caps_checked_before_waiting():
+    clk = FakeClock()
+    a = make(always([]), clk, per_hour=1, per_day=1)
+    list(a.fetch("prices", ["AAA"], DAY, DAY))
+    with pytest.raises(TiingoQuotaError):
+        a.fetch("prices", ["AAA"], DAY, DAY)
+    # reached between requests (retries): refused at once, never after an hour's wait
+    clk = FakeClock()
+    rec = Recorder([(503, {}, {})] * 3)
+    it = make(rec, clk, per_hour=1, per_day=1, max_retries=3).fetch("prices", ["AAA"], DAY, DAY)
+    assert next(it).status == "error"
+    with pytest.raises(TiingoQuotaError, match="per_day"):
+        next(it)
+    assert clk.sleeps == [] and len(rec.requests) == 1
+
+
+def test_key_not_kept_in_a_headers_dict():
+    a = make(always([]))
+    assert FAKE_KEY not in repr(vars(a)) and FAKE_KEY not in repr(a._auth)
+    assert "headers" not in vars(a)
+    assert a._http.headers.get("authorization") is None
+    leaks: list[str] = []
+
+    def inspect_frames(request):
+        assert request.headers["authorization"] == f"Token {FAKE_KEY}"
+        frame = sys._getframe()
+        while frame is not None:
+            if frame.f_code.co_filename.endswith("tiingo.py"):  # the adapter's own frames
+                for name, value in frame.f_locals.items():
+                    if FAKE_KEY in repr(value):
+                        leaks.append(f"{frame.f_code.co_name}.{name}")
+            frame = frame.f_back
+        return httpx.Response(200, json=[])
+
+    list(make(Recorder(answer=inspect_frames)).fetch("prices", ["AAA"], DAY, DAY))
+    assert leaks == []
+    assert QuotaState("tiingo", None).path is None

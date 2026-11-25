@@ -30,35 +30,48 @@ answers errors as a JSON object ``{"detail": ...}``), ``fetch`` yields a FetchRe
 ``error``, the full requested range and the payload ``ERROR_PAYLOAD`` (``[]``), then raises
 ``TiingoError``. Any other exception takes the same path, naming the exception type only (no
 ``__cause__``/``__context__``, whose text could hold a URL or payload data). Tiingo's free text
-(``detail``) is never echoed. An HTTP 404 whose ``detail`` says the ticker is not found is a
+(``detail``) is never echoed. An HTTP 404 whose ``detail`` names a ticker not found (ruling 72) is a
 complete answer, not a failure: status ``not_found``, payload ``ERROR_PAYLOAD``, and the fetch goes
 on with the next symbol (any other 404, e.g. a wrong ``base_url``, is an error). ``fetch`` runs
 ``parse_report`` and ``parse_actions`` on each payload before yielding it, so nothing is archived
 as ``ok`` that ``parse`` would refuse.
 
 Key and limits (spec §8.3: respected, never worked around)
-    The key comes from ``TIINGO_API_KEY`` (``from_env``), is held in a ``Secret`` and sent only in
-    the ``Authorization: Token <key>`` header: never in a URL (no ``token=`` parameter), a log
-    line, an error message, a repr or an archived FetchResult. ``fetch`` itself checks the key
-    before returning (no request otherwise): missing → ``TiingoKeyError`` saying how to get a
-    free one; characters outside printable ASCII → ``TiingoKeyError`` echoing none of them;
-    401/403 → ``TiingoKeyError`` naming the HTTP status only. ``parse`` needs no key.
+    The key comes from ``TIINGO_API_KEY`` (``from_env``), is held in a ``Secret`` and set on each
+    request as it is sent (an ``httpx.Auth`` hook) in the ``Authorization: Token <key>`` header:
+    never in a URL (no ``token=`` parameter), a log line, an error message, a repr, the quota
+    state or an archived FetchResult. ``fetch`` itself checks the key before returning (no
+    request otherwise): missing → ``TiingoKeyError`` saying how to get a free one; characters
+    outside printable ASCII → ``TiingoKeyError`` echoing none of them; 401/403 →
+    ``TiingoKeyError`` naming the HTTP status only. ``parse`` needs no key.
     Free-plan limits, each a parameter that may be set lower, never higher (no paid plan, D14):
-    ``per_hour`` (``FREE_PLAN_PER_HOUR`` = 50): requests, retries included, are spaced evenly,
-    one every ``3600 / per_hour`` seconds, so no hour ever holds more; ``per_day``
-    (``FREE_PLAN_PER_DAY`` = 1000): requests in the last 24 hours of this adapter's clock;
-    ``unique_symbols_per_month`` (``FREE_PLAN_UNIQUE_SYMBOLS_PER_MONTH`` = 500): distinct symbols
-    this adapter requested. Both caps are tracked **per adapter instance, so per process**: they
-    know nothing of other processes or of earlier runs this month, and the monthly set never
-    resets (one process never lives a month). A fetch that would exceed a cap is refused before
-    any request (``TiingoQuotaError``); a cap reached during a fetch (retries) stops it at the next
-    request (an ``error`` FetchResult, then ``TiingoQuotaError``). A 429, a 5xx or a transport
-    error is retried: wait ``Retry-After`` seconds when sent, else ``backoff_s * 2**n``
-    (n = retries so far), never less than the spacing; after ``max_retries`` retries, or when a
-    wait would exceed ``max_wait_s`` (an exhausted hourly allocation), ``TiingoError`` (no retry
-    storm). Any other non-200 answer (redirects included, never followed) is a ``TiingoError``
-    naming the HTTP status. Clock, sleep, wall time (``now``) and the HTTP transport are
-    injectable. The adapter holds an HTTP client: ``close()`` it, or use it as a context manager.
+    ``per_hour`` (``FREE_PLAN_PER_HOUR`` = 50) requests, retries included, in any trailing
+    3600 s: a rolling-hour budget, so a "Try it" of a few companies runs in seconds and the
+    51st request of an hour waits until the oldest of the last 50 is an hour old; two requests
+    are always at least ``min_spacing_s`` apart (``DEFAULT_MIN_SPACING_S`` = 1.5 s, never a
+    burst); ``per_day`` (``FREE_PLAN_PER_DAY`` = 1000) requests in any trailing 86,400 s;
+    ``unique_symbols_per_month`` (``FREE_PLAN_UNIQUE_SYMBOLS_PER_MONTH`` = 500) distinct symbols
+    in the current UTC month. The budget is kept across runs in a small JSON file
+    (``market_data.adapters._quota``): ``state_dir`` (default: ``MOF_MARKET_STATE_DIR``, else the
+    platform user cache directory + ``myopenfund/market-data``; None or ``"off"`` disables it)
+    holds ``tiingo-quota.json``, the request times of the last 24 hours and the month's symbols
+    only (never the key), written atomically and re-read before each request. A corrupt or
+    unreadable file is ignored without a warning (the budget starts empty from it and the next
+    request rewrites it); a failed write is ignored (best effort). The state is per user cache,
+    not per key, and two processes running at the same moment can race (no lock): Tiingo's own
+    limits then answer 429. Times come from ``clock`` (the wall clock by default, so they
+    survive a restart). A fetch that would exceed the daily or symbol cap is refused before any
+    request (``TiingoQuotaError``); a cap reached during a fetch (retries) stops it before the
+    next request, without waiting (an ``error`` FetchResult, then ``TiingoQuotaError``). The
+    adapter is **silent while it waits** (the hourly budget can hold a request for up to an
+    hour): progress is the caller's job (B9). A 429, a 5xx or a transport error is retried: wait
+    ``Retry-After`` seconds when sent, else ``backoff_s * 2**n`` (n = retries so far); after
+    ``max_retries`` retries, or when a wait would exceed ``max_wait_s``, ``TiingoError`` (no
+    retry storm; after a 429 it says the free hourly allocation is probably spent and to retry
+    in about an hour). Any other non-200 answer (redirects included, never followed) is a
+    ``TiingoError`` naming the HTTP status. Clock, sleep, wall time (``now``), the state
+    directory and the HTTP transport are injectable. The adapter holds an HTTP client:
+    ``close()`` it, or use it as a context manager.
 
 Parse (``parse`` / ``parse_report`` / ``parse_actions`` / ``parse_vendor_adjusted``)
     source_symbol = the fetch's symbol; valid_date = the calendar date part of ``date``
@@ -101,10 +114,10 @@ import math
 import os
 import re
 import time
-from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -113,6 +126,12 @@ import pyarrow as pa
 from open_data_store.market.asof import sessions
 from open_data_store.sources import SourceInfo
 
+from market_data.adapters._quota import (
+    STATE_DIR_ENV,
+    STATE_OFF,
+    QuotaState,
+    default_state_dir,
+)
 from market_data.adapters.base import (
     FETCH_KINDS,
     RAW_ACTION_SCHEMA,
@@ -135,6 +154,7 @@ __all__ = [
     "DEFAULT_BACKOFF_S",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_WAIT_S",
+    "DEFAULT_MIN_SPACING_S",
     "DEFAULT_TIMEOUT_S",
     "DUPLICATE_ROW",
     "ERROR_PAYLOAD",
@@ -149,6 +169,7 @@ __all__ = [
     "NON_POSITIVE_CLOSE",
     "NOT_AN_OBJECT",
     "SOURCE_CODE",
+    "STATE_DIR_ENV",
     "VENDOR_ADJUSTED_SCHEMA",
     "ParseReport",
     "TiingoAdapter",
@@ -168,6 +189,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_S = 15.0
 DEFAULT_MAX_WAIT_S = 300.0
 DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_MIN_SPACING_S = 1.5  # between two requests, inside the hourly budget
 DEFAULT_MIC = "XNYS"
 ACTIONS_FETCH_KIND = "prices"  # the archived kind whose payload also holds the actions
 RESAMPLE_FREQ = "daily"
@@ -235,6 +257,31 @@ class TiingoKeyError(TiingoError):
 
 class TiingoQuotaError(TiingoError):
     """A request beyond this adapter's daily or unique-symbol cap; nothing was sent."""
+
+
+class _FromEnv:
+    """``state_dir`` default: ``MOF_MARKET_STATE_DIR``, else the user cache directory."""
+
+    def __repr__(self) -> str:
+        return "<state dir from the environment>"
+
+
+_STATE_FROM_ENV = _FromEnv()
+
+
+class _TokenAuth(httpx.Auth):
+    """Sets ``Authorization: Token <key>`` on each request as it is sent: the clear key is never
+    kept in a headers dict or a local of the fetch frames."""
+
+    def __init__(self, key: Secret) -> None:
+        self._key = key
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = "Token " + self._key.reveal()
+        yield request
+
+    def __repr__(self) -> str:
+        return "_TokenAuth(Secret(***))"
 
 
 class _NotFound(Exception):
@@ -325,10 +372,12 @@ class TiingoAdapter:
         per_hour: int = FREE_PLAN_PER_HOUR,
         per_day: int = FREE_PLAN_PER_DAY,
         unique_symbols_per_month: int = FREE_PLAN_UNIQUE_SYMBOLS_PER_MONTH,
+        min_spacing_s: float = DEFAULT_MIN_SPACING_S,
+        state_dir: Path | str | None | _FromEnv = _STATE_FROM_ENV,
         base_url: str = BASE_URL,
         mic: str = DEFAULT_MIC,
         transport: httpx.BaseTransport | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -345,6 +394,14 @@ class TiingoAdapter:
         )
         if max_retries < 0 or backoff_s <= 0 or max_wait_s <= 0:
             raise ValueError("max_retries must be >= 0, backoff_s and max_wait_s > 0")
+        if not (math.isfinite(min_spacing_s) and min_spacing_s >= 0):
+            raise ValueError(f"min_spacing_s must be >= 0, got {min_spacing_s}")
+        if isinstance(state_dir, _FromEnv):
+            directory = default_state_dir()
+        elif state_dir is None or (isinstance(state_dir, str) and state_dir.lower() == STATE_OFF):
+            directory = None
+        else:
+            directory = Path(state_dir)
         self.info = _info()
         self.per_hour = per_hour
         self.per_day = per_day
@@ -354,13 +411,14 @@ class TiingoAdapter:
         self.max_retries = max_retries
         self.backoff_s = backoff_s
         self.max_wait_s = max_wait_s
-        self._interval = _HOUR_S / per_hour
+        self.min_spacing_s = min_spacing_s
         self._clock = clock
         self._sleep = sleep
         self._now = now
-        self._next: float | None = None  # earliest clock time of the next request
-        self._sent: deque[float] = deque()  # clock times of the requests of the last 24 hours
-        self._symbols: set[str] = set()  # distinct symbols requested by this instance
+        self._next: float | None = None  # earliest clock time of a retry
+        # request times of the last 24 hours and the month's symbols, shared across runs
+        self._quota = QuotaState(SOURCE_CODE, directory)
+        self._auth = None if self._key is None else _TokenAuth(self._key)
         self._http = httpx.Client(transport=transport, timeout=timeout_s)
 
     @classmethod
@@ -414,32 +472,32 @@ class TiingoAdapter:
         end = start if end is None else end
         if start > end:
             raise ValueError(f"start {start.isoformat()} is after end {end.isoformat()}")
-        self._header()
-        new = len({n for n in names if n not in self._symbols})
-        if len(self._symbols) + new > self.unique_symbols_per_month:
+        self._check_key()
+        self._refresh_quota()
+        spent = self._quota.symbols
+        new = len({n for n in names if n not in spent})
+        if len(spent) + new > self.unique_symbols_per_month:
             raise TiingoQuotaError(
                 f"{new} new symbol(s) would exceed unique_symbols_per_month "
-                f"({self.unique_symbols_per_month}) of this adapter "
-                f"({len(self._symbols)} already requested); nothing was sent"
+                f"({self.unique_symbols_per_month}): {len(spent)} already requested this "
+                "month; nothing was sent"
             )
         left = self.per_day - self._sent_today()
         if len(names) > left:
             raise TiingoQuotaError(
-                f"{len(names)} request(s) would exceed per_day ({self.per_day}) of this adapter "
-                f"({left} left in the last 24 hours); nothing was sent"
+                f"{len(names)} request(s) would exceed per_day ({self.per_day}): "
+                f"{left} left in the last 24 hours; nothing was sent"
             )
         return self._fetch_prices(names, start, end)
 
-    def _header(self) -> dict[str, str]:
+    def _check_key(self) -> None:
         if not self._key:
             raise TiingoKeyError(f"no Tiingo API key: {_GET_A_KEY}")
-        value = self._key.reveal()
-        if not _KEY_CHARS.fullmatch(value):
+        if not _KEY_CHARS.fullmatch(self._key.reveal()):
             raise TiingoKeyError(
                 f"the Tiingo API key in {API_KEY_ENV} has characters an HTTP header cannot "
                 "carry (printable ASCII only); check it was copied whole"
             )
-        return {"Authorization": f"Token {value}"}
 
     def _last_closed_session(self, start: date, end: date) -> date | None:
         """The last session of ``mic`` in ``[start, end]`` whose close is not after now."""
@@ -511,41 +569,52 @@ class TiingoAdapter:
             content_type=CONTENT_TYPE,
         )
 
+    def _month(self) -> str:
+        return self._now().astimezone(UTC).strftime("%Y-%m")
+
+    def _refresh_quota(self) -> None:
+        self._quota.refresh(self._clock(), self._month())
+
     def _sent_today(self) -> int:
-        """Requests of the last 24 hours of the adapter's clock."""
-        horizon = self._clock() - _DAY_S
-        while self._sent and self._sent[0] <= horizon:
-            self._sent.popleft()
-        return len(self._sent)
+        """Requests of the last 24 hours (this run and earlier ones sharing the state)."""
+        return len(self._quota.since(self._clock() - _DAY_S))
 
     def _check_caps(self, symbol: str) -> None:
+        self._refresh_quota()
         if self._sent_today() >= self.per_day:
             raise TiingoQuotaError(
-                f"per_day ({self.per_day}) of this adapter reached; no request sent"
+                f"per_day ({self.per_day}) reached in the last 24 hours; no request sent"
             )
-        if symbol not in self._symbols and len(self._symbols) >= self.unique_symbols_per_month:
+        spent = self._quota.symbols
+        if symbol not in spent and len(spent) >= self.unique_symbols_per_month:
             raise TiingoQuotaError(
-                f"unique_symbols_per_month ({self.unique_symbols_per_month}) of this adapter "
-                "reached; no request sent"
+                f"unique_symbols_per_month ({self.unique_symbols_per_month}) reached this month; "
+                "no request sent"
             )
 
     def _wait_turn(self) -> None:
+        """Sleep until the hourly budget, the minimum spacing and any retry wait allow a
+        request (silently: the caller shows progress)."""
         now = self._clock()
-        if self._next is not None and now < self._next:
-            self._sleep(self._next - now)
+        ready = now if self._next is None else max(now, self._next)
+        recent = self._quota.since(now - _HOUR_S)
+        if recent:
+            ready = max(ready, recent[-1] + self.min_spacing_s)
+        if len(recent) >= self.per_hour:
+            ready = max(ready, recent[-self.per_hour] + _HOUR_S)
+        if ready > now:
+            self._sleep(ready - now)
 
     def _get(self, url: str, params: Mapping[str, str], symbol: str) -> bytes:
-        headers = self._header()
+        self._check_key()
         for attempt in range(self.max_retries + 1):
+            self._check_caps(symbol)  # before waiting: a refused request never waits
             self._wait_turn()
-            self._check_caps(symbol)
-            sent = self._clock()
-            self._next = sent + self._interval
-            self._sent.append(sent)
-            self._symbols.add(symbol)
+            self._quota.record(self._clock(), symbol, self._month())
             retry_after = None
+            spent = ""
             try:
-                response = self._http.get(url, params=params, headers=headers)
+                response = self._http.get(url, params=params, auth=self._auth)
             except httpx.HTTPError as exc:
                 error = f"Tiingo request failed: {type(exc).__name__}"
             else:
@@ -563,14 +632,17 @@ class TiingoAdapter:
                     raise TiingoError(f"Tiingo request failed with HTTP {status}")
                 error = f"Tiingo answered HTTP {status}"
                 retry_after = _retry_after(response)
+                if status == 429:
+                    spent = "; the free hourly allocation is probably spent: retry in about an hour"
             if attempt == self.max_retries:
-                raise TiingoError(f"{error}; gave up after {self.max_retries} retries")
+                raise TiingoError(f"{error}; gave up after {self.max_retries} retries{spent}")
             wait = retry_after or self.backoff_s * 2**attempt
             if wait > self.max_wait_s:
                 raise TiingoError(
-                    f"{error}; asked to wait {wait:g} s, beyond max_wait_s ({self.max_wait_s:g} s)"
+                    f"{error}; asked to wait {wait:g} s, beyond max_wait_s "
+                    f"({self.max_wait_s:g} s){spent}"
                 )
-            self._next = max(self._next, self._clock() + wait)
+            self._next = self._clock() + wait
         raise AssertionError("unreachable")  # pragma: no cover
 
     # --- parse ---------------------------------------------------------------------------------
@@ -723,12 +795,16 @@ def _symbol_rows(result: FetchResult) -> tuple[str, list[Any]]:
 
 
 def _says_not_found(payload: bytes) -> bool:
-    """Tiingo's 404 for an unknown ticker: ``{"detail": "Error: Ticker 'X' not found"}``."""
+    """Tiingo's 404 for an unknown ticker: ``{"detail": "Error: Ticker 'X' not found"}``
+    (both "ticker" and "not found" required)."""
     try:
         detail = json.loads(payload).get("detail")
     except (ValueError, AttributeError):
         return False
-    return isinstance(detail, str) and "not found" in detail.lower()
+    if not isinstance(detail, str):
+        return False
+    detail = detail.lower()
+    return "not found" in detail and "ticker" in detail
 
 
 def _retry_after(response: httpx.Response) -> float | None:
