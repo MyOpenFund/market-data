@@ -8,7 +8,8 @@ and writes nothing (a dry run):
     ``corporate_actions``, ``vendor_total_return``, ``index_snapshots`` and ``fetch_log``
     (producer ``PRODUCER``, rows of source ``private_history``), and, in the step's private run
     directory, ``observations.parquet`` (the only place the export's labels live) and
-    ``spans.parquet`` (per member, from the fetch log and the snapshots) for ``map``. Those two
+    ``spans.parquet`` (per member, from the fetch log and every filed snapshot, a restated
+    load included) for ``map``. Those two
     are written first: batches that landed without them could never be mapped.
 ``plan_fetch`` / ``fetch``
     The requests a fetch would make and the quota they would spend (dry run); with ``write``,
@@ -320,7 +321,9 @@ def load_history(
         # the run's private artifacts first: batches without them could never be mapped
         run = _run_dir(reports, run_id)
         pq.write_table(loaded.observations, run / OBSERVATIONS_FILE)
-        spans = _mapping.spans_from_fetch_log(loaded.fetch_log, snapshots=loaded.index_snapshots)
+        # spans from every filed snapshot: a restated load's index_snapshots hold only the
+        # rows that changed, and would shorten (or drop) the span of every unchanged member
+        spans = _mapping.spans_from_fetch_log(loaded.fetch_log, snapshots=history.snapshots())
         pq.write_table(spans, run / SPANS_FILE)
         written = _write(tables, landing=landing, run_id=run_id)
     summary = summarize_safely(

@@ -748,3 +748,33 @@ def test_archive_observations_latest_fetch_wins_per_label():
         ("ticker", date(2024, 4, 16)),
         ("composite_figi", date(2024, 4, 16)),
     ]
+
+
+def open_windows(cfg) -> list[tuple]:
+    from open_data_store.market.asof import latest
+
+    with Store.open(cfg) as store:
+        ids = store.read_asof("instrument_identifiers")
+    rows = latest(ids, INSTRUMENT_IDENTIFIERS.natural_key).to_pylist()
+    return sorted(
+        (r["instrument_id"], r["id_value"], r["valid_date"], r["valid_to"])
+        for r in rows
+        if r["id_scheme"] == "source_symbol"
+        and (r["valid_to"] is None or r["valid_to"] > r["valid_date"])
+    )
+
+
+def test_restated_load_keeps_the_spans_of_the_full_snapshot_table(env, run):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert run("map", "--write", "--no-existing") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    before = open_windows(env["cfg"])
+    published = env["root"] / "published_snapshots.parquet"
+    with Store.open(env["cfg"]) as store:
+        pq.write_table(store.read_asof("index_snapshots"), published)
+    assert run(*HISTORY_ARGS, "--write", "--previous-snapshots", str(published)) == EXIT_OK
+    first, second = sorted((env["reports"] / "runs").glob("*-load-history"))
+    assert pq.read_table(second / "spans.parquet").equals(pq.read_table(first / "spans.parquet"))
+    assert run("map", "--write") in (EXIT_OK, EXIT_DEGRADED)
+    assert publish_pending(env["cfg"]).exit_code == 0
+    assert open_windows(env["cfg"]) == before
