@@ -50,6 +50,7 @@ market_data = "market_data.sources:sources"
 # in market_data.sources (tests/test_adapters_base.py enforces it).
 [project.entry-points."market_data.adapters"]
 massive = "market_data.adapters.massive:adapter"
+tiingo = "market_data.adapters.tiingo:adapter"
 
 [tool.hatch.metadata]
 # Needed for the git URL dependency above; remove with it.

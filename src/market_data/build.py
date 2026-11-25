@@ -27,6 +27,11 @@ Corporate actions (``build_actions``, contract ``corporate_actions``)
     labelled ``collected`` / ``fetch_time``. A later changed value (any non-identity field) gives
     a new row at ``fetched_at``, ``collected`` / ``fetch_time``.
 
+    Actions carried by another kind's payload: an adapter whose actions come in its prices
+    answers (Tiingo: ``divCash``/``splitFactor`` on each end-of-day row) declares
+    ``actions_fetch_kind = "prices"``; ``build_actions`` then reads that adapter's archived
+    ``prices`` fetches and parses each as kind ``actions`` (``fetch_kind`` overrides it).
+
 Fetch log (``build_fetch_log``, contract ``fetch_log``)
     One row per archived fetch of a source, ``fetch_id`` = ``archive_ref``.
 
@@ -63,7 +68,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -176,15 +181,19 @@ def _rows(
     adapter: Adapter,
     kind: str,
     symbols: Sequence[str] | None,
+    *,
+    fetch_kind: str | None = None,
 ) -> list[tuple[datetime, str, list[dict[str, Any]]]]:
     """(fetched_at UTC, archive_ref, rows) per contributing fetch, in archive order, filtered to
-    symbols."""
+    symbols. Rows of ``kind`` are parsed from the archived fetches of ``fetch_kind`` (default
+    ``kind``)."""
     wanted = None if symbols is None else pa.array(sorted(set(symbols)), pa.string())
     out = []
-    for entry in _fetches(archive, adapter.source_code, kind, symbols):
+    for entry in _fetches(archive, adapter.source_code, fetch_kind or kind, symbols):
         if entry.result.status not in ROW_STATUSES:
             continue
-        table = _parse(adapter, entry.result)
+        result = entry.result if entry.result.kind == kind else replace(entry.result, kind=kind)
+        table = _parse(adapter, result)
         if wanted is not None:
             table = table.filter(pc.is_in(table["source_symbol"], value_set=wanted))
         out.append((entry.result.fetched_at.astimezone(UTC), entry.archive_ref, table.to_pylist()))
@@ -302,6 +311,7 @@ def build_actions(
     *,
     mic: str = "XNYS",
     next_session_margin: timedelta = NEXT_SESSION_MARGIN,
+    fetch_kind: str | None = None,
 ) -> BuildResult:
     """``corporate_actions`` rows of ``adapter``'s source for ``symbols`` (None: every symbol).
 
@@ -309,9 +319,16 @@ def build_actions(
     earliest ex-date minus the margin to the latest plus the margin, so an ex-date that is not a
     session finds the next session, and the range always holds a session even when the earliest
     ex-date is a weekend or holiday. Calendar failures (out of the library's range, no next
-    session inside the margin) are ``ValueError``."""
+    session inside the margin) are ``ValueError``.
+
+    ``fetch_kind``: the archived kind holding the actions; None (default) takes the adapter's
+    ``actions_fetch_kind`` attribute when it has one, else ``"actions"``."""
     check_margin(next_session_margin)
-    fetches = _rows(archive, adapter, "actions", symbols)
+    if fetch_kind is None:
+        fetch_kind = getattr(adapter, "actions_fetch_kind", "actions")
+    if fetch_kind not in FETCH_KINDS or fetch_kind == "symbols":
+        raise ValueError(f"fetch_kind must be 'actions' or 'prices', got {fetch_kind!r}")
+    fetches = _rows(archive, adapter, "actions", symbols, fetch_kind=fetch_kind)
     ex_dates = [r["valid_date"] for _, _, rows in fetches for r in rows]
     cal = None
     if ex_dates:

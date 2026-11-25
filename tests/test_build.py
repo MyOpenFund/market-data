@@ -523,6 +523,21 @@ def test_action_from_whole_market_fetch_filtered(arc):
     assert t["source_symbol"].to_pylist() == ["AAA"]
 
 
+def test_actions_read_from_another_fetch_kind(arc):
+    rows = [action("AAA", "2026-01-06", amount=0.5, currency="USD")]
+    put(arc, rows, utc(2026, 1, 7, 1), kind="prices")  # actions carried by a prices payload
+    plain = FakeAdapter()
+    assert build_actions(arc, plain, ["AAA"]).table.num_rows == 0  # default: kind "actions"
+    t = build_actions(arc, plain, ["AAA"], fetch_kind="prices").table
+    assert t["amount"].to_pylist() == [0.5]
+    assert [r.kind for r in plain.parsed] == ["actions"]  # parsed as actions, archive untouched
+    declared = FakeAdapter()
+    declared.actions_fetch_kind = "prices"
+    assert build_actions(arc, declared, ["AAA"]).table.equals(t)
+    with pytest.raises(ValueError, match="fetch_kind"):
+        build_actions(arc, plain, ["AAA"], fetch_kind="symbols")
+
+
 # --- fetch log ---------------------------------------------------------------------------------
 
 
