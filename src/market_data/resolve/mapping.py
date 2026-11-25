@@ -87,6 +87,10 @@ Rules
       empty window the store never applies, so an outdated mapping (a series now manual,
       ambiguous or re-dated) cannot clash with the new one. A series without a span this run
       keeps its published windows as they are (never rewritten open-ended).
+    - A later export giving an export-dated token another composite is the source of truth
+      correcting itself: the span moves to the new instrument and the published row is closed,
+      and the move is reported in ``MappingResult.changed`` (``export_composite_changed``,
+      candidates = instruments left; the token only, no label).
     - ``known_at`` = ``load_time`` (``collected`` / ``load_time``) for every row (spec §7.3).
 
 Spans: ``spans_from_fetch_log`` (per series, earliest ``requested_from`` (else
@@ -159,6 +163,7 @@ __all__ = [
     "UNRESOLVED_NO_SPAN",
     "UNRESOLVED_OUTSIDE_SPAN",
     "UNRESOLVED_UNCOVERED_SPAN",
+    "CHANGED_EXPORT_COMPOSITE",
     "MappingResult",
     "build_mapping",
     "combine_spans",
@@ -187,6 +192,7 @@ UNRESOLVED_NO_COMPOSITE = "no_composite_figi"
 UNRESOLVED_NO_SPAN = "no_span"
 UNRESOLVED_OUTSIDE_SPAN = "outside_span"
 UNRESOLVED_UNCOVERED_SPAN = "uncovered_span"
+CHANGED_EXPORT_COMPOSITE = "export_composite_changed"
 AMBIGUOUS_SEVERAL_COMPOSITES = "several_composite_figis"
 AMBIGUOUS_OPENFIGI_SHARED = "openfigi_shared"
 AMBIGUOUS_OPENFIGI_STALE = "openfigi_stale"
@@ -265,6 +271,7 @@ class MappingResult:
     ambiguous: pa.Table  # REPORT_SCHEMA
     minted: tuple[str, ...]  # instrument ids created by this run
     labels_left_out: pa.Table  # LABELS_LEFT_OUT_SCHEMA (counts, never a label)
+    changed: pa.Table  # REPORT_SCHEMA: mapped series moved to another instrument (operator review)
 
 
 @dataclass(frozen=True)
@@ -858,6 +865,7 @@ def build_mapping(
     kept: set[str] = set()  # id_values whose published windows this run keeps as they are
     mapping: list[dict[str, Any]] = []
 
+    changed: list[tuple[Series, str, int]] = []
     applied: dict[Series, _Window] = {}  # present-time answers applied this run, per series
 
     def keep(s: Series, value: str, published: list[_Window], candidates: int = 0) -> None:
@@ -949,6 +957,13 @@ def build_mapping(
             continue
         if uncovered:
             unresolved.append((s, UNRESOLVED_UNCOVERED_SPAN, len(candidates)))
+        if s[0] in export_dated and published:
+            moved = {w.instrument_id for w in published} - {
+                ids.by_composite.get(c) for c, _, _ in windows
+            }
+            if moved:
+                # a corrected export is the source of truth: applied, but every move is shown
+                changed.append((s, CHANGED_EXPORT_COMPOSITE, len(moved)))
         for composite, start, end in windows:
             inst = ids.for_composite(composite)
             windows_of[s].append(_Window(inst, start, end, composite))
@@ -1047,6 +1062,7 @@ def build_mapping(
         unresolved=_report(unresolved),
         ambiguous=_report(ambiguous),
         minted=tuple(ids.minted),
+        changed=_report(changed),
         labels_left_out=pa.Table.from_pylist(
             [
                 {"source_code": s[0], "source_symbol": s[1], "reason": why, "rows": n}
@@ -1087,7 +1103,8 @@ def link_issuers(
     their own source) and the new one added. Feeding the output back in at the same
     ``load_time`` adds nothing; closing a row published at this very ``load_time`` raises.
 
-    Source of the row: ``sec`` when the instrument has at least one live series (an open
+    Closed (empty-window) mapping rows never count as series of an instrument. Source of the
+    row: ``sec`` when the instrument has at least one live series (an open
     ``source_symbol`` window reaching ``as_of - max_staleness_days``) of an open source (a dead
     open series never publishes a link found through a private one); otherwise (known only
     through restricted series, e.g. a private token) the most restrictive of its series'

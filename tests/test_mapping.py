@@ -1177,3 +1177,36 @@ def test_cik_link_ignores_closed_and_dead_open_series_and_never_doubles():
         if r["valid_to"] is None or r["valid_to"] > r["valid_date"]
     ]
     assert open_ciks == ["0000000007"]
+
+
+def test_export_composite_change_moves_the_span_and_is_reported():
+    sp = spans(("private_history", "t1", date(2005, 1, 3), END))
+    first = build(
+        observations(ob("private_history", "t1", "composite_figi", CX, END),
+                     ob("private_history", "t1", "export_member_id", "SYN UN Equity", END)),
+        spans=sp,
+    )  # fmt: skip
+    assert first.changed.num_rows == 0
+    second = build(
+        observations(ob("private_history", "t1", "composite_figi", CY, END)),
+        spans=sp,
+        existing=first.identifiers,
+        load_time=LATER,
+    )
+    assert second.changed.to_pylist() == [
+        {"source_code": "private_history", "source_symbol": "t1",
+         "reason": "export_composite_changed", "candidates": 1}
+    ]  # fmt: skip
+    assert second.changed.schema == REPORT_SCHEMA
+    m = symbol_mappings(pa.concat_tables([first.identifiers, second.identifiers]))
+    assert resolve(m, "private_history:t1", date(2010, 1, 4)) == instrument_of(
+        second.identifiers, CY
+    )
+    # an unchanged export reports nothing
+    third = build(
+        observations(ob("private_history", "t1", "composite_figi", CY, END)),
+        spans=sp,
+        existing=pa.concat_tables([first.identifiers, second.identifiers]),
+        load_time=LATER + timedelta(days=1),
+    )
+    assert third.changed.num_rows == 0
