@@ -297,11 +297,62 @@ def test_failed_fetch_contributes_no_rows(arc):
     assert [r.status for r in adapter.parsed] == ["partial"]
 
 
-def test_conflicting_values_at_one_fetch_time_raise(arc):
+def test_conflicting_values_within_one_fetch_raise(arc):
     put(arc, [bar("AAA", "2026-01-05", 10.0)], utc(2026, 1, 6, 1))
+    ref = put(
+        arc, [bar("AAA", "2026-01-05", 10.0), bar("AAA", "2026-01-05", 10.4)], utc(2026, 1, 7)
+    )
+    with pytest.raises(ValueError, match="conflicting values") as err:
+        build_prices(arc, FakeAdapter(), ["AAA"])
+    assert ref in str(err.value) and "'AAA'" in str(err.value)
+
+
+def test_conflicting_first_values_within_one_fetch_raise(arc):
     put(arc, [bar("AAA", "2026-01-05", 10.0), bar("AAA", "2026-01-05", 10.4)], utc(2026, 1, 7))
     with pytest.raises(ValueError, match="conflicting values"):
         build_prices(arc, FakeAdapter(), ["AAA"])
+
+
+def test_tied_conflict_across_fetches_first_sighting_raises(arc):
+    at = utc(2026, 1, 6, 1)
+    own = put(arc, [bar("AAA", "2026-01-05", 10.0)], at)
+    mkt = put(arc, [bar("AAA", "2026-01-05", 10.5)], at, symbol=WHOLE_MARKET_SYMBOL)
+    with pytest.raises(ValueError, match="conflicting values") as err:
+        build_prices(arc, FakeAdapter(), ["AAA"])
+    assert own in str(err.value) and mkt in str(err.value)
+    assert "2026, 1, 5" in str(err.value) or "2026-01-05" in str(err.value)
+
+
+def test_tied_conflict_across_fetches_already_seen_raises(arc):
+    put(arc, [bar("AAA", "2026-01-05", 10.0)], utc(2026, 1, 6, 1))
+    at = utc(2026, 1, 8, 1)
+    own = put(arc, [bar("AAA", "2026-01-05", 10.2)], at)
+    mkt = put(arc, [bar("AAA", "2026-01-05", 10.3)], at, symbol=WHOLE_MARKET_SYMBOL)
+    with pytest.raises(ValueError, match="conflicting values") as err:
+        build_prices(arc, FakeAdapter(), ["AAA"])
+    assert own in str(err.value) and mkt in str(err.value)
+
+
+def test_tied_equal_values_across_fetches_give_one_row(arc):
+    at = utc(2026, 1, 6, 1)
+    put(arc, [bar("AAA", "2026-01-05", 10.0)], at)
+    put(arc, [bar("AAA", "2026-01-05", 10.0)], at, symbol=WHOLE_MARKET_SYMBOL)
+    assert build_prices(arc, FakeAdapter(), ["AAA"]).table.num_rows == 1
+
+
+def test_tied_conflict_across_action_fetches_raises(arc):
+    at = utc(2026, 1, 7, 1)
+    own = put(arc, [action("AAA", "2026-01-06", amount=0.5)], at, kind="actions")
+    mkt = put(
+        arc,
+        [action("AAA", "2026-01-06", amount=0.6)],
+        at,
+        symbol=WHOLE_MARKET_SYMBOL,
+        kind="actions",
+    )
+    with pytest.raises(ValueError, match="conflicting values") as err:
+        build_actions(arc, FakeAdapter(), ["AAA"])
+    assert own in str(err.value) and mkt in str(err.value)
 
 
 def test_rows_of_another_source_refused(arc):
@@ -386,7 +437,7 @@ def test_action_announce_date_path(arc):
     ]
     assert got == [
         ("AAA", utc(2026, 1, 16, 4, 59, 59, 999999), "published", "announce_date"),
-        ("BBB", utc(2026, 1, 15, 15), "published", "announce_date"),
+        ("BBB", utc(2026, 1, 15, 15), "collected", "fetch_time"),
     ]
 
 
@@ -425,7 +476,33 @@ def test_future_ex_date_never_gives_future_known_at(arc):
     )
     t = build_actions(arc, FakeAdapter(), ["AAA"]).table
     assert t["known_at"].to_pylist() == [fetched, fetched]
+    assert t["known_at_kind"].to_pylist() == ["collected", "collected"]
+    assert t["known_at_basis"].to_pylist() == ["fetch_time", "fetch_time"]
     conform(CORPORATE_ACTIONS, t, now=fetched)
+
+
+def test_announce_on_ex_date_known_at_ex_date_open(arc):
+    # Announced on its own ex-date: end of day comes after the open, so the open is used and a
+    # total return as of the ex-date close sees the action.
+    a = action("AAA", "2026-01-06", announce_date="2026-01-06", amount=0.5, currency="USD")
+    put(arc, [a], utc(2026, 1, 7, 1), kind="actions")
+    (row,) = rows_of(build_actions(arc, FakeAdapter(), ["AAA"]).table)
+    assert (row["known_at"], row["known_at_kind"], row["known_at_basis"]) == (
+        utc(2026, 1, 6, 14, 30),
+        "published",
+        "ex_date_assumed",
+    )
+
+
+def test_announce_day_before_ex_date_uses_announce_date(arc):
+    a = action("AAA", "2026-01-06", announce_date="2026-01-05", amount=0.5, currency="USD")
+    put(arc, [a], utc(2026, 1, 7, 1), kind="actions")
+    (row,) = rows_of(build_actions(arc, FakeAdapter(), ["AAA"]).table)
+    assert (row["known_at"], row["known_at_kind"], row["known_at_basis"]) == (
+        utc(2026, 1, 6, 4, 59, 59, 999999),
+        "published",
+        "announce_date",
+    )
 
 
 def test_action_from_whole_market_fetch_filtered(arc):
