@@ -20,12 +20,17 @@ Commands:
   first mapping (no published identifiers), so ids are never re-minted by accident.
 - ``build --source massive|tiingo [--identifiers PARQUET] [--all-symbols]``: restricted to the
   source's mapped universe (``--all-symbols``: every archived symbol, an explicit choice).
-- ``report``: the newest pieces merged into ``<run_id>-report.json`` / ``.md``.
+- ``report [--index CODE [--as-of T] [--precedence ...] [--snapshot-precedence ...]
+  [--allowed-restricted ...] [--staleness-days N] [--max-missing-share X]
+  [--min-delisting-gap-sessions N]]``: the newest pieces merged into ``<run_id>-report.json`` /
+  ``.md``, with the store's coverage of the index (defaults: the store recipes'); without
+  ``--index`` the report is degraded (``coverage_not_run``).
 
 Each command prints one summary line (counts, never a label) and exits 0 (``ok``), 1
 (``degraded``; 0 with ``--allow-degraded``) or 2 (``error``). An exception is caught: its type and
 message go to stderr, and an ``error`` report naming its type only is written to the reports
-directory (dry run included) before the exit.
+directory (dry run included) before the exit. A successful ``--write`` whose run record cannot
+be saved exits 2 ("batches landed but run record not saved").
 """
 
 from __future__ import annotations
@@ -40,6 +45,11 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from open_data_store.contracts.standard.market import INSTRUMENT_IDENTIFIERS
+from open_data_store.market.coverage import (
+    DEFAULT_MAX_MISSING_SHARE,
+    DEFAULT_MIN_DELISTING_GAP_SESSIONS,
+)
+from open_data_store.market.membership import DEFAULT_STALENESS_DAYS
 
 from market_data import pipeline
 from market_data.adapters.base import Adapter, allowed_adapters, load_adapters
@@ -275,9 +285,43 @@ def _build(args: argparse.Namespace, run_id: str, started: datetime) -> pipeline
         _close(adapter)
 
 
+def _coverage(args: argparse.Namespace):
+    """The store's coverage of ``--index`` (None without ``--index``: ``coverage_not_run``)."""
+    if args.index is None:
+        return None
+    from open_data_store import sources
+    from open_data_store.config import StoreConfig
+    from open_data_store.reader import Store
+
+    as_of = args.as_of or datetime.now(UTC)
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("--as-of must carry a UTC offset, e.g. 2026-11-20T21:00:00+00:00")
+    allowed = args.allowed_restricted
+    if allowed is None:  # the operator's own store: every registered restricted source
+        allowed = sorted(sources.restricted_codes(sources.discover_sources()))
+    with Store.open(StoreConfig.from_env()) as store:
+        return pipeline.store_coverage(
+            store,
+            index_code=args.index,
+            as_of=as_of,
+            allowed_restricted=allowed,
+            precedence=args.precedence,
+            snapshot_precedence=args.snapshot_precedence,
+            staleness_days=args.staleness_days,
+            max_missing_share=args.max_missing_share,
+            min_delisting_gap_sessions=args.min_delisting_gap_sessions,
+        )
+
+
 def _report(args: argparse.Namespace, run_id: str, started: datetime) -> pipeline.StepResult:
     reports = _require(_reports(args), "reports directory", REPORTS_ENV)
-    return pipeline.report(reports, run_id=run_id, started_at=started, write=args.write)
+    return pipeline.report(
+        reports,
+        run_id=run_id,
+        started_at=started,
+        write=args.write,
+        coverage_result=_coverage(args),
+    )
 
 
 _BODIES: dict[str, Body] = {
@@ -300,25 +344,39 @@ def _exit_code(result: pipeline.StepResult, allow_degraded: bool) -> int:
     return EXIT_OK
 
 
-def _record(step: str, args: argparse.Namespace, result: pipeline.StepResult) -> None:
+def _record(step: str, args: argparse.Namespace, result: pipeline.StepResult) -> bool:
     """Keep the step's piece (``--write``) and, for an ``error`` outcome, write its report
-    (type name only) to the reports directory, dry run included. Best effort: a failure here
-    is said on stderr and never changes the exit code of an error."""
+    (type name only) to the reports directory, dry run included. Returns False when the run
+    record of a successful ``--write`` could not be kept (its batches did land): the caller
+    exits with the error code."""
     reports = _reports(args)
     error = result.outcome == "error"
     if reports is None:
         if error:
             print(f"{step}: no error report written ({REPORTS_ENV} not set)", file=sys.stderr)
-        return
+        return True
     try:
         if error:
             write_report(result.summary, reports)
         if args.write and step != "report":
             pipeline.save_piece(reports, result)
-    except Exception as exc:  # noqa: BLE001 - an error run still exits with the error code
-        if not error:
-            raise
-        print(f"{step}: error report not written ({type(exc).__name__})", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - said on stderr, and the exit code says it too
+        if error:
+            print(f"{step}: error report not written ({type(exc).__name__})", file=sys.stderr)
+            return True
+        print(
+            f"{step}: batches landed but run record not saved: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _step_source(step: str, args: argparse.Namespace) -> str | None:
+    """The source a step's pieces are keyed by, the same whether it fails or succeeds."""
+    if step == "load-history":
+        return pipeline.HISTORY_SOURCE
+    return getattr(args, "source", None)
 
 
 def _run(step: str, args: argparse.Namespace) -> int:
@@ -331,9 +389,12 @@ def _run(step: str, args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - doctrine: every failure ends in an error report
         print(f"{step}: {type(exc).__name__}: {exc}", file=sys.stderr)
         summary = pipeline.summarize_safely(run_id, started_at=started, error=exc)
-        result = pipeline.StepResult(step, summary, args.write, getattr(args, "source", None))
-    _record(step, args, result)
+        kind = args.kind if step == "fetch" else None
+        result = pipeline.StepResult(step, summary, args.write, _step_source(step, args), kind=kind)
+    kept = _record(step, args, result)
     print(result.line())
+    if not kept:
+        return EXIT_ERROR
     return _exit_code(result, args.allow_degraded)
 
 
@@ -381,7 +442,21 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--identifiers", type=Path)
     p.add_argument("--all-symbols", action="store_true")
 
-    sub.add_parser("report", parents=[common], help="merge the newest pieces into a report")
+    p = sub.add_parser("report", parents=[common], help="merge the newest pieces into a report")
+    p.add_argument("--index", help="index code whose store coverage the report runs")
+    p.add_argument("--as-of", type=datetime.fromisoformat, help="coverage as known then")
+    p.add_argument("--precedence", nargs="*", default=[], help="price source precedence")
+    p.add_argument("--snapshot-precedence", nargs="*", default=[])
+    p.add_argument(
+        "--allowed-restricted",
+        nargs="*",
+        help="restricted sources read (default: every registered one: your own store)",
+    )
+    p.add_argument("--staleness-days", type=int, default=DEFAULT_STALENESS_DAYS)
+    p.add_argument("--max-missing-share", type=float, default=DEFAULT_MAX_MISSING_SHARE)
+    p.add_argument(
+        "--min-delisting-gap-sessions", type=int, default=DEFAULT_MIN_DELISTING_GAP_SESSIONS
+    )
     return parser
 
 

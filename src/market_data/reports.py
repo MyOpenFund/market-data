@@ -8,7 +8,8 @@ Silent-failure doctrine: a run is never ``ok`` by default. ``RunSummary.outcome`
   with no unresolved or ambiguous identifier (``MappingResult.unresolved`` / ``ambiguous``, and
   overlapping mapping windows); a prices fetch log was recorded (a non-empty
   ``fetch_logs["prices"]``, or the history-file load's fetch-log summary with members) with no
-  unsuperseded failed fetch of any kind; the coverage, when given, has sessions and passed;
+  unsuperseded failed fetch of any kind; the coverage, when given, has sessions and passed (a
+  whole-run report, ``coverage_required``, must have one: else ``coverage_not_run``);
 - ``degraded`` otherwise; ``reasons`` says why (``REASONS``).
 
 Kept-out rows, builder drops, changed mappings and quality flags are counted but do not degrade a
@@ -76,6 +77,7 @@ REASONS = (
     "failed_fetches",
     "coverage_empty",
     "coverage_failed",
+    "coverage_not_run",
 )
 # Over-threshold session dates listed in a report (the count is always given).
 DEFAULT_MAX_LISTED_SESSIONS = 20
@@ -270,6 +272,8 @@ class RunSummary:
     - ``fetches``: kind -> source_code -> fetch-log rows recorded.
     - ``failed_fetches``: kind -> source_code -> unsuperseded failed fetches.
     - ``written``: contract -> rows written.
+    - ``coverage_required``: a whole-run report (the CLI's ``report``): a missing coverage
+      section is then the reason ``coverage_not_run``.
     """
 
     run_id: str
@@ -285,6 +289,8 @@ class RunSummary:
     fetches: Mapping[str, Any] | None = None
     failed_fetches: Mapping[str, Any] | None = None
     written: Mapping[str, Any] | None = None
+    # True for a whole-run report: no coverage then degrades it (``coverage_not_run``).
+    coverage_required: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not _RUN_ID.fullmatch(self.run_id):
@@ -293,6 +299,8 @@ class RunSummary:
                 "starting with a letter or digit"
             )
         _aware(self.started_at, "started_at")
+        if not isinstance(self.coverage_required, bool):
+            raise ValueError("coverage_required must be a bool")
         _aware(self.finished_at, "finished_at")
         if self.error is not None and not (
             isinstance(self.error, str) and self.error.isidentifier()
@@ -322,7 +330,10 @@ class RunSummary:
             out.append("fetch_logs_not_recorded")
         if self.failed_fetches is not None and _total(self.failed_fetches):
             out.append("failed_fetches")
-        if self.coverage is not None:
+        if self.coverage is None:
+            if self.coverage_required:
+                out.append("coverage_not_run")
+        else:
             if not self.coverage["sessions"]:
                 out.append("coverage_empty")
             elif not self.coverage["passed"]:

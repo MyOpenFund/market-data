@@ -17,7 +17,9 @@ Profile ``none`` (default: the README "Try it")
     (``resolve_prices``, ``resolve_actions``, ``total_return``). Returning to the caller data
     fetched with the caller's own key is not redistribution: no licence gate (spec §13). Massive
     actions are whole-market lists: a total return through Massive pages through every dividend
-    and split of the range (slow at the free plan's 5 requests a minute).
+    and split of the range (slow at the free plan's 5 requests a minute). ``as_of`` here dates
+    the identity rows and bounds the recipe's read, nothing more: the data is fetched now, with
+    what the source knows today (actions and corrections included).
 
 Profile ``server``
     Reads a store (``store``, else ``Store.open()`` from the environment) with
@@ -39,7 +41,12 @@ Output (sorted by instrument_id, session_date; ``start``..``end`` inclusive)
 Errors (``ApiError``, a ``ValueError``): ``MissingKeyError`` (no key for the live source; the
 key itself is never shown), ``UnknownInstrumentError`` (inputs nothing names, listed as the
 caller wrote them, never a stored label), ``AmbiguousInstrumentError`` (an input naming several
-instruments), ``RestrictedSourceError`` (a restricted or unregistered source not allowed).
+instruments), ``RestrictedSourceError`` (a restricted or unregistered source not allowed),
+``NoDataError`` (none: a symbol the source returned no row for over the range, either adapter;
+server: an input ``source=`` has no price for over the range), and a plain ``ApiError`` when two
+sources (or two series of one source) give one instrument different rows on one session
+(server, without ``source=``; only the caller's inputs are named). The server profile resolves
+only the requested instruments' series: other instruments never make a request fail.
 """
 
 from __future__ import annotations
@@ -74,6 +81,7 @@ __all__ = [
     "AmbiguousInstrumentError",
     "ApiError",
     "MissingKeyError",
+    "NoDataError",
     "RestrictedSourceError",
     "UnknownInstrumentError",
     "prices",
@@ -126,6 +134,14 @@ class UnknownInstrumentError(ApiError):
         self.inputs = tuple(inputs)
         shown = list(self.inputs[:_MAX_LISTED])
         super().__init__(f"{len(self.inputs)} unknown instrument(s) ({why}): {shown}")
+
+
+class NoDataError(ApiError):
+    """Inputs the source returned no row for over the range; ``inputs`` lists them."""
+
+    def __init__(self, message: str, inputs: Sequence[str]) -> None:
+        self.inputs = tuple(inputs)
+        super().__init__(message)
 
 
 class AmbiguousInstrumentError(ApiError):
@@ -209,8 +225,10 @@ def prices(
     """Daily prices of ``instruments`` from ``start`` to ``end`` (inclusive); see the module
     docstring for the profiles, the output and the errors.
 
-    ``as_of`` (tz-aware, default now): what is known then (server: the store read; none: the
-    recipe's read of the in-memory rows). ``allowed_restricted``: restricted source codes the
+    ``as_of`` (tz-aware, default now): server, the store read as known then; none, the
+    recipe's read of the in-memory rows and the date of the identity rows only: the data is
+    fetched now, so actions and corrections the source knows today apply whatever ``as_of``
+    (only a store keeps earlier vintages). ``allowed_restricted``: restricted source codes the
     server profile may read. ``mic``: the session calendar. ``adapter``: an adapter to use
     instead of building the live one from ``source`` and the key (tests, a custom adapter);
     the caller closes it."""
@@ -298,13 +316,18 @@ def _live_with(
     ]
     if missing:
         raise UnknownInstrumentError(missing, f"{code} knows no such symbol")
+    built = build_prices(memory, adapter, symbols, mic=mic).table  # type: ignore[arg-type]
+    built = _in_range(built, "valid_date", start, end)
+    present = set(built["source_symbol"].to_pylist())
+    empty = [s for s in symbols if s not in present]
+    if empty:
+        raise NoDataError(
+            f"no data for {empty[:_MAX_LISTED]} from {code} between {start.isoformat()} and "
+            f"{end.isoformat()}",
+            empty,
+        )
     identifiers = _identity(code, symbols, as_of)
-    resolved = resolve_prices(
-        build_prices(memory, adapter, symbols, mic=mic).table,  # type: ignore[arg-type]
-        identifiers,
-        as_of=as_of,
-        precedence=(),
-    )
+    resolved = resolve_prices(built, identifiers, as_of=as_of, precedence=())
     label = {f"{LIVE_PREFIX}{code}:{s}": s for s in symbols}
     if adjust == "raw":
         out = _raw(resolved, start, end)
@@ -413,17 +436,69 @@ def _server(
         if own:
             store.close()
     named = _resolve_inputs(labels, inputs.identifiers, as_of.astimezone(UTC).date())
-    wanted = pa.array(sorted(set(named.values())), pa.string())
+    series = _series_of(inputs.identifiers, set(named.values()))
+    prices_in = _of_series(inputs.prices, set().union(*series.values()))
+    actions_in = _of_series(inputs.actions, set().union(*series.values()))
     precedence = (source,) if source else ()
-    resolved = resolve_prices(inputs.prices, inputs.identifiers, as_of=as_of, precedence=precedence)
-    resolved = resolved.filter(pc.is_in(resolved["instrument_id"], value_set=wanted))
+
+    def resolved_for(tokens: set[str]) -> tuple[pa.Table, pa.Table | None]:
+        rp = resolve_prices(
+            _of_series(prices_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
+        )
+        if adjust == "raw":
+            return rp, None
+        ra = resolve_actions(
+            _of_series(actions_in, tokens), inputs.identifiers, as_of=as_of, precedence=precedence
+        )
+        return rp, ra
+
+    try:
+        resolved, actions = resolved_for(set().union(*series.values()))
+    except ValueError:
+        # name the caller's inputs only: the recipe's message names other series
+        clashing = []
+        for label, inst in named.items():
+            try:
+                resolved_for(series[inst])
+            except ValueError:
+                clashing.append(label)
+        raise ApiError(
+            f"several sources (or conflicting series) for {clashing[:_MAX_LISTED]} on one "
+            "session; pass source= to choose one"
+        ) from None
+    if source is not None:
+        window = _in_range(resolved, "session_date", start, end)
+        have = set(window["instrument_id"].to_pylist())
+        empty = [label for label, inst in named.items() if inst not in have]
+        if empty:
+            raise NoDataError(
+                f"no {source} prices for {empty[:_MAX_LISTED]} between {start.isoformat()} "
+                f"and {end.isoformat()}: try another source, or none to take any allowed one",
+                empty,
+            )
     if adjust == "raw":
         return _raw(resolved, start, end).cast(RAW_SERVER_SCHEMA)
-    actions = resolve_actions(
-        inputs.actions, inputs.identifiers, as_of=as_of, precedence=precedence
-    )
-    actions = actions.filter(pc.is_in(actions["instrument_id"], value_set=wanted))
+    assert actions is not None
     return _total_return(resolved, actions, start, end, mic).cast(TOTAL_RETURN_SERVER_SCHEMA)
+
+
+def _series_of(identifiers: pa.Table, instruments: set[str]) -> dict[str, set[str]]:
+    """instrument_id -> its ``<source_code>:<symbol>`` series (mapping rows, read latest)."""
+    out: dict[str, set[str]] = {i: set() for i in instruments}
+    if not identifiers.num_rows:
+        return out
+    rows = latest(identifiers, INSTRUMENT_IDENTIFIERS.natural_key)
+    rows = rows.filter(pc.equal(rows["id_scheme"], "source_symbol"))
+    for r in rows.select(["instrument_id", "id_value"]).to_pylist():
+        if r["instrument_id"] in out:
+            out[r["instrument_id"]].add(r["id_value"])
+    return out
+
+
+def _of_series(table: pa.Table, tokens: set[str]) -> pa.Table:
+    """The rows of ``table`` (source_code, source_symbol) belonging to ``tokens``."""
+    token = pc.binary_join_element_wise(table["source_code"], table["source_symbol"], ":")
+    return table.filter(pc.is_in(token, value_set=pa.array(sorted(tokens), pa.string())))
 
 
 # --- shared ------------------------------------------------------------------------------------

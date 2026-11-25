@@ -47,7 +47,8 @@ and restricted sources are read only when you allow them (`allowed_restricted`).
 `--write`, prints one summary line and exits 0 (ok), 1 (degraded; 0 with `--allow-degraded`) or
 2 (error). Paths come from flags or `MOF_MARKET_ARCHIVE`, `MOF_MARKET_REPORTS` (private, outside
 any git checkout), `OPEN_DATA_STORE_DATA_ROOT` (landing) and `OPEN_DATA_STORE_CATALOG` (published
-identifiers). See `market-data <command> --help` and the docstrings of `market_data.cli` and
+identifiers). `report --index CODE` runs the store's coverage of that index; a report
+without it is degraded (`coverage_not_run`). See `market-data <command> --help` and the docstrings of `market_data.cli` and
 `market_data.pipeline`.
 
 ## Writing an adapter in your own package

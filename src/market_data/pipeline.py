@@ -8,7 +8,8 @@ and writes nothing (a dry run):
     ``corporate_actions``, ``vendor_total_return``, ``index_snapshots`` and ``fetch_log``
     (producer ``PRODUCER``, rows of source ``private_history``), and, in the step's private run
     directory, ``observations.parquet`` (the only place the export's labels live) and
-    ``spans.parquet`` (per member, from the fetch log and the snapshots) for ``map``.
+    ``spans.parquet`` (per member, from the fetch log and the snapshots) for ``map``. Those two
+    are written first: batches that landed without them could never be mapped.
 ``plan_fetch`` / ``fetch``
     The requests a fetch would make and the quota they would spend (dry run); with ``write``,
     every FetchResult the adapter yields is put in the raw archive as it arrives (an ``error``
@@ -24,20 +25,27 @@ and writes nothing (a dry run):
     restricted to the symbols given (the CLI passes the source's mapped universe): landing
     batches for ``prices``, ``corporate_actions`` and ``fetch_log``. The published fetch log
     holds **prices fetches only**: the contract has no kind column, and an actions or symbols
-    fetch would read as price coverage; every kind is still counted in the run summary.
+    fetch would read as price coverage; every kind is still counted in the run summary. An
+    adapter with a vendor-adjusted series (Tiingo) gets ``check_prices``' vendor-divergence
+    check from its archived payloads (``vendor_adjusted``).
 ``report``
-    The newest piece of each step (per source) merged into one ``RunSummary``, written as
-    ``<run_id>-report.json`` / ``.md`` (``reports.write_report``).
+    The newest piece of each step merged into one ``RunSummary`` with the store's coverage of
+    one index (``store_coverage``) when the caller computed it, written as
+    ``<run_id>-report.json`` / ``.md`` (``reports.write_report``). The report requires coverage:
+    without it the reason ``coverage_not_run`` degrades it.
 
 Run directory and pieces: a ``--write`` step keeps ``<reports>/runs/<run_id>/summary.json`` (its
 ``RunSummary`` as a dict, label-free) plus its private artifacts; ``reports`` is
 ``MOF_MARKET_REPORTS``, a private path outside any git checkout. ``report`` reads the newest
-``summary.json`` per (step, source); a ``fetch`` piece is left out for a source that has a
-``build`` piece (the build re-reads every archived fetch of the source: a superset).
+``summary.json`` per (step, source, kind) (the source of a history load is ``private_history``,
+failed or not, so a later success supersedes a failure); a ``fetch`` piece is left out for a
+source that has a ``build`` piece (the build re-reads every archived fetch of the source: a
+superset).
 
 Step outcome: ``error`` when the step raised; else ``degraded`` when the summary has a reason in
-the step's scope (``STEP_SCOPES``: a fetch is not judged on the mapping, a mapping not on the
-fetch logs); else ``ok``. ``report`` is judged on every reason (``reports.RunSummary``).
+the step's scope (``STEP_SCOPES``: a fetch is judged on failed fetches and on having recorded a
+fetch of its own kind, ``FETCHES_NOT_RECORDED``; a mapping not on the fetch logs); else
+``ok``. ``report`` is judged on every reason (``reports.RunSummary``).
 
 ``summarize_safely`` wraps ``reports.summarize``: an exception (a caller bug, an unknown contract
 name) yields an ``error`` summary naming its type only, so a run never ends without a report.
@@ -68,12 +76,27 @@ from open_data_store.contracts.standard.market import (
     VENDOR_TOTAL_RETURN,
 )
 from open_data_store.market.asof import latest, sessions
+from open_data_store.market.coverage import (
+    COVERAGE_PER_MEMBER_SCHEMA,
+    COVERAGE_PER_SESSION_SCHEMA,
+    DEFAULT_MAX_MISSING_SHARE,
+    DEFAULT_MIN_DELISTING_GAP_SESSIONS,
+    CoverageResult,
+    coverage,
+)
+from open_data_store.market.membership import (
+    DEFAULT_STALENESS_DAYS,
+    membership_intervals,
+    unresolved_members,
+)
+from open_data_store.market.returns import resolve_prices
+from open_data_store.market.store import load_market_inputs
 from open_data_store.writer.batch import write_batch
 
 from market_data.adapters.base import FETCH_KINDS, WHOLE_MARKET_SYMBOL, Adapter, FetchResult
 from market_data.archive import MemoryArchive, RawArchive
 from market_data.build import ROW_STATUSES, build_actions, build_fetch_log, build_prices
-from market_data.quality import check_prices
+from market_data.quality import check_prices, fetch_coverage
 from market_data.reports import REASONS, RunSummary, kept_out_counts, summarize, write_report
 from market_data.resolve import mapping as _mapping
 from market_data.resolve.openfigi import figi_results, us_ticker_job
@@ -100,6 +123,8 @@ __all__ = [
     "plan_fetch",
     "report",
     "save_piece",
+    "store_coverage",
+    "vendor_adjusted",
     "saved_artifacts",
     "summarize_safely",
 ]
@@ -112,10 +137,12 @@ SUMMARY_FILE = "summary.json"
 OBSERVATIONS_FILE = "observations.parquet"
 SPANS_FILE = "spans.parquet"
 STEPS = ("load-history", "fetch", "map", "build", "report")
+# A fetch step that archived nothing of its kind (a step-level reason, not a report one).
+FETCHES_NOT_RECORDED = "fetches_not_recorded"
 # The reasons a step is judged on (``report``: all of them).
 STEP_SCOPES: Mapping[str, tuple[str, ...]] = {
     "load-history": ("fetch_logs_not_recorded", "failed_fetches"),
-    "fetch": ("fetch_logs_not_recorded", "failed_fetches"),
+    "fetch": ("failed_fetches",),  # plus FETCHES_NOT_RECORDED for its own kind
     "map": ("mapping_not_recorded", "unresolved_identifiers", "ambiguous_identifiers"),
     "build": ("fetch_logs_not_recorded", "failed_fetches"),
     "report": REASONS,
@@ -127,7 +154,6 @@ _SUMMARY_SECTIONS = (
     "file_load",
     "mapping",
     "quality",
-    "coverage",
     "fetches",
     "failed_fetches",
     "written",
@@ -147,11 +173,14 @@ class StepResult:
     source: str | None = None
     counts: Mapping[str, int] = field(default_factory=dict)
     run_dir: Path | None = None
+    kind: str | None = None  # a fetch's kind (pieces are keyed by step, source and kind)
+    # step-level reasons outside the summary's vocabulary (a fetch that recorded nothing)
+    extra_reasons: tuple[str, ...] = ()
 
     @property
     def reasons(self) -> tuple[str, ...]:
         scope = STEP_SCOPES[self.step]
-        return tuple(r for r in self.summary.reasons if r in scope)
+        return (*(r for r in self.summary.reasons if r in scope), *self.extra_reasons)
 
     @property
     def outcome(self) -> str:
@@ -207,7 +236,12 @@ def summarize_safely(run_id: str, *, started_at: datetime, **parts: Any) -> RunS
 def save_piece(reports: Path | str, result: StepResult) -> Path:
     """Keep the step's summary in its run directory for ``report`` (label-free JSON)."""
     path = _run_dir(reports, result.summary.run_id) / SUMMARY_FILE
-    data = {"step": result.step, "source": result.source, "summary": result.summary.to_dict()}
+    data = {
+        "step": result.step,
+        "source": result.source,
+        "kind": result.kind,
+        "summary": result.summary.to_dict(),
+    }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
@@ -278,11 +312,12 @@ def load_history(
     run = None
     if write:
         assert landing is not None and reports is not None
-        written = _write(tables, landing=landing, run_id=run_id)
+        # the run's private artifacts first: batches without them could never be mapped
         run = _run_dir(reports, run_id)
         pq.write_table(loaded.observations, run / OBSERVATIONS_FILE)
         spans = _mapping.spans_from_fetch_log(loaded.fetch_log, snapshots=loaded.index_snapshots)
         pq.write_table(spans, run / SPANS_FILE)
+        written = _write(tables, landing=landing, run_id=run_id)
     summary = summarize_safely(
         run_id, started_at=started_at, load_report=loaded.report, written=written
     )
@@ -435,7 +470,9 @@ def fetch(
     for r in fetched:
         statuses[r.status] = statuses.get(r.status, 0) + 1
     counts = {"fetches": len(fetched), **dict(sorted(statuses.items()))}
-    return StepResult("fetch", summary, True, code, counts)
+    recorded = sum(((summary.fetches or {}).get(kind) or {}).values())
+    extra = () if recorded else (FETCHES_NOT_RECORDED,)
+    return StepResult("fetch", summary, True, code, counts, kind=kind, extra_reasons=extra)
 
 
 # --- map ----------------------------------------------------------------------------------------
@@ -617,9 +654,15 @@ def build(
         for r in archive.history(code, s, k)
     )
     quality = None
+    vendor = vendor_adjusted(archive, adapter, symbols)
     if prices.table.num_rows:
         days = pc.min_max(prices.table["valid_date"]).as_py()
-        quality = check_prices(prices.table, actions.table, sessions(mic, days["min"], days["max"]))
+        quality = check_prices(
+            prices.table,
+            actions.table,
+            sessions(mic, days["min"], days["max"]),
+            vendor_adjusted=vendor,
+        )
     prices_log = logs.get("prices", FETCH_LOG.schema.empty_table())
     tables = (
         (PRICES, prices.table),
@@ -642,26 +685,62 @@ def build(
     counts = {c.name: t.num_rows for c, t in tables}
     if symbols is not None:
         counts["symbols"] = len(symbols)
+    if vendor is not None and quality is not None:
+        flagged = pc.equal(quality["check"], "vendor_divergence")
+        counts["vendor_divergence"] = int(pc.sum(pc.cast(flagged, pa.int64())).as_py() or 0)
     return StepResult("build", summary, write, code, counts)
+
+
+def vendor_adjusted(
+    archive: RawArchive, adapter: Adapter, symbols: Sequence[str] | None
+) -> pa.Table | None:
+    """The vendor's adjusted closes of the archived prices fetches (adapters with
+    ``parse_vendor_adjusted``, Tiingo), for ``check_prices``' divergence check: per
+    (symbol, date) the value of the latest fetch. None when the adapter has no such series."""
+    parse = getattr(adapter, "parse_vendor_adjusted", None)
+    if parse is None:
+        return None
+    code = adapter.source_code
+    names = archive.symbols(code, "prices") if symbols is None else sorted(set(symbols))
+    latest_value: dict[tuple[str, date], float] = {}
+    entries = [e for n in names for e in archive.history_with_refs(code, n, "prices")]
+    entries.sort(key=lambda e: (e.result.fetched_at.astimezone(UTC), e.archive_ref))
+    for entry in entries:
+        if entry.result.status not in ROW_STATUSES:
+            continue
+        for r in parse(entry.result).to_pylist():
+            latest_value[(r["source_symbol"], r["valid_date"])] = r["adj_close"]
+    keys = sorted(latest_value)
+    return pa.table(
+        {
+            "source_symbol": pa.array([k[0] for k in keys], pa.string()),
+            "valid_date": pa.array([k[1] for k in keys], pa.date32()),
+            "adj_close": pa.array([latest_value[k] for k in keys], pa.float64()),
+        }
+    )
 
 
 # --- report -------------------------------------------------------------------------------------
 
 
 def _pieces(reports: Path | str) -> list[dict[str, Any]]:
-    """Newest piece per (step, source); a fetch piece dropped where a build piece exists."""
+    """Newest piece per (step, source, kind); a fetch piece dropped where a build piece of its
+    source exists."""
     base = Path(reports) / RUNS_DIR
-    newest: dict[tuple[str, str | None], dict[str, Any]] = {}
+    newest: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
     if base.is_dir():
         for path in sorted(base.glob(f"*/{SUMMARY_FILE}")):
             data = json.loads(path.read_text(encoding="utf-8"))
             if data["step"] == "report":
                 continue
-            newest[(data["step"], data["source"])] = data  # sorted by run id: newest last
-    built = {source for step, source in newest if step == "build"}
+            key = (data["step"], data["source"], data.get("kind"))
+            newest[key] = data  # sorted by run id: newest last
+    built = {source for step, source, _ in newest if step == "build"}
     return [
         d
-        for (step, source), d in sorted(newest.items(), key=lambda kv: kv[1]["summary"]["run_id"])
+        for (step, source, _), d in sorted(
+            newest.items(), key=lambda kv: kv[1]["summary"]["run_id"]
+        )
         if not (step == "fetch" and source in built)
     ]
 
@@ -676,15 +755,71 @@ def _merge(into: dict[str, Any], value: Mapping[str, Any]) -> None:
             into[key] = into.get(key, 0) + v
 
 
+def store_coverage(
+    store: Any,
+    *,
+    index_code: str,
+    as_of: datetime,
+    allowed_restricted: Iterable[str],
+    precedence: Sequence[str] = (),
+    snapshot_precedence: Sequence[str] = (),
+    staleness_days: int = DEFAULT_STALENESS_DAYS,
+    max_missing_share: float = DEFAULT_MAX_MISSING_SHARE,
+    min_delisting_gap_sessions: int = DEFAULT_MIN_DELISTING_GAP_SESSIONS,
+    mic: str = DEFAULT_MIC,
+) -> CoverageResult:
+    """The store's coverage of ``index_code`` as known at ``as_of``: ``load_market_inputs``
+    (strict), ``membership_intervals`` and ``unresolved_members`` (``snapshot_precedence``,
+    ``staleness_days``), ``resolve_prices`` (``precedence``), ``quality.fetch_coverage`` of the
+    published (prices) fetch log, then ``coverage`` over the sessions from the first membership
+    date to ``as_of``. No membership at all: an empty result that does not pass (the report's
+    ``coverage_empty``)."""
+    inputs = load_market_inputs(
+        store, as_of=as_of, allowed_restricted=frozenset(allowed_restricted)
+    )
+    kw = dict(
+        index_code=index_code,
+        as_of=as_of,
+        staleness_days=staleness_days,
+        precedence=tuple(snapshot_precedence),
+    )
+    intervals = membership_intervals(inputs.snapshots, inputs.identifiers, **kw)
+    first = pc.min(intervals["valid_from"]).as_py() if intervals.num_rows else None
+    last = as_of.astimezone(UTC).date()
+    if first is None or first > last:
+        return CoverageResult(
+            COVERAGE_PER_MEMBER_SCHEMA.empty_table(),
+            COVERAGE_PER_SESSION_SCHEMA.empty_table(),
+            passed=False,
+        )
+    unresolved = unresolved_members(inputs.snapshots, inputs.identifiers, **kw)
+    resolved = resolve_prices(
+        inputs.prices, inputs.identifiers, as_of=as_of, precedence=tuple(precedence)
+    )
+    cal = sessions(mic, first, last)
+    covered = fetch_coverage(inputs.fetch_log, inputs.identifiers, as_of=as_of, sessions=cal)
+    return coverage(
+        intervals,
+        resolved,
+        cal,
+        covered,
+        unresolved=unresolved,
+        max_missing_share=max_missing_share,
+        min_delisting_gap_sessions=min_delisting_gap_sessions,
+    )
+
+
 def report(
     reports: Path | str,
     *,
     run_id: str,
     started_at: datetime,
     write: bool,
+    coverage_result: CoverageResult | None = None,
 ) -> StepResult:
     """Merge the newest pieces into one report (sections summed; an errored piece makes the
-    report an error); with ``write``, ``write_report`` into ``reports``."""
+    report an error) with the store coverage when given (none: ``coverage_not_run``); with
+    ``write``, ``write_report`` into ``reports``."""
     pieces = _pieces(reports)
     sections: dict[str, Any] = {}
     error = None
@@ -696,11 +831,16 @@ def report(
             if data.get(name) is not None:
                 _merge(sections.setdefault(name, {}), data[name])
     starts = [datetime.fromisoformat(p["summary"]["started_at"]) for p in pieces]
+    if coverage_result is not None:
+        sections["coverage"] = summarize(
+            run_id, started_at=started_at, coverage=coverage_result
+        ).coverage
     summary = RunSummary(
         run_id=run_id,
         started_at=min(starts) if starts else started_at,
         finished_at=datetime.now(UTC),
         error=error,
+        coverage_required=True,
         **sections,
     )
     if write:

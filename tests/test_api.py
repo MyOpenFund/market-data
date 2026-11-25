@@ -408,3 +408,96 @@ def test_server_profile_label_resolved_on_the_as_of_date(store):
     kw = dict(profile="server", store=store, allowed_restricted={"tiingo"})
     with pytest.raises(UnknownInstrumentError):
         api.prices(["AAA"], START, END, as_of=datetime(1999, 1, 1, tzinfo=UTC), **kw)
+
+
+# --- review fixes: scoped server reads, no-data errors -------------------------------------------
+
+
+def test_none_profile_symbol_without_rows_is_an_error():
+    PAYLOADS["EMPTY"] = []
+    try:
+        with pytest.raises(api.NoDataError, match="no data for \\['EMPTY'\\] from tiingo") as info:
+            api.prices(["AAA", "EMPTY"], START, END, adapter=fake_tiingo(), as_of=NOW)
+    finally:
+        del PAYLOADS["EMPTY"]
+    assert info.value.inputs == ("EMPTY",)
+
+
+def test_none_profile_massive_symbol_without_rows_is_an_error():
+    from test_massive import NOW as MASSIVE_NOW
+    from test_massive import Recorder, make
+
+    empty = {"status": "OK", "resultsCount": 0, "ticker": "ZZZZ", "adjusted": False}
+    adapter = make(Recorder(answer=lambda request: httpx.Response(200, json=empty)))
+    with pytest.raises(api.NoDataError, match="from massive"):
+        api.prices(
+            ["ZZZZ"], date(2026, 11, 16), date(2026, 11, 20), adapter=adapter, as_of=MASSIVE_NOW
+        )
+
+
+@pytest.fixture
+def busy_store(tmp_path):
+    """I1 has tiingo and massive rows that differ; I2 has tiingo only; I3 (unrelated) has both."""
+    cfg = StoreConfig(data_root=tmp_path / "store", catalog=str(tmp_path / "meta.ducklake"))
+    for c in MARKET_CONTRACTS:
+        approve_contract(cfg, c, "test")
+    days = SESS["session_date"].to_pylist()
+    i3 = "mof:" + "3" * 32
+    prices = [_price("AAA", d, 100.0 + i) for i, d in enumerate(days)]
+    prices += [_price("AAA", d, 200.0 + i, source="massive") for i, d in enumerate(days)]
+    prices += [_price("BBB", d, 20.0 + i) for i, d in enumerate(days)]
+    prices += [_price("CCC", d, 30.0 + i) for i, d in enumerate(days)]
+    prices += [_price("CCC", d, 40.0 + i, source="massive") for i, d in enumerate(days)]
+    ids = [
+        _ident(I1, "source_symbol", "tiingo:AAA", "tiingo"),
+        _ident(I1, "source_symbol", "massive:AAA", "massive"),
+        _ident(I2, "source_symbol", "tiingo:BBB", "tiingo"),
+        _ident(i3, "source_symbol", "tiingo:CCC", "tiingo"),
+        _ident(i3, "source_symbol", "massive:CCC", "massive"),
+        _ident(I1, "ticker", "AAA", "openfigi"),
+        _ident(I2, "ticker", "BBB", "openfigi"),
+    ]
+    for contract, rows in ((PRICES, prices), (INSTRUMENT_IDENTIFIERS, ids)):
+        write_batch(
+            contract,
+            pa.Table.from_pylist(rows, schema=contract.schema),
+            landing_root=cfg.landing,
+            run_id="t",
+            producer="test",
+        )
+    assert publish_pending(cfg).exit_code == 0
+    with Store.open(cfg) as s:
+        yield s
+
+
+def test_server_profile_unrelated_conflict_never_fails_a_request(busy_store):
+    kw = dict(profile="server", store=busy_store, as_of=AS_OF)
+    out = api.prices(["BBB"], START, END, allowed_restricted={"tiingo", "massive"}, **kw)
+    assert set(out["instrument_id"].to_pylist()) == {I2}
+
+
+def test_server_profile_same_instrument_conflict_names_the_input_only(busy_store):
+    kw = dict(profile="server", store=busy_store, as_of=AS_OF)
+    with pytest.raises(api.ApiError, match="pass source=") as info:
+        api.prices(["AAA", "BBB"], START, END, allowed_restricted={"tiingo", "massive"}, **kw)
+    message = str(info.value)
+    assert "'AAA'" in message and "BBB" not in message
+    assert I1 not in message and "massive:" not in message and "tiingo:" not in message
+    out = api.prices(
+        ["AAA"], START, END, source="massive", allowed_restricted={"tiingo", "massive"}, **kw
+    )
+    assert out["close"].to_pylist() == [200.0, 201.0, 202.0, 203.0, 204.0]
+
+
+def test_server_profile_source_leaving_an_input_empty_says_so(busy_store):
+    kw = dict(profile="server", store=busy_store, as_of=AS_OF)
+    with pytest.raises(api.NoDataError, match="try another source") as info:
+        api.prices(
+            ["AAA", "BBB"],
+            START,
+            END,
+            source="massive",
+            allowed_restricted={"tiingo", "massive"},
+            **kw,
+        )
+    assert info.value.inputs == ("BBB",)

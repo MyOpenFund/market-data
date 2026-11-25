@@ -492,3 +492,160 @@ def fake_tiingo(fail: bool = False):
         max_retries=0,
         now=lambda: NOW,
     )
+
+
+# --- review fixes: run records, fetch scope, coverage, vendor divergence ------------------------
+
+
+def pieces(env) -> list[dict]:
+    return [
+        json.loads(p.read_text()) for p in sorted((env["reports"] / "runs").glob("*/summary.json"))
+    ]
+
+
+def test_failed_history_load_is_superseded_by_a_later_success(env, run):
+    assert run("load-history", "--write", "--dir", "{root}/missing") == EXIT_ERROR
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    run("map", "--write", "--no-existing")
+    assert [(p["step"], p["source"]) for p in pieces(env)][:2] == [
+        ("load-history", "private_history"),
+        ("load-history", "private_history"),
+    ]
+    code = run("report", "--write", "--allow-degraded")
+    assert code == EXIT_OK
+    (report,) = env["reports"].glob("*-report-report.json")
+    data = json.loads(report.read_text())
+    assert data["outcome"] != "error" and data["error"] is None
+
+
+def massive_actions(source):
+    from test_massive import Recorder, fixture, make, ok
+
+    return make(
+        Recorder(
+            [
+                ok(fixture("dividends_page1.json")),
+                ok(fixture("dividends_page2.json")),
+                ok(fixture("splits.json")),
+            ]
+        )
+    )
+
+
+def test_fetch_of_another_kind_is_judged_on_its_own_kind(env, run, monkeypatch, capsys):
+    monkeypatch.setenv("MOF_MARKET_ADAPTERS", "massive")
+    monkeypatch.setattr(cli, "make_adapter", massive_actions)
+    argv = ("fetch", "--write", "--source", "massive", "--kind", "actions")
+    assert run(*argv, "--from", "2026-11-20", "--to", "2026-11-23") == EXIT_OK
+    assert "fetch: ok source=massive fetches=2" in capsys.readouterr().out
+    assert [(p["step"], p["source"], p["kind"]) for p in pieces(env)] == [
+        ("fetch", "massive", "actions")
+    ]
+
+
+def test_fetch_that_records_nothing_is_degraded(env, run, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "make_adapter", lambda source: fake_tiingo())
+    # a Saturday: no session, no request
+    argv = ("fetch", "--write", "--source", "tiingo", "--date", "2025-06-07", "--symbols", "AAA")
+    assert run(*argv) == EXIT_DEGRADED
+    assert "reasons=fetches_not_recorded" in capsys.readouterr().out
+
+
+def test_fetch_pieces_keyed_by_kind(env, run, monkeypatch):
+    monkeypatch.setattr(cli, "make_adapter", lambda source: fake_tiingo())
+    assert (
+        run("fetch", "--write", "--source", "tiingo", "--date", "2025-06-02", "--symbols", "AAA")
+        == EXIT_OK
+    )
+    monkeypatch.setenv("MOF_MARKET_ADAPTERS", "massive")
+    monkeypatch.setattr(cli, "make_adapter", massive_actions)
+    argv = ("fetch", "--write", "--source", "massive", "--kind", "actions")
+    assert run(*argv, "--from", "2026-11-20", "--to", "2026-11-23") == EXIT_OK
+    result = pipeline.report(env["reports"], run_id="r", started_at=NOW, write=False)
+    assert result.counts == {"pieces": 2}
+    assert result.summary.fetches == {"prices": {"tiingo": 1}, "actions": {"massive": 2}}
+
+
+def test_report_without_coverage_is_degraded(env, run, capsys):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert run("report") == EXIT_DEGRADED
+    assert "coverage_not_run" in capsys.readouterr().out
+
+
+def test_report_runs_the_store_coverage(env, run, capsys):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    run("map", "--write", "--no-existing")
+    assert publish_pending(env["cfg"]).exit_code == 0
+    capsys.readouterr()
+    code = run(
+        "report",
+        "--write",
+        "--allow-degraded",
+        "--index",
+        "IDX1",
+        "--as-of",
+        "2020-04-10T00:00:00+00:00",
+    )
+    assert code == EXIT_OK
+    assert "coverage_not_run" not in capsys.readouterr().out
+    (report,) = env["reports"].glob("*-report-report.json")
+    data = json.loads(report.read_text())
+    assert data["coverage"]["sessions"] > 0
+    assert "coverage_not_run" not in data["reasons"]
+
+
+def test_report_coverage_of_an_unknown_index_is_empty(env, run, capsys):
+    assert run(*HISTORY_ARGS, "--write") == EXIT_OK
+    assert publish_pending(env["cfg"]).exit_code == 0
+    assert run("report", "--index", "NOPE") == EXIT_DEGRADED
+    assert "coverage_empty" in capsys.readouterr().out
+
+
+def test_tiingo_build_checks_vendor_divergence(env, run, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "make_adapter", lambda source: fake_tiingo())
+    assert (
+        run(
+            "fetch",
+            "--write",
+            "--source",
+            "tiingo",
+            "--from",
+            "2025-06-02",
+            "--to",
+            "2025-06-06",
+            "--symbols",
+            "AAA",
+        )
+        == EXIT_OK
+    )
+    ids = env["root"] / "ids.parquet"
+    pq.write_table(identifiers({"tiingo:AAA": I1}), ids)
+    capsys.readouterr()
+    assert run("build", "--write", "--source", "tiingo", "--identifiers", str(ids)) == EXIT_OK
+    # the synthetic adjClose equals the raw close: the 2:1 split day diverges (the 0.5 dividend
+    # day stays under the 1 % default threshold)
+    assert "vendor_divergence=1" in capsys.readouterr().out
+    (piece,) = [p for p in pieces(env) if p["step"] == "build"]
+    assert piece["summary"]["quality"]["vendor_divergence"] == 1
+
+
+def test_run_record_failure_after_landed_batches_exits_2(env, run, monkeypatch, capsys):
+    def broken(reports, result):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline, "save_piece", broken)
+    assert run(*HISTORY_ARGS, "--write") == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "batches landed but run record not saved: OSError" in err
+    assert list((env["store"] / "landing").rglob("batch.json"))
+
+
+def test_history_artifacts_are_saved_before_batches(env, run, monkeypatch):
+    def broken(*a, **kw):
+        raise OSError("landing unavailable")
+
+    monkeypatch.setattr(pipeline, "_write", broken)
+    assert run(*HISTORY_ARGS, "--write") == EXIT_ERROR
+    (load_run,) = [p for p in (env["reports"] / "runs").iterdir() if p.name.endswith("history")]
+    assert (load_run / "observations.parquet").is_file()
+    assert (load_run / "spans.parquet").is_file()
