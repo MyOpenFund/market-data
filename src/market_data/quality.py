@@ -1,0 +1,570 @@
+"""Producer-side quality checks and fetch coverage (spec §12, §7.4, G4).
+
+``check_prices``: parameterised price checks, one source at a time. Rows are **flagged, never
+withheld**: the function returns flags (``QUALITY_FLAGS_SCHEMA``) and never touches its inputs.
+
+Inputs are contract tables (``prices``, ``corporate_actions``) of one ``source_code`` (several
+raise ``ValueError``: ``"AAA"`` of two sources are two series); each is read latest per natural
+key first (the latest ``known_at`` revision is the one checked). ``sessions`` is a table with a
+``session_date`` column (e.g. ``open_data_store.market.asof.sessions``). A close is *valid* when
+finite and > 0. Checks (``CHECKS``):
+
+- ``non_positive``: a close that is not valid (<= 0, NaN or infinite).
+- ``jump_without_action``: ``|close(t) / close(p) - 1| > jump_threshold`` between a valid close t
+  and the symbol's previous valid close p, with no ``split``, ``stock_dividend`` or ``spin_off``
+  action of that symbol whose ex-date lies in ``(p, t]`` (an ex-date that is not a session shows
+  its jump on the next price row). Cash actions never excuse a jump.
+- ``missing_session``: a session of ``sessions`` between a symbol's first and last price row
+  (inclusive) with no price row; flagged on the missing session.
+- ``vendor_divergence`` (only with ``vendor_adjusted``, e.g. ``TiingoAdapter.parse_vendor_adjusted``
+  output ``[source_symbol, valid_date, adj_close]`` of the same source): for each pair (p, t) of
+  consecutive valid closes where the vendor has an adjusted close on both dates,
+  ``|ours - vendor| > divergence_threshold`` with ``vendor = adj(t) / adj(p) - 1`` and ``ours`` the
+  recipe-free return from raw closes and the actions with ex-date in ``(p, t]``, applied per
+  ex-date as the store's total-return recipe does: splits and stock dividends first
+  (``n *= ratio_new / ratio_old``; ratios not finite and positive are ignored), then cash
+  (regular and special dividends, return of capital, a spin-off with an amount; amounts not finite
+  and positive are ignored) credited per share held, ``cash += n * amount`` (``old_share`` basis:
+  per share held before that ex-date's splits); ``ours = (n * close(t) + cash) / close(p) - 1``.
+  Currencies are not compared; rights and unvalued spin-offs are not applied (a divergence there
+  is a real difference to look at, and is flagged).
+
+Thresholds are named parameters (``DEFAULT_JUMP_THRESHOLD`` 0.5 and
+``DEFAULT_DIVERGENCE_THRESHOLD`` 0.01 are placeholders to set from measurements on real data).
+
+``fetch_coverage``: fetch-log ranges mapped to instruments, the store coverage recipe's
+``FETCH_COVERAGE_SCHEMA`` input. See its docstring. ``unsuperseded_failures``: the failed rows of
+a fetch log that no later fetch replaced, for the run report.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+from open_data_store.contracts.standard.market import (
+    CORPORATE_ACTIONS,
+    FETCH_STATUSES,
+    PRICES,
+)
+from open_data_store.market._mapping import MAX_LISTED, symbol_mappings
+from open_data_store.market.asof import latest
+from open_data_store.market.coverage import (
+    FAILED_FETCH_STATUSES,
+    FETCH_COVERAGE_SCHEMA,
+    NO_DATA_STATUSES,
+)
+
+from market_data.adapters.base import WHOLE_MARKET_SYMBOL
+
+__all__ = [
+    "CHECKS",
+    "DEFAULT_DIVERGENCE_THRESHOLD",
+    "DEFAULT_JUMP_THRESHOLD",
+    "JUMP_EXCUSING_ACTIONS",
+    "QUALITY_FLAGS_SCHEMA",
+    "check_prices",
+    "fetch_coverage",
+    "unsuperseded_failures",
+]
+
+CHECKS = ("non_positive", "jump_without_action", "missing_session", "vendor_divergence")
+DEFAULT_JUMP_THRESHOLD = 0.5
+DEFAULT_DIVERGENCE_THRESHOLD = 0.01
+JUMP_EXCUSING_ACTIONS = ("split", "stock_dividend", "spin_off")
+_SHARE_ACTIONS = ("split", "stock_dividend")
+_CASH_ACTIONS = ("cash_dividend_regular", "cash_dividend_special", "return_of_capital", "spin_off")
+
+QUALITY_FLAGS_SCHEMA = pa.schema(
+    [
+        ("source_symbol", pa.string()),
+        ("session_date", pa.date32()),
+        ("check", pa.string()),
+        ("detail", pa.string()),
+    ]
+)
+
+_EPOCH = date(1970, 1, 1)
+# Composite (symbol, day) keys: code * _SHIFT + day + _OFFSET, day in int32 range.
+_OFFSET = 1 << 32
+_SHIFT = 1 << 34
+
+
+def _days(column: pa.ChunkedArray | pa.Array) -> np.ndarray:
+    arr = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+    return arr.cast(pa.int32()).to_numpy(zero_copy_only=False).astype(np.int64)
+
+
+def _codes(column: pa.ChunkedArray | pa.Array, names: pa.Array) -> np.ndarray:
+    idx = pc.index_in(column, value_set=names)
+    idx = idx.combine_chunks() if isinstance(idx, pa.ChunkedArray) else idx
+    return idx.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
+
+
+def _floats(column: pa.ChunkedArray) -> np.ndarray:
+    return column.combine_chunks().fill_null(math.nan).to_numpy(zero_copy_only=False)
+
+
+def _key(code: np.ndarray, day: np.ndarray) -> np.ndarray:
+    return code * _SHIFT + day + _OFFSET
+
+
+def _check_threshold(name: str, value: float, *, positive: bool) -> None:
+    ok = isinstance(value, (int, float)) and math.isfinite(value)
+    ok = ok and (value > 0 if positive else value >= 0)
+    if not ok:
+        bound = "> 0" if positive else ">= 0"
+        raise ValueError(f"{name} must be a finite number {bound}, got {value!r}")
+
+
+def _one_source(*tables: pa.Table) -> None:
+    codes: set[str] = set()
+    for table in tables:
+        if table.num_rows:
+            codes.update(pc.unique(table["source_code"]).to_pylist())
+    if len(codes) > 1:
+        raise ValueError(
+            f"check_prices checks one source at a time, got {len(codes)} source codes: "
+            f"{sorted(codes)[:MAX_LISTED]}"
+        )
+
+
+class _Flags:
+    def __init__(self) -> None:
+        self.code: list[np.ndarray] = []
+        self.day: list[np.ndarray] = []
+        self.check: list[str] = []
+        self.detail: list[str] = []
+
+    def add(self, code: np.ndarray, day: np.ndarray, check: str, details: Sequence[str]) -> None:
+        self.code.append(code)
+        self.day.append(day)
+        self.check.extend([check] * code.size)
+        self.detail.extend(details)
+
+    def table(self, names: pa.Array) -> pa.Table:
+        code = np.concatenate(self.code) if self.code else np.zeros(0, np.int64)
+        day = np.concatenate(self.day) if self.day else np.zeros(0, np.int64)
+        out = pa.table(
+            [
+                names.take(pa.array(code, pa.int64())) if code.size else pa.array([], pa.string()),
+                pa.array(day.astype(np.int32), pa.int32()).cast(pa.date32()),
+                pa.array(self.check, pa.string()),
+                pa.array(self.detail, pa.string()),
+            ],
+            schema=QUALITY_FLAGS_SCHEMA,
+        )
+        return out.sort_by(
+            [("source_symbol", "ascending"), ("session_date", "ascending"), ("check", "ascending")]
+        )
+
+
+def check_prices(
+    prices: pa.Table,
+    actions: pa.Table,
+    sessions: pa.Table,
+    *,
+    jump_threshold: float = DEFAULT_JUMP_THRESHOLD,
+    divergence_threshold: float = DEFAULT_DIVERGENCE_THRESHOLD,
+    vendor_adjusted: pa.Table | None = None,
+) -> pa.Table:
+    """Quality flags of one source's prices (``QUALITY_FLAGS_SCHEMA``, sorted by source_symbol,
+    session_date, check). See the module docstring for the checks."""
+    _check_threshold("jump_threshold", jump_threshold, positive=True)
+    _check_threshold("divergence_threshold", divergence_threshold, positive=False)
+    _one_source(prices, actions)
+    if prices.num_rows == 0:
+        return QUALITY_FLAGS_SCHEMA.empty_table()
+    prices = latest(prices, PRICES.natural_key)
+    actions = latest(actions, CORPORATE_ACTIONS.natural_key) if actions.num_rows else actions
+
+    names = pc.unique(prices["source_symbol"].combine_chunks())
+    names = names.take(pc.sort_indices(names))
+    code = _codes(prices["source_symbol"], names)
+    day = _days(prices["valid_date"])
+    close = _floats(prices["close"])
+    order = np.lexsort((day, code))
+    code, day, close = code[order], day[order], close[order]
+    flags = _Flags()
+
+    valid = np.isfinite(close) & (close > 0)
+    bad = np.flatnonzero(~valid)
+    flags.add(code[bad], day[bad], "non_positive", [f"close={close[i]!r}" for i in bad])
+
+    # Pairs (p, t) of consecutive valid closes of one symbol.
+    v = np.flatnonzero(valid)
+    same = code[v][1:] == code[v][:-1]
+    p_row, t_row = v[:-1][same], v[1:][same]
+    p_key, t_key = _key(code[p_row], day[p_row]), _key(code[t_row], day[t_row])
+    ret = close[t_row] / close[p_row] - 1.0
+
+    a_code = _codes(actions["source_symbol"], names) if actions.num_rows else np.zeros(0, np.int64)
+    a_day = _days(actions["valid_date"]) if actions.num_rows else np.zeros(0, np.int64)
+    a_type = (
+        np.asarray(actions["action_type"].to_pylist(), dtype=object)
+        if actions.num_rows
+        else np.zeros(0, object)
+    )
+    a_known = a_code >= 0
+
+    # jump_without_action
+    excusing = a_known & np.isin(a_type, JUMP_EXCUSING_ACTIONS)
+    ex_keys = np.sort(_key(a_code[excusing], a_day[excusing]))
+    excused = np.searchsorted(ex_keys, t_key, "right") > np.searchsorted(ex_keys, p_key, "right")
+    jump = np.flatnonzero((np.abs(ret) > jump_threshold) & ~excused)
+    flags.add(
+        code[t_row[jump]],
+        day[t_row[jump]],
+        "jump_without_action",
+        [f"return={ret[j]:+.6f} threshold={jump_threshold}" for j in jump],
+    )
+
+    _missing_sessions(flags, code, day, sessions)
+
+    if vendor_adjusted is not None:
+        ours = _our_returns(
+            actions, a_code, a_day, a_type, a_known, p_key, t_key, close, p_row, t_row
+        )
+        vendor = _vendor_returns(vendor_adjusted, names, p_key, t_key)
+        diff = np.abs(ours - vendor)
+        div = np.flatnonzero(np.isfinite(vendor) & ~(diff <= divergence_threshold))
+        flags.add(
+            code[t_row[div]],
+            day[t_row[div]],
+            "vendor_divergence",
+            [
+                f"ours={ours[j]:+.6f} vendor={vendor[j]:+.6f} threshold={divergence_threshold}"
+                for j in div
+            ],
+        )
+    return flags.table(names)
+
+
+def _missing_sessions(flags: _Flags, code: np.ndarray, day: np.ndarray, sessions: pa.Table) -> None:
+    if sessions["session_date"].null_count:
+        raise ValueError("sessions.session_date has null values")
+    s_days = np.unique(_days(sessions["session_date"]))
+    if not s_days.size:
+        return
+    starts = np.flatnonzero(np.r_[True, code[1:] != code[:-1]])
+    ends = np.r_[starts[1:], code.size] - 1
+    sym = code[starts]
+    lo = np.searchsorted(s_days, day[starts], "left")
+    hi = np.searchsorted(s_days, day[ends], "right")
+    lengths = np.maximum(hi - lo, 0)
+    total = int(lengths.sum())
+    offsets = np.repeat(lo - np.r_[0, np.cumsum(lengths)[:-1]], lengths)
+    n = s_days.size
+    cells = np.repeat(sym, lengths) * n + offsets + np.arange(total, dtype=np.int64)
+    pos = np.searchsorted(s_days, day)
+    on_session = (pos < n) & (s_days[np.minimum(pos, n - 1)] == day)
+    present = code[on_session] * n + pos[on_session]
+    missing = cells[~np.isin(cells, present)]
+    m_code, m_idx = np.divmod(missing, n)
+    flags.add(
+        m_code,
+        s_days[m_idx],
+        "missing_session",
+        ["no price row on a calendar session"] * missing.size,
+    )
+
+
+def _our_returns(
+    actions: pa.Table,
+    a_code: np.ndarray,
+    a_day: np.ndarray,
+    a_type: np.ndarray,
+    a_known: np.ndarray,
+    p_key: np.ndarray,
+    t_key: np.ndarray,
+    close: np.ndarray,
+    p_row: np.ndarray,
+    t_row: np.ndarray,
+) -> np.ndarray:
+    """Recipe-free return per pair (p, t) from raw closes and actions (see the module doc)."""
+    n_total = np.ones(p_key.size)
+    cash = np.zeros(p_key.size)
+    if actions.num_rows and p_key.size:
+        ratio = _floats(actions["ratio_new"]) / _floats(actions["ratio_old"])
+        amount = _floats(actions["amount"])
+        old_basis = np.asarray(
+            [b == "old_share" for b in actions["per_share_basis"].to_pylist()], bool
+        )
+        is_share = np.isin(a_type, _SHARE_ACTIONS) & np.isfinite(ratio) & (ratio > 0)
+        is_cash = np.isin(a_type, _CASH_ACTIONS) & np.isfinite(amount) & (amount > 0)
+        a_key = _key(a_code, a_day)
+        pair = np.searchsorted(t_key, a_key, "left")
+        inside = a_known & (is_share | is_cash) & (pair < t_key.size)
+        inside[inside] &= p_key[pair[inside]] < a_key[inside]
+        rows = np.flatnonzero(inside)
+        if not rows.size:
+            return (n_total * close[t_row] + cash) / close[p_row] - 1.0
+        # Order: pair, ex-date, shares before cash.
+        rows = rows[np.lexsort((is_cash[rows], a_day[rows], pair[rows]))]
+        r_pair, r_day = pair[rows], a_day[rows]
+        log_f = np.where(is_share[rows], np.log(np.where(is_share[rows], ratio[rows], 1.0)), 0.0)
+        cum = np.cumsum(log_f)
+        before = np.r_[0.0, cum[:-1]]  # cumulative log before each row
+        group_start = np.r_[True, r_pair[1:] != r_pair[:-1]]
+        base = np.maximum.accumulate(np.where(group_start, np.arange(rows.size), 0))
+        day_start = group_start | np.r_[True, r_day[1:] != r_day[:-1]]
+        day_first = np.maximum.accumulate(np.where(day_start, np.arange(rows.size), 0))
+        n_after = np.exp(cum - before[base])
+        n_before_day = np.exp(before[day_first] - before[base])
+        held = np.where(old_basis[rows], n_before_day, n_after)
+        credit = np.where(is_cash[rows], amount[rows] * held, 0.0)
+        np.add.at(cash, r_pair, credit)
+        np.multiply.at(n_total, r_pair, np.exp(log_f))
+    return (n_total * close[t_row] + cash) / close[p_row] - 1.0
+
+
+def _vendor_returns(
+    vendor: pa.Table, names: pa.Array, p_key: np.ndarray, t_key: np.ndarray
+) -> np.ndarray:
+    """Vendor return per pair (p, t); NaN when the vendor lacks either date."""
+    out = np.full(p_key.size, np.nan)
+    v_code = _codes(vendor["source_symbol"], names)
+    keep = v_code >= 0
+    v_key = _key(v_code[keep], _days(vendor["valid_date"])[keep])
+    v_val = _floats(vendor["adj_close"])[keep]
+    order = np.argsort(v_key, kind="stable")
+    v_key, v_val = v_key[order], v_val[order]
+    if np.any(v_key[1:] == v_key[:-1]):
+        raise ValueError("vendor_adjusted has several rows for one (source_symbol, valid_date)")
+    if not v_key.size or not p_key.size:
+        return out
+
+    def lookup(keys: np.ndarray) -> np.ndarray:
+        pos = np.minimum(np.searchsorted(v_key, keys), v_key.size - 1)
+        return np.where(v_key[pos] == keys, v_val[pos], np.nan)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = lookup(t_key) / lookup(p_key) - 1.0
+    return np.where(np.isfinite(out), out, np.nan)
+
+
+# --- fetch coverage -----------------------------------------------------------------------------
+
+
+def _check_statuses(fetch_log: pa.Table) -> None:
+    status = fetch_log["status"]
+    unknown = pc.invert(pc.is_in(status, value_set=pa.array(FETCH_STATUSES))).fill_null(True)
+    if pc.any(unknown).as_py():
+        bad = sorted(set(status.filter(unknown).to_pylist()), key=str)
+        raise ValueError(f"fetch_log status not in {FETCH_STATUSES}: {bad[:MAX_LISTED]}")
+
+
+def _session_days(sessions: pa.Table | None) -> np.ndarray | None:
+    if sessions is None:
+        return None
+    if sessions["session_date"].null_count:
+        raise ValueError("sessions.session_date has null values")
+    return np.unique(_days(sessions["session_date"]))
+
+
+def _space(start: np.ndarray, end: np.ndarray, s_days: np.ndarray | None):
+    """Inclusive day ranges as half-open [lo, hi) in the merge space: calendar days, or session
+    indices when ``s_days`` is given (two ranges with no session between them touch)."""
+    if s_days is None:
+        return start, end + 1
+    return np.searchsorted(s_days, start, "left"), np.searchsorted(s_days, end, "right")
+
+
+def _bounds(fetch_log: pa.Table) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Day numbers of requested_from / requested_to and a mask of usable (non-null) ranges."""
+    has = pc.and_(
+        pc.is_valid(fetch_log["requested_from"]), pc.is_valid(fetch_log["requested_to"])
+    ).to_numpy(zero_copy_only=False)
+    start = fetch_log["requested_from"].combine_chunks().cast(pa.int32()).fill_null(0)
+    end = fetch_log["requested_to"].combine_chunks().cast(pa.int32()).fill_null(-1)
+    start = start.to_numpy(zero_copy_only=False).astype(np.int64)
+    end = end.to_numpy(zero_copy_only=False).astype(np.int64)
+    return start, end, has & (start <= end)
+
+
+def _superseded(fetch_log: pa.Table, s_days: np.ndarray | None) -> np.ndarray:
+    """Mask of failed rows (``error``/``partial``) whose whole range a strictly later
+    ``ok``/``empty``/``not_found`` row (or the union of such rows) of the same (source_code,
+    source_symbol) covers."""
+    out = np.zeros(fetch_log.num_rows, bool)
+    status = np.asarray(fetch_log["status"].to_pylist(), dtype=object)
+    failed = np.flatnonzero(np.isin(status, FAILED_FETCH_STATUSES))
+    if not failed.size:
+        return out
+    start, end, usable = _bounds(fetch_log)
+    lo, hi = _space(start, end, s_days)
+    known = fetch_log["known_at"].combine_chunks().cast(pa.int64()).to_numpy(zero_copy_only=False)
+    keys = list(
+        zip(
+            fetch_log["source_code"].to_pylist(),
+            fetch_log["source_symbol"].to_pylist(),
+            strict=True,
+        )
+    )
+    by_key: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i in np.flatnonzero(np.isin(status, NO_DATA_STATUSES) & usable):
+        by_key[keys[i]].append(int(i))
+    for i in failed:
+        if not usable[i]:
+            continue
+        rows = np.asarray(by_key.get(keys[i], ()), np.int64)
+        rows = rows[known[rows] > known[i]] if rows.size else rows
+        if not rows.size:
+            continue
+        rows = rows[np.argsort(lo[rows], kind="stable")]
+        r_lo, r_hi = lo[rows], np.maximum.accumulate(hi[rows])
+        new_run = np.r_[True, r_lo[1:] > r_hi[:-1]]
+        run_lo = r_lo[new_run]
+        run_hi = r_hi[np.r_[np.flatnonzero(new_run)[1:] - 1, rows.size - 1]]
+        pos = np.searchsorted(run_lo, lo[i], "right") - 1
+        out[i] = pos >= 0 and run_hi[pos] >= hi[i]
+    return out
+
+
+def unsuperseded_failures(fetch_log: pa.Table, *, sessions: pa.Table | None = None) -> pa.Table:
+    """The ``error``/``partial`` rows of ``fetch_log`` that no later fetch superseded (see
+    ``fetch_coverage``), for the run report. A failed row with a null range is never superseded.
+
+    Pass the fetch log of one kind (``build_fetch_log(kinds=(kind,))``): it has no kind column,
+    so an ``ok`` actions fetch would otherwise supersede a failed prices fetch."""
+    _check_statuses(fetch_log)
+    failed = pc.is_in(fetch_log["status"], value_set=pa.array(FAILED_FETCH_STATUSES))
+    keep = failed.to_numpy(zero_copy_only=False) & ~_superseded(fetch_log, _session_days(sessions))
+    return fetch_log.filter(pa.array(keep))
+
+
+def _windows(identifiers: pa.Table) -> pa.Table:
+    """Mapping windows of ``source_symbol`` identifiers (read latest, store cover rule):
+    token, source_code, w_from, w_to (inclusive; null = open), instrument_id."""
+    rows: dict[str, list] = {k: [] for k in ("token", "w_source", "w_from", "w_to", "inst")}
+    for token, windows in sorted(symbol_mappings(identifiers).items()):
+        windows = sorted(windows, key=lambda w: w[0])
+        for a, (start_a, end_a, inst_a) in enumerate(windows):
+            for start_b, _end_b, inst_b in windows[a + 1 :]:
+                if inst_b != inst_a and (end_a is None or start_b < end_a):
+                    raise ValueError(
+                        f"ambiguous mapping for symbol {token!r} from {start_b.isoformat()}: "
+                        f"several instruments {sorted({inst_a, inst_b})}; fix the mapping upstream"
+                    )
+            rows["token"].append(token)
+            rows["w_source"].append(token.split(":", 1)[0])
+            rows["w_from"].append(start_a)
+            rows["w_to"].append(None if end_a is None else end_a - timedelta(days=1))
+            rows["inst"].append(inst_a)
+    return pa.table(
+        {
+            "token": pa.array(rows["token"], pa.string()),
+            "w_source": pa.array(rows["w_source"], pa.string()),
+            "w_from": pa.array(rows["w_from"], pa.date32()),
+            "w_to": pa.array(rows["w_to"], pa.date32()),
+            "instrument_id": pa.array(rows["inst"], pa.string()),
+        }
+    )
+
+
+def _merged_runs(log: pa.Table, start, end, s_days: np.ndarray | None) -> pa.Table:
+    """Ranges merged per (source_code, source_symbol, status): touching or overlapping ranges
+    (in the merge space of ``_space``) become one run [first from, max to]."""
+    group = pc.binary_join_element_wise(
+        log["source_code"], log["source_symbol"], log["status"], "\x00"
+    ).combine_chunks()
+    encoded = pc.dictionary_encode(group)
+    g = encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64)
+    lo, hi = _space(start, end, s_days)
+    k_lo, k_hi = _key(g, lo), _key(g, hi)
+    order = np.lexsort((start, k_lo))
+    k_lo, k_hi, g, start, end = k_lo[order], k_hi[order], g[order], start[order], end[order]
+    reach = np.maximum.accumulate(k_hi)
+    new_run = np.r_[True, k_lo[1:] > reach[:-1]]
+    first = np.flatnonzero(new_run)
+    run_to = np.maximum.reduceat(end, first)
+    taken = log.take(pa.array(order[first], pa.int64()))
+    return pa.table(
+        {
+            "source_code": taken["source_code"],
+            "source_symbol": taken["source_symbol"],
+            "status": taken["status"],
+            "f_from": pa.array(start[first].astype(np.int32), pa.int32()).cast(pa.date32()),
+            "f_to": pa.array(run_to.astype(np.int32), pa.int32()).cast(pa.date32()),
+        }
+    )
+
+
+def fetch_coverage(
+    fetch_log: pa.Table,
+    identifiers: pa.Table,
+    *,
+    as_of: datetime,
+    sessions: pa.Table | None = None,
+) -> pa.Table:
+    """Fetch-log ranges mapped to instruments: the store's ``FETCH_COVERAGE_SCHEMA``
+    [instrument_id, covered_from, covered_to, status] (inclusive bounds), sorted.
+
+    ``fetch_log`` must hold **prices fetches only** (``build_fetch_log(kinds=("prices",))``): the
+    contract has no kind column, and coverage is about prices. Rules:
+
+    1. Rows known after ``as_of`` (tz-aware) are ignored; ranges are clipped to ``as_of``'s UTC
+       date. An unknown status raises ``ValueError``.
+    2. A failed row (``error``/``partial``) is dropped when strictly later ``ok``/``empty``/
+       ``not_found`` rows of the same (source_code, source_symbol or ``"*"``) cover its whole
+       range (one row or their union): a transient failure must not veto delistings forever.
+       Unsuperseded failures are kept (the store's coverage lets them veto).
+    3. Rows with a null bound cover nothing and are dropped (``unsuperseded_failures`` still
+       reports such failures).
+    4. Each ``<source_code>:<source_symbol>`` maps through the ``source_symbol`` identifiers, read
+       latest, a window ``[valid_date, valid_to)`` covering the day (the store's ``_mapping``
+       rule); a range spanning several windows is split; an unmapped symbol covers nothing.
+       Overlapping windows of one symbol naming different instruments raise ``ValueError``.
+    5. A ``"*"`` (whole-market) row covers every mapped instrument of its source over its range.
+
+    Ranges of one (source_code, source_symbol, status) are merged first; with ``sessions`` (pass
+    the coverage recipe's own), ranges with no session between them merge too (daily grouped
+    fetches Friday and Monday become one range), which keeps a whole-market history compact."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be a timezone-aware datetime")
+    _check_statuses(fetch_log)
+    s_days = _session_days(sessions)
+    known = fetch_log["known_at"]
+    log = fetch_log.filter(pc.less_equal(known, pa.scalar(as_of.astimezone(UTC), known.type)))
+    log = log.filter(pa.array(~_superseded(log, s_days)))
+    start, end, usable = _bounds(log)
+    end = np.minimum(end, (as_of.astimezone(UTC).date() - _EPOCH).days)
+    usable &= start <= end
+    keep = np.flatnonzero(usable)
+    if not keep.size:
+        return FETCH_COVERAGE_SCHEMA.empty_table()
+    log = log.take(pa.array(keep, pa.int64()))
+    runs = _merged_runs(log, start[keep], end[keep], s_days)
+    windows = _windows(identifiers)
+    if not windows.num_rows:
+        return FETCH_COVERAGE_SCHEMA.empty_table()
+
+    whole = pc.equal(runs["source_symbol"], WHOLE_MARKET_SYMBOL)
+    own = runs.filter(pc.invert(whole))
+    own = own.append_column(
+        "token", pc.binary_join_element_wise(own["source_code"], own["source_symbol"], ":")
+    )
+    parts = [
+        own.join(windows, "token", join_type="inner"),
+        runs.filter(whole).join(windows, "source_code", "w_source", join_type="inner"),
+    ]
+    out = []
+    for part in parts:
+        if not part.num_rows:
+            continue
+        lo = pc.max_element_wise(part["f_from"], part["w_from"])
+        hi = pc.min_element_wise(part["f_to"], part["w_to"])  # null w_to (open) is skipped
+        table = pa.table(
+            [part["instrument_id"], lo, hi, part["status"]], schema=FETCH_COVERAGE_SCHEMA
+        )
+        out.append(table.filter(pc.less_equal(lo, hi)))
+    if not out:
+        return FETCH_COVERAGE_SCHEMA.empty_table()
+    return pa.concat_tables(out).sort_by(
+        [(name, "ascending") for name in ("instrument_id", "covered_from", "covered_to", "status")]
+    )
