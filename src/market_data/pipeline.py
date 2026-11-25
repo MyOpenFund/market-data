@@ -97,7 +97,7 @@ from open_data_store.writer.batch import write_batch
 from market_data.adapters.base import FETCH_KINDS, WHOLE_MARKET_SYMBOL, Adapter, FetchResult
 from market_data.archive import MemoryArchive, RawArchive
 from market_data.build import ROW_STATUSES, build_actions, build_fetch_log, build_prices
-from market_data.quality import check_prices, fetch_coverage
+from market_data.quality import check_prices, fetch_coverage, unusable_cash
 from market_data.reports import REASONS, RunSummary, kept_out_counts, summarize, write_report
 from market_data.resolve import mapping as _mapping
 from market_data.resolve.openfigi import figi_results, us_ticker_job
@@ -142,10 +142,10 @@ STEPS = ("load-history", "fetch", "map", "build", "report")
 FETCHES_NOT_RECORDED = "fetches_not_recorded"
 # The reasons a step is judged on (``report``: all of them).
 STEP_SCOPES: Mapping[str, tuple[str, ...]] = {
-    "load-history": ("fetch_logs_not_recorded", "failed_fetches"),
+    "load-history": ("fetch_logs_not_recorded", "failed_fetches", "unusable_cash_actions"),
     "fetch": ("failed_fetches",),  # plus FETCHES_NOT_RECORDED for its own kind
     "map": ("mapping_not_recorded", "unresolved_identifiers", "ambiguous_identifiers"),
-    "build": ("fetch_logs_not_recorded", "failed_fetches"),
+    "build": ("fetch_logs_not_recorded", "failed_fetches", "unusable_cash_actions"),
     "report": REASONS,
 }
 _RUN_STAMP = "%Y%m%dT%H%M%S%fZ"
@@ -158,6 +158,7 @@ _SUMMARY_SECTIONS = (
     "fetches",
     "failed_fetches",
     "written",
+    "unusable_cash",
 )
 
 
@@ -327,7 +328,11 @@ def load_history(
         pq.write_table(spans, run / SPANS_FILE)
         written = _write(tables, landing=landing, run_id=run_id)
     summary = summarize_safely(
-        run_id, started_at=started_at, load_report=loaded.report, written=written
+        run_id,
+        started_at=started_at,
+        load_report=loaded.report,
+        written=written,
+        unusable_cash={history.source_code: loaded.report.unusable_cash},
     )
     counts = {c.name: t.num_rows for c, t in tables}
     counts["observations"] = loaded.observations.num_rows
@@ -709,6 +714,7 @@ def build(
         quality=quality,
         fetch_logs=logs,
         written=written,
+        unusable_cash=unusable_cash(actions.table),
     )
     counts = {c.name: t.num_rows for c, t in tables}
     if symbols is not None:

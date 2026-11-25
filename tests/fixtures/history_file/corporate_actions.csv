@@ -1,11 +1,11 @@
-member_id,action_type,source_action_type,announce_date,ex_date,record_date,pay_date,amount,currency,ratio_old,ratio_new,spinoff_member_id
-AAA UN Equity,,Stock Split,2020-02-10,2020-03-02,2020-02-28,2020-03-01,,,1,2,
-AAA UN Equity,,Regular Cash,2020-02-10,2020-03-02,2020-03-03,2020-03-16,0.25,USD,,,
-AAA UN Equity,,Regular Cash,2020-03-20,2020-04-15,2020-04-16,2020-04-30,0.26,USD,,,
-AAA UN Equity,,Regular Cash,,2020-05-15,,,0.26,USD,,,
-DDD UQ Equity,,Regular Cash,2020-01-10,2020-01-31,2020-02-03,2020-02-14,0.10,USD,,,
-DDD UQ Equity,,regular cash,2020-01-10,2020-01-31,2020-02-03,2020-02-14,0.05,USD,,,
-DDD UQ Equity,,Spinoff,2020-01-15,2020-02-03,,,,,1,1,FFF UN Equity
-EEE ZZ Equity,,Regular Cash,2020-01-10,2020-02-03,,,0.40,EUR,,,
-FFF UN Equity,,Mystery Distribution,2020-02-20,2020-03-02,,,1.00,USD,,,
-CCC LN Equity,,Regular Cash,2020-02-06,2020-02-20,2020-02-21,2020-03-20,12.5,GBp,,,
+member_id,action_type,source_action_type,announce_date,ex_date,record_date,pay_date,amount,currency,ratio_old,ratio_new,spinoff_member_id,per_share_basis
+AAA UN Equity,,Stock Split,2020-02-10,2020-03-02,2020-02-28,2020-03-01,,,1,2,,
+AAA UN Equity,,Regular Cash,2020-02-10,2020-03-02,2020-03-03,2020-03-16,0.25,USD,,,,new_share
+AAA UN Equity,,Regular Cash,2020-03-20,2020-04-15,2020-04-16,2020-04-30,0.26,USD,,,,
+AAA UN Equity,,Regular Cash,,2020-05-15,,,0.26,USD,,,,
+DDD UQ Equity,,Regular Cash,2020-01-10,2020-01-31,2020-02-03,2020-02-14,0.10,USD,,,,
+DDD UQ Equity,,regular cash,2020-01-10,2020-01-31,2020-02-03,2020-02-14,0.05,USD,,,,
+DDD UQ Equity,,Spinoff,2020-01-15,2020-02-03,,,,,1,1,FFF UN Equity,
+EEE ZZ Equity,,Regular Cash,2020-01-10,2020-02-03,,,0.40,EUR,,,,
+FFF UN Equity,,Mystery Distribution,2020-02-20,2020-03-02,,,1.00,USD,,,,
+CCC LN Equity,,Regular Cash,2020-02-06,2020-02-20,2020-02-21,2020-03-20,12.5,GBp,,,,

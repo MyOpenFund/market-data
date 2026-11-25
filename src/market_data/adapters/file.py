@@ -12,8 +12,10 @@ Format (a directory)
     unadjusted; anything else refuses the whole load), ``dates_timezone`` (must be
     ``exchange``: every date is the local trading date of the member's exchange, the only
     convention supported), ``dividends`` (``gross`` or ``net``), ``source_description``;
-    optional ``fields``, ``notes``. Then ``securities`` (required), ``prices_daily``,
-    ``index_snapshots`` (at least one of them), ``corporate_actions`` and
+    optional ``fields``, ``notes``, ``per_share_basis_default`` (``old_share`` or
+    ``new_share``: the ``per_share_basis`` of a cash action whose row leaves it empty).
+    Then ``securities`` (required), ``prices_daily``, ``index_snapshots`` (at least one of
+    them), ``corporate_actions`` and
     ``total_return_index`` (optional), each as Parquet (preferred) or CSV (UTF-8, comma,
     header), possibly split into parts: ``<name>.<ext>`` or ``<name>_part<digits>.<ext>``
     (``prices_daily_part001.parquet``), read in natural file-name order (part2 before part10);
@@ -79,6 +81,10 @@ Exchange calendars
 
 Corporate actions: an explicit ``action_type`` wins, else ``source_action_type`` through
 ``action_types`` (case-insensitive); unknown labels are kept out and counted, never guessed.
+The optional ``per_share_basis`` column (``old_share`` / ``new_share``, else the manifest's
+``per_share_basis_default``) is set on rows with an ``amount``. Cash actions the total-return
+recipe could never apply (no currency; no basis on the ex-date of a split or stock dividend
+of the member) are kept and counted in ``report.unusable_cash`` (``quality.unusable_cash``).
 An exact duplicate row is kept once and counted (``duplicate_row``). Spin-off targets absent
 from ``securities`` get a token but no label; their number is reported.
 
@@ -118,6 +124,7 @@ from open_data_store.contracts.standard.market import (
     CORPORATE_ACTIONS,
     FETCH_LOG,
     INDEX_SNAPSHOTS,
+    PER_SHARE_BASES,
     PRICES,
     VENDOR_TOTAL_RETURN,
 )
@@ -130,6 +137,7 @@ from market_data._calendars import (
     check_margin,
 )
 from market_data.adapters.base import RAW_SYMBOL_SCHEMA
+from market_data.quality import unusable_cash
 from market_data.tokens import MIN_SALT_BYTES, salt_from_env, token
 
 __all__ = [
@@ -185,7 +193,7 @@ _MANIFEST_REQUIRED = (
     "dividends",
     "source_description",
 )
-_MANIFEST_OPTIONAL = ("fields", "notes")
+_MANIFEST_OPTIONAL = ("fields", "notes", "per_share_basis_default")
 _DIVIDENDS = ("gross", "net")
 _ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")  # always fullmatch
 _FIGI = re.compile(r"BBG[0-9A-Z]{9}")
@@ -290,6 +298,7 @@ _SPECS: Mapping[str, _Spec] = {
             "ratio_old": _F,
             "ratio_new": _F,
             "spinoff_member_id": _S,
+            "per_share_basis": _S,
         },
         ("member_id", "source_action_type", "ex_date"),
         ("member_id", "source_action_type", "ex_date"),
@@ -326,6 +335,8 @@ class Manifest:
     source_description: str
     fields: str | None = None
     notes: str | None = None
+    # the per_share_basis of a cash action whose row leaves it empty (None: left empty)
+    per_share_basis_default: str | None = None
 
     @property
     def export_date(self) -> date:
@@ -356,6 +367,8 @@ class LoadReport:
     fetch_log: dict[str, int] = field(default_factory=dict)
     # distinct spinoff_member_id values absent from securities (tokens computed, no labels)
     unlisted_spinoff_targets: int = 0
+    # cash actions the total-return recipe would never apply, per ``quality`` reason (rows)
+    unusable_cash: dict[str, int] = field(default_factory=dict)
 
 
 def _norm_type(label: str) -> str:
@@ -843,6 +856,9 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
         )
     if "dividends" in values and values["dividends"].casefold() not in _DIVIDENDS:
         problems.append(f"{path.name}: dividends must be 'gross' or 'net'")
+    basis = values.get("per_share_basis_default")
+    if basis is not None and basis.casefold() not in PER_SHARE_BASES:
+        problems.append(f"{path.name}: per_share_basis_default must be one of {PER_SHARE_BASES}")
     if problems:
         return None, problems
     return (
@@ -854,6 +870,7 @@ def _read_manifest(directory: Path, ignored: Ignored) -> tuple[Manifest | None, 
             source_description=values["source_description"],
             fields=values.get("fields"),
             notes=values.get("notes"),
+            per_share_basis_default=None if basis is None else basis.casefold(),
         ),
         [],
     )
@@ -1084,9 +1101,16 @@ class FileHistory:
         return problems
 
     def _check_action_types(self, table: pa.Table) -> list[str]:
-        if "action_type" not in table.column_names:
-            return []
         out = []
+        if "per_share_basis" in table.column_names:
+            for i, v in enumerate(table["per_share_basis"].to_pylist()):
+                if v is not None and v.strip().casefold() not in PER_SHARE_BASES:
+                    out.append(
+                        f"corporate_actions: row {i + 1} (over all parts): per_share_basis is "
+                        f"not one of {PER_SHARE_BASES}"
+                    )
+        if "action_type" not in table.column_names:
+            return out
         given = table["action_type"].to_pylist()
         source = table["source_action_type"].to_pylist()
         for i, (a, s) in enumerate(zip(given, source, strict=True)):
@@ -1502,6 +1526,12 @@ class FileHistory:
             seq[ident] = seq.get(ident, -1) + 1
             amount = r.get("amount")
             spin = r.get("spinoff_member_id")
+            share_basis = None
+            if amount is not None:
+                given = r.get("per_share_basis")
+                share_basis = (
+                    given.strip().casefold() if given else manifest.per_share_basis_default
+                )
             out.append(
                 {
                     "source_symbol": member.token,
@@ -1514,7 +1544,7 @@ class FileHistory:
                     "amount": amount,
                     "currency": r.get("currency"),
                     "amount_basis": manifest.dividends if amount is not None else None,
-                    "per_share_basis": None,
+                    "per_share_basis": share_basis,
                     "ratio_old": r.get("ratio_old"),
                     "ratio_new": r.get("ratio_new"),
                     "spinoff_symbol": None if spin is None else self._member(spin).token,
@@ -1529,7 +1559,11 @@ class FileHistory:
         out.sort(
             key=lambda r: (r["source_symbol"], r["valid_date"], r["action_type"], r["action_seq"])
         )
-        return pa.Table.from_pylist(out, schema=CORPORATE_ACTIONS.schema)
+        table = pa.Table.from_pylist(out, schema=CORPORATE_ACTIONS.schema)
+        self.report.unusable_cash = dict(
+            sorted(unusable_cash(table).get(self.source_code, {}).items())
+        )
+        return table
 
     # -- entry point ---------------------------------------------------------------------------
 

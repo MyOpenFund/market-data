@@ -505,3 +505,14 @@ def test_listed_not_priced_counted_without_degrading():
     assert run.outcome == "ok"
     assert run.mapping["listed_not_priced"] == {SRC: {"listed_not_priced": 2}}
     assert clean().mapping["listed_not_priced"] == {}
+
+
+def test_unusable_cash_actions_degrade():
+    run = clean(unusable_cash={SRC: {"split_day_cash_without_basis": 2}})
+    assert run.outcome == "degraded"
+    assert run.reasons == ("unusable_cash_actions",)
+    assert run.unusable_cash == {SRC: {"split_day_cash_without_basis": 2}}
+    kept = {SRC: {"actions": {"cash_without_currency": {"keys": 1, "rows": 1}}}}
+    assert clean(kept_out=kept).reasons == ("unusable_cash_actions",)
+    assert clean(unusable_cash={SRC: {}}).outcome == "ok"
+    assert clean(unusable_cash={SRC: {"something_new": 1}}).unusable_cash == {SRC: {OTHER: 1}}

@@ -95,13 +95,15 @@ Parse (``parse`` / ``parse_report``)
 
 Kept out, never blocking (ruling 69): a bad row never blocks a source. It is kept out and
 counted under a reason: ``not_an_object``; ``missing_field`` (a required field absent, of the
-wrong type or not a valid date: ``T``/``t``/``c``, ``ticker``, the ex-date, the currency of a
-dividend, a ``list_date``/``delisted_utc``, including one out of the calendar's range);
+wrong type or not a valid date: ``T``/``t``/``c``, ``ticker``, the ex-date, a dividend
+currency that is not text, a ``list_date``/``delisted_utc``, including one out of the
+calendar's range);
 ``non_finite`` (NaN, infinite, or beyond the float range); ``non_positive_close``;
 ``bad_volume`` (not an integer in ``0..MAX_VOLUME``, the int64 column); ``bad_timestamp`` (a bar
 ``t`` outside ``TIMESTAMP_RANGE``); ``bad_ratio`` (a split ratio null, zero or negative);
 ``null_amount`` (a dividend without ``cash_amount``); ``non_positive_amount`` (zero or negative);
-``bad_currency``; ``seq_overflow``;
+``bad_currency``; ``cash_without_currency`` (a dividend with no or an empty currency: the
+recipe could never apply it, so the run degrades); ``seq_overflow``;
 ``ambiguous_action`` (both an ex-dividend and an execution date); ``unknown_distribution_type``
 and ``unknown_adjustment_type`` (any other or missing type: never guessed); for prices,
 ``duplicate_row`` (an exact repeat of a (symbol, date) bar, kept once) and
@@ -156,6 +158,7 @@ __all__ = [
     "BAD_TIMESTAMP",
     "BAD_VOLUME",
     "BASE_URL",
+    "CASH_WITHOUT_CURRENCY",
     "CONFLICTING_DUPLICATE",
     "DEFAULT_BACKOFF_S",
     "DEFAULT_MAX_HISTORY_DAYS",
@@ -251,6 +254,9 @@ UNKNOWN_ADJUSTMENT_TYPE = "unknown_adjustment_type"
 DUPLICATE_ROW = "duplicate_row"
 CONFLICTING_DUPLICATE = "conflicting_duplicate"
 BAD_IDENTIFIER = "bad_identifier"
+# A dividend with no currency: the total-return recipe would never apply it (the run degrades:
+# ``quality.CASH_WITHOUT_CURRENCY``, the same name).
+CASH_WITHOUT_CURRENCY = "cash_without_currency"
 KEPT_OUT_REASONS = (
     NOT_AN_OBJECT,
     MISSING_FIELD,
@@ -269,6 +275,7 @@ KEPT_OUT_REASONS = (
     DUPLICATE_ROW,
     CONFLICTING_DUPLICATE,
     BAD_IDENTIFIER,
+    CASH_WITHOUT_CURRENCY,
 )
 _SYMBOL_SCHEMES = ("ticker", "composite_figi", "share_class_figi", "cik")
 
@@ -809,7 +816,9 @@ class MassiveAdapter:
             if amount <= 0:
                 raise _KeptOut(NON_POSITIVE_AMOUNT, symbol, day, action_type)
             given = row.get("currency")
-            if not isinstance(given, str) or not given.strip():
+            if given is None or (isinstance(given, str) and not given.strip()):
+                raise _KeptOut(CASH_WITHOUT_CURRENCY, symbol, day, action_type)
+            if not isinstance(given, str):
                 raise _KeptOut(MISSING_FIELD, symbol, day, action_type)
             given = given.strip()
             currency = given.upper()

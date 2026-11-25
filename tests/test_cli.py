@@ -828,3 +828,32 @@ def test_store_coverage_leaves_out_a_session_not_closed_at_as_of(env, run):
                 store, index_code="IDX1", as_of=as_of, allowed_restricted=allowed
             )
             assert max(result.per_session["session_date"].to_pylist()) == last
+
+
+def test_unusable_cash_degrades_the_load_and_the_build(env, run, capsys):
+    from test_api import bar
+
+    from market_data.adapters.base import FetchResult
+    from market_data.archive import MemoryArchive
+
+    # the export's split-day dividend loses its per_share_basis
+    path = env["export"] / "corporate_actions.csv"
+    path.write_text(path.read_text().replace(",new_share", ","))
+    assert run(*HISTORY_ARGS) == EXIT_DEGRADED
+    assert "reasons=unusable_cash_actions" in capsys.readouterr().out
+    # a provider bar with a split and a dividend on one day: the builder counts it
+    payload = json.dumps(
+        [bar("2025-06-02", 100.0), bar("2025-06-03", 50.0, div=0.5, split=2.0)]
+    ).encode()
+    memory = MemoryArchive()
+    memory.put(
+        FetchResult(
+            "tiingo", "AAA", "prices", date(2025, 6, 2), date(2025, 6, 3), NOW, "ok",
+            payload, "application/json",
+        )
+    )  # fmt: skip
+    result = pipeline.build(
+        fake_tiingo(), archive=memory, symbols=None, run_id="b", started_at=NOW, write=False
+    )
+    assert result.summary.unusable_cash == {"tiingo": {"split_day_cash_without_basis": 1}}
+    assert "unusable_cash_actions" in result.reasons and result.outcome == "degraded"

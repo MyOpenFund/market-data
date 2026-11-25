@@ -1124,3 +1124,16 @@ def test_max_pages_bounds_a_list():
     assert len(rec.requests) == 3
     with pytest.raises(ValueError, match="max_pages"):
         make(max_pages=0)
+
+
+@pytest.mark.parametrize("currency", [None, "", "  "])
+def test_dividend_without_currency_is_counted_as_such(currency):
+    from market_data.adapters.massive import CASH_WITHOUT_CURRENCY
+
+    row = div("AAA", 1.0, "recurring", currency=currency)
+    if currency is None:
+        del row["currency"]
+    report = make().parse_report(result("actions", {"results": [row]}))
+    assert report.table.num_rows == 0
+    assert nonzero(report) == {CASH_WITHOUT_CURRENCY: (("AAA", DAY),)}
+    assert CASH_WITHOUT_CURRENCY in KEPT_OUT_REASONS

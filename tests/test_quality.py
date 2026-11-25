@@ -12,12 +12,15 @@ from open_data_store.market.coverage import FETCH_COVERAGE_SCHEMA, coverage
 
 from market_data.adapters.tiingo import VENDOR_ADJUSTED_SCHEMA
 from market_data.quality import (
+    CASH_WITHOUT_CURRENCY,
     CHECKS,
     QUALITY_FLAGS_SCHEMA,
+    SPLIT_DAY_CASH_WITHOUT_BASIS,
     ambiguous_mappings,
     check_prices,
     fetch_coverage,
     unsuperseded_failures,
+    unusable_cash,
 )
 
 SRC = "synth"
@@ -758,3 +761,28 @@ def test_symbol_fetch_after_the_last_window_corroborates_the_end():
     assert cov_rows(fetch_coverage(log, ids, as_of=AS_OF)) == [
         (INST_A, date(2024, 1, 1), date(2024, 1, 4), "ok")
     ]
+
+
+def test_unusable_cash_counts_what_the_recipe_cannot_apply():
+    day, other = SESSION_DAYS[2], SESSION_DAYS[3]
+    a = actions(
+        [
+            # a split and a same-day dividend without a basis: the cash is never applied
+            {"source_symbol": "AAA", "valid_date": day, "action_type": "split",
+             "ratio_old": 1.0, "ratio_new": 2.0},
+            {"source_symbol": "AAA", "valid_date": day, "action_type": "cash_dividend_regular",
+             "amount": 1.0, "currency": "USD"},
+            # with a basis it is applied
+            {"source_symbol": "BBB", "valid_date": day, "action_type": "stock_dividend",
+             "ratio_old": 1.0, "ratio_new": 1.1},
+            {"source_symbol": "BBB", "valid_date": day, "action_type": "cash_dividend_special",
+             "amount": 1.0, "currency": "USD", "per_share_basis": "old_share"},
+            # no currency: never applied (another day, no split)
+            {"source_symbol": "CCC", "valid_date": other, "action_type": "return_of_capital",
+             "amount": 0.5, "currency": None},
+            # a spin-off without an amount is not cash
+            {"source_symbol": "CCC", "valid_date": day, "action_type": "spin_off"},
+        ]
+    )  # fmt: skip
+    assert unusable_cash(a) == {SRC: {CASH_WITHOUT_CURRENCY: 1, SPLIT_DAY_CASH_WITHOUT_BASIS: 1}}
+    assert unusable_cash(NO_ACTIONS) == {}

@@ -141,16 +141,18 @@ Prices must be **raw, unadjusted**.
 
 | File | Columns | Required |
 |---|---|---|
-| `manifest.json` or `manifest.csv` (`key,value`) | `export_time` (ISO 8601 with offset), `adjustment` (must be `none`), `dates_timezone` (must be `exchange`), `dividends` (`gross` or `net`), `source_description`; optional `fields`, `notes` | yes, every key but the optional ones |
+| `manifest.json` or `manifest.csv` (`key,value`) | `export_time` (ISO 8601 with offset), `adjustment` (must be `none`), `dates_timezone` (must be `exchange`), `dividends` (`gross` or `net`), `source_description`; optional `fields`, `notes`, `per_share_basis_default` (`old_share` or `new_share`: the basis of a cash amount whose row leaves `per_share_basis` empty) | yes, every key but the optional ones |
 | `securities` (one row per `member_id`) | `member_id`, `name`, `figi`, `composite_figi`, `share_class_figi`, `isin`, `country`, `exchange_code`, `security_type`, `price_currency`, `status`, `delisting_date`, `delisting_reason`, `last_ticker` | yes; `member_id`, `name` (the rest best effort) |
 | `index_snapshots` | `date`, `index`, `member_id`, `weight` | `date`, `index`, `member_id` |
 | `prices_daily` | `member_id`, `date`, `close`, `volume`, `currency`, optional `open`, `high`, `low` | `member_id`, `date`, `close`, `volume` (values may be empty), `currency`; for every member over its whole listed life |
-| `corporate_actions` | `member_id`, `action_type`, `source_action_type`, `announce_date`, `ex_date`, `record_date`, `pay_date`, `amount`, `currency`, `ratio_old`, `ratio_new`, `spinoff_member_id` | optional file; `member_id`, `source_action_type`, `ex_date` |
+| `corporate_actions` | `member_id`, `action_type`, `source_action_type`, `announce_date`, `ex_date`, `record_date`, `pay_date`, `amount`, `currency`, `ratio_old`, `ratio_new`, `spinoff_member_id`, optional `per_share_basis` (`old_share` or `new_share`: is a cash amount per share before or after a split on the same ex-date) | optional file; `member_id`, `source_action_type`, `ex_date` |
 | `total_return_index` | `member_id`, `date`, `tr_index` | optional file (a vendor control series) |
 
 At least one of `index_snapshots` and `prices_daily` is required. An exchange code (from
 `securities.exchange_code`, else the second word of `member_id`) picks the calendar of a member;
-US codes map to XNYS by default. The loader replaces every `member_id` by an opaque token
+US codes map to XNYS by default. A cash action the total-return recipe could never apply (no
+`currency`, or no `per_share_basis` on the ex-date of a split or stock dividend of the same
+member) is still loaded but counted, and degrades the run (`unusable_cash_actions`). The loader replaces every `member_id` by an opaque token
 (`MOF_MARKET_TOKEN_SALT`) in every dated row, and refuses a malformed file with a list of every
 problem (file, column, row; never a cell's content).
 

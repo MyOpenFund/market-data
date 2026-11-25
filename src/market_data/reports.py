@@ -9,11 +9,13 @@ Silent-failure doctrine: a run is never ``ok`` by default. ``RunSummary.outcome`
   overlapping mapping windows); a prices fetch log was recorded (a non-empty
   ``fetch_logs["prices"]``, or the history-file load's fetch-log summary with members) with no
   unsuperseded failed fetch of any kind; the coverage, when given, has sessions and passed (a
-  whole-run report, ``coverage_required``, must have one: else ``coverage_not_run``);
+  whole-run report, ``coverage_required``, must have one: else ``coverage_not_run``); no cash
+  action the total-return recipe would never apply (``unusable_cash``, or a dividend kept out
+  for having no currency: else ``unusable_cash_actions``);
 - ``degraded`` otherwise; ``reasons`` says why (``REASONS``).
 
-Kept-out rows, builder drops, changed mappings and quality flags are counted but do not degrade a
-run: they are flagged, not hidden (§12).
+Kept-out rows (but a dividend without a currency), builder drops, changed mappings and quality
+flags are counted but do not degrade a run: they are flagged, not hidden (§12).
 
 Label-free: a summary holds counts, closed vocabularies, source codes, contract names, session
 dates and booleans only — never a source symbol, a member id, an exchange code, an export's
@@ -52,7 +54,13 @@ from market_data.adapters import massive as _massive
 from market_data.adapters import tiingo as _tiingo
 from market_data.adapters.base import FETCH_KINDS, FetchResult
 from market_data.build import DROP_REASONS, ROW_STATUSES, BuildResult
-from market_data.quality import CHECKS, ambiguous_mappings, unsuperseded_failures
+from market_data.quality import (
+    CASH_WITHOUT_CURRENCY,
+    CHECKS,
+    UNUSABLE_CASH_REASONS,
+    ambiguous_mappings,
+    unsuperseded_failures,
+)
 from market_data.resolve import mapping as _mapping
 
 __all__ = [
@@ -78,6 +86,7 @@ REASONS = (
     "coverage_empty",
     "coverage_failed",
     "coverage_not_run",
+    "unusable_cash_actions",
 )
 # Over-threshold session dates listed in a report (the count is always given).
 DEFAULT_MAX_LISTED_SESSIONS = 20
@@ -204,6 +213,7 @@ _KEYS_ROWS = _record({"keys": _count, "rows": _count})
 _DISTINCT_ROWS = _record({"distinct": _count, "rows": _count})
 _PER_SOURCE_REASON = _tree(_source_key, _in(_MAPPING_REASONS))
 _PER_KIND_SOURCE = _tree(_in(FETCH_KINDS), _source_key)
+_UNUSABLE_CASH = (*UNUSABLE_CASH_REASONS, OTHER)
 _SECTIONS: dict[str, Check] = {
     "builder_drops": _tree(_in(_CONTRACTS), _in(_BUILD_DROPS)),
     "kept_out": _tree(_source_key, _in(FETCH_KINDS), _in(_KEPT_OUT), leaf=_KEYS_ROWS),
@@ -244,6 +254,7 @@ _SECTIONS: dict[str, Check] = {
     "fetches": _PER_KIND_SOURCE,
     "failed_fetches": _PER_KIND_SOURCE,
     "written": _tree(_in(_CONTRACTS)),
+    "unusable_cash": _tree(_source_key, _in(_UNUSABLE_CASH)),
 }
 
 
@@ -274,6 +285,9 @@ class RunSummary:
     - ``fetches``: kind -> source_code -> fetch-log rows recorded.
     - ``failed_fetches``: kind -> source_code -> unsuperseded failed fetches.
     - ``written``: contract -> rows written.
+    - ``unusable_cash``: source_code -> reason (``quality.UNUSABLE_CASH_REASONS``) -> cash
+      actions written that the total-return recipe would never apply (``quality.unusable_cash``
+      of a history load's or a build's actions); any of them degrades the run.
     - ``coverage_required``: a whole-run report (the CLI's ``report``): a missing coverage
       section is then the reason ``coverage_not_run``.
     """
@@ -291,6 +305,7 @@ class RunSummary:
     fetches: Mapping[str, Any] | None = None
     failed_fetches: Mapping[str, Any] | None = None
     written: Mapping[str, Any] | None = None
+    unusable_cash: Mapping[str, Any] | None = None
     # True for a whole-run report: no coverage then degrades it (``coverage_not_run``).
     coverage_required: bool = False
 
@@ -332,6 +347,8 @@ class RunSummary:
             out.append("fetch_logs_not_recorded")
         if self.failed_fetches is not None and _total(self.failed_fetches):
             out.append("failed_fetches")
+        if _total(self.unusable_cash or {}) or self._kept_out_without_currency():
+            out.append("unusable_cash_actions")
         if self.coverage is None:
             if self.coverage_required:
                 out.append("coverage_not_run")
@@ -341,6 +358,13 @@ class RunSummary:
             elif not self.coverage["passed"]:
                 out.append("coverage_failed")
         return tuple(out)
+
+    def _kept_out_without_currency(self) -> int:
+        return sum(
+            reasons.get(CASH_WITHOUT_CURRENCY, {}).get("rows", 0)
+            for kinds in (self.kept_out or {}).values()
+            for reasons in kinds.values()
+        )
 
     @property
     def outcome(self) -> str:
@@ -577,6 +601,7 @@ def summarize(
     sessions: pa.Table | None = None,
     written: Mapping[str, int] | None = None,
     max_listed_sessions: int = DEFAULT_MAX_LISTED_SESSIONS,
+    unusable_cash: Mapping[str, Mapping[str, int]] | None = None,
 ) -> RunSummary:
     """A label-free ``RunSummary`` from one run's parts; each part is optional.
 
@@ -587,7 +612,8 @@ def summarize(
     ``CoverageResult``; ``fetch_logs``: kind -> that kind's fetch log
     (``build_fetch_log(kinds=(kind,))``, every source concatenated), failures superseded as in
     ``quality.fetch_coverage`` (``sessions``: the same merge rule); ``written``: contract -> rows
-    written; ``error``: the exception the run raised (only its type name is kept).
+    written; ``unusable_cash``: source_code -> reason -> rows (``quality.unusable_cash``);
+    ``error``: the exception the run raised (only its type name is kept).
 
     Contract names and fetch kinds must be known (``ValueError`` otherwise); reasons outside a
     known vocabulary are counted under ``other``; source codes that are not short lowercase
@@ -623,7 +649,17 @@ def summarize(
             if written is None
             else {_require(k, _CONTRACTS, "contract"): int(v) for k, v in sorted(written.items())}
         ),
+        unusable_cash=None if unusable_cash is None else _unusable_section(unusable_cash),
     )
+
+
+def _unusable_section(counts: Mapping[str, Mapping[str, int]]) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {}
+    for src, reasons in counts.items():
+        per = out.setdefault(_source(src), {})
+        for reason, n in reasons.items():
+            _bump(per, _known(reason, _UNUSABLE_CASH), n)
+    return {s: dict(sorted(r.items())) for s, r in sorted(out.items())}
 
 
 # --- writing ------------------------------------------------------------------------------------
@@ -694,6 +730,7 @@ def _markdown(data: Mapping[str, Any]) -> str:
         ("Coverage", "coverage"),
         ("Fetches recorded", "fetches"),
         ("Failed fetches (unsuperseded)", "failed_fetches"),
+        ("Cash actions the total return cannot apply", "unusable_cash"),
         ("Identifier mapping", "mapping"),
         ("Quality flags", "quality"),
         ("Builder drops", "builder_drops"),

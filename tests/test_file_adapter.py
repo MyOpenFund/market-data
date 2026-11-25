@@ -1172,3 +1172,63 @@ def test_row_number_message_names_the_position(tmp_path):
     )
     problems = problems_of(history(path))
     assert "total_return_index.csv: unnamed row-number column at position 2" in problems
+
+
+# --- per-share basis and unusable cash (ruling 83) --------------------------------------------
+
+
+def test_per_share_basis_column_and_manifest_default(tmp_path):
+    fh = history(csv_export(tmp_path))
+    by = {
+        (r["source_symbol"], r["valid_date"], r["action_type"]): r for r in fh.actions().to_pylist()
+    }
+    aaa = tok("AAA UN Equity")
+    assert by[(aaa, date(2020, 3, 2), "cash_dividend_regular")]["per_share_basis"] == "new_share"
+    assert by[(aaa, date(2020, 4, 15), "cash_dividend_regular")]["per_share_basis"] is None
+    assert by[(aaa, date(2020, 3, 2), "split")]["per_share_basis"] is None
+    assert fh.report.unusable_cash == {}
+    # a manifest default fills the cash rows that leave the column empty
+    path = csv_export(tmp_path / "default")
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["per_share_basis_default"] = "old_share"
+    rewrite(path, "manifest.json", json.dumps(manifest))
+    fh = history(path)
+    rows = fh.actions().to_pylist()
+    cash = {
+        r["valid_date"]: r["per_share_basis"]
+        for r in rows
+        if r["source_symbol"] == aaa and r["amount"]
+    }
+    assert cash == {
+        date(2020, 3, 2): "new_share",  # the row's own value wins
+        date(2020, 4, 15): "old_share",
+        date(2020, 5, 15): "old_share",
+    }
+    assert {r["per_share_basis"] for r in rows if r["action_type"] == "split"} == {None}
+    assert fh.report.ignored.manifest_keys == []
+
+
+@pytest.mark.parametrize("where", ["column", "manifest"])
+def test_per_share_basis_values_checked(tmp_path, where):
+    path = csv_export(tmp_path)
+    if where == "column":
+        edit_csv(path, "corporate_actions.csv", ",new_share", ",per_old")
+    else:
+        manifest = json.loads((path / "manifest.json").read_text())
+        manifest["per_share_basis_default"] = "per_old"
+        rewrite(path, "manifest.json", json.dumps(manifest))
+    message = problems_of(history(path))
+    assert "per_share_basis" in message and "old_share" in message
+    assert "per_old" not in message  # never a cell's or a key's value
+
+
+def test_unusable_cash_counted_at_load(tmp_path):
+    path = csv_export(tmp_path)
+    edit_csv(path, "corporate_actions.csv", ",new_share", ",")  # the split-day dividend
+    edit_csv(path, "corporate_actions.csv", "0.26,USD", "0.26,")  # a dividend without currency
+    fh = history(path)
+    fh.actions()
+    assert fh.report.unusable_cash == {
+        "cash_without_currency": 1,
+        "split_day_cash_without_basis": 1,
+    }

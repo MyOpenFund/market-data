@@ -63,24 +63,36 @@ from open_data_store.market.coverage import (
 from market_data.adapters.base import WHOLE_MARKET_SYMBOL
 
 __all__ = [
+    "CASH_ACTIONS",
+    "CASH_WITHOUT_CURRENCY",
     "CHECKS",
     "CORROBORATING_STATUSES",
     "DEFAULT_DIVERGENCE_THRESHOLD",
     "DEFAULT_JUMP_THRESHOLD",
     "JUMP_EXCUSING_ACTIONS",
     "QUALITY_FLAGS_SCHEMA",
+    "SHARE_ACTIONS",
+    "SPLIT_DAY_CASH_WITHOUT_BASIS",
+    "UNUSABLE_CASH_REASONS",
     "ambiguous_mappings",
     "check_prices",
     "fetch_coverage",
     "unsuperseded_failures",
+    "unusable_cash",
 ]
 
 CHECKS = ("non_positive", "jump_without_action", "missing_session", "vendor_divergence")
 DEFAULT_JUMP_THRESHOLD = 0.5
 DEFAULT_DIVERGENCE_THRESHOLD = 0.01
 JUMP_EXCUSING_ACTIONS = ("split", "stock_dividend", "spin_off")
-_SHARE_ACTIONS = ("split", "stock_dividend")
-_CASH_ACTIONS = ("cash_dividend_regular", "cash_dividend_special", "return_of_capital", "spin_off")
+SHARE_ACTIONS = ("split", "stock_dividend")
+CASH_ACTIONS = ("cash_dividend_regular", "cash_dividend_special", "return_of_capital", "spin_off")
+# Cash actions the total-return recipe never applies (it flags them; the cash is lost): a cash
+# amount without a currency, and one without ``per_share_basis`` on the ex-date of a split or
+# stock dividend of the same series.
+CASH_WITHOUT_CURRENCY = "cash_without_currency"
+SPLIT_DAY_CASH_WITHOUT_BASIS = "split_day_cash_without_basis"
+UNUSABLE_CASH_REASONS = (CASH_WITHOUT_CURRENCY, SPLIT_DAY_CASH_WITHOUT_BASIS)
 
 QUALITY_FLAGS_SCHEMA = pa.schema(
     [
@@ -301,8 +313,8 @@ def _our_returns(
         old_basis = np.asarray(
             [b == "old_share" for b in actions["per_share_basis"].to_pylist()], bool
         )
-        is_share = np.isin(a_type, _SHARE_ACTIONS) & np.isfinite(ratio) & (ratio > 0)
-        is_cash = np.isin(a_type, _CASH_ACTIONS) & np.isfinite(amount) & (amount > 0)
+        is_share = np.isin(a_type, SHARE_ACTIONS) & np.isfinite(ratio) & (ratio > 0)
+        is_cash = np.isin(a_type, CASH_ACTIONS) & np.isfinite(amount) & (amount > 0)
         a_key = _key(a_code, a_day)
         pair = np.searchsorted(t_key, a_key, "left")
         inside = a_known & (is_share | is_cash) & (pair < t_key.size)
@@ -445,6 +457,38 @@ def _superseded(fetch_log: pa.Table, s_days: np.ndarray | None) -> np.ndarray:
         run_hi = r_hi[np.r_[np.flatnonzero(new_run)[1:] - 1, rows.size - 1]]
         pos = np.searchsorted(run_lo, lo[i], "right") - 1
         out[i] = pos >= 0 and run_hi[pos] >= hi[i]
+    return out
+
+
+def unusable_cash(actions: pa.Table) -> dict[str, dict[str, int]]:
+    """source_code -> reason -> rows: the cash actions (``CASH_ACTIONS`` with an amount) of
+    ``actions`` (``CORPORATE_ACTIONS`` or ``RAW_ACTION_SCHEMA`` rows) the total-return recipe
+    would never apply: no currency (``CASH_WITHOUT_CURRENCY``), or no ``per_share_basis`` on
+    the ex-date of a ``SHARE_ACTIONS`` row of the same (source_code, source_symbol)
+    (``SPLIT_DAY_CASH_WITHOUT_BASIS``; counted once when both apply, as no currency). Empty
+    when every cash action is usable."""
+    cols = ["source_code", "source_symbol", "valid_date", "action_type", "amount", "currency",
+            "per_share_basis"]  # fmt: skip
+    rows = actions.select(cols).to_pylist() if actions.num_rows else []
+    split_days = {
+        (r["source_code"], r["source_symbol"], r["valid_date"])
+        for r in rows
+        if r["action_type"] in SHARE_ACTIONS
+    }
+    out: dict[str, dict[str, int]] = {}
+    for r in rows:
+        if r["action_type"] not in CASH_ACTIONS or r["amount"] is None:
+            continue
+        if not (r["currency"] or "").strip():
+            reason = CASH_WITHOUT_CURRENCY
+        elif r["per_share_basis"] is None and (
+            (r["source_code"], r["source_symbol"], r["valid_date"]) in split_days
+        ):
+            reason = SPLIT_DAY_CASH_WITHOUT_BASIS
+        else:
+            continue
+        per = out.setdefault(r["source_code"], {})
+        per[reason] = per.get(reason, 0) + 1
     return out
 
 
